@@ -224,7 +224,9 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
             title, year = meta.get("title") or title, meta.get("year") or year
             authors = [a["family"] for a in meta.get("authors") or [] if a.get("family")] or authors
             venue, doi, status = meta.get("venue"), meta.get("doi"), meta.get("status")
-            tags = list(dict.fromkeys([*tags, *work["user"].get("tags", [])]))   # no repeats, order kept
+            tags = list(dict.fromkeys([*tags, *work["user"].get("tags", []),
+                                       *work["user"].get("collections", [])]))   # no repeats, order kept
+            ids.update({f"alias{n}": a for n, a in enumerate(work.get("aliases", []))})
 
         conn.execute(
             "UPDATE files SET g_title=?, g_authors=?, g_year=?, g_ids=?, kind=?, kind_source=?, "
@@ -251,6 +253,35 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
                 " ".join(tags),
                 description or "",
             ),
+        )
+
+    # 4. Works with no PDF on disk (quick-added without a file, or imported from
+    #    Zotero) get a stand-in row, so they can be found like any other.
+    conn.execute("DELETE FROM files WHERE hash LIKE 'work:%'")
+    with_files = {file_to_work[h] for h in by_hash if h in file_to_work}
+    for work_id, work in all_works.items():
+        if work_id in with_files or "meta" not in work:
+            continue
+        meta, user = work["meta"], work["user"]
+        authors = [a["family"] for a in meta.get("authors") or [] if a.get("family")]
+        tags = list(dict.fromkeys([*work.get("tags", []), *user.get("tags", []),
+                                   *user.get("collections", [])]))
+        conn.execute(
+            "INSERT INTO files (hash, size, first_seen, work_id, citekey, kind, kind_source, "
+            "g_title, g_authors, g_year, g_ids, status, venue, doi, description, tags) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"work:{work_id}", 0, work["created"], work_id, work["citekey"], meta.get("kind"),
+             "work", meta.get("title"), json.dumps(authors, ensure_ascii=False), meta.get("year"),
+             "{}", "no-file", meta.get("venue"), meta.get("doi"), work.get("description"),
+             json.dumps(tags, ensure_ascii=False)),
+        )
+        initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
+        conn.execute(
+            "INSERT INTO search (hash, title, authors, aliases, filename, context, venue, tags, "
+            "description) VALUES (?,?,?,?,?,?,?,?,?)",
+            (f"work:{work_id}", meta.get("title") or "", " ".join(authors),
+             " ".join(filter(None, [initials, work["citekey"], *work.get("aliases", [])])),
+             "", "", meta.get("venue") or "", " ".join(tags), work.get("description") or ""),
         )
 
 
@@ -310,7 +341,11 @@ def search(
         match = " AND ".join('"' + t.replace('"', '""') + '"*' for t in terms)
         rows = conn.execute(
             "SELECT f.* FROM search JOIN files f ON f.hash = search.hash "
-            "WHERE search MATCH ? ORDER BY bm25(search)", (match,),
+            # Column weights (hash, title, authors, aliases, filename, context,
+            # venue, tags, description): a hit on initials or citekey counts most,
+            # a word buried in the description least.
+            "WHERE search MATCH ? "
+            "ORDER BY bm25(search, 0, 5.0, 5.0, 10.0, 2.0, 1.0, 1.0, 2.0, 0.5)", (match,),
         ).fetchall()
     else:
         rows = conn.execute("SELECT * FROM files").fetchall()
@@ -345,9 +380,14 @@ def search(
     results: list[dict] = []
     seen_works: dict[str, dict] = {}
     for row in rows:
-        if row["hash"] not in locations or not passes(row, locations[row["hash"]]):
+        # A stand-in row for a work without a PDF has no locations; any other
+        # row without a location is a file that has left the disk.
+        if row["hash"] not in locations and not row["hash"].startswith("work:"):
             continue
-        item = _file_dict(row, locations[row["hash"]])
+        row_locations = locations.get(row["hash"], [])
+        if not passes(row, row_locations):
+            continue
+        item = _file_dict(row, row_locations)
         earlier = seen_works.get(item["work_id"]) if item["work_id"] else None
         if earlier is not None:
             earlier["locations"] += item["locations"]
@@ -364,9 +404,12 @@ def search(
         # is kept within each group.)
         results.sort(key=lambda r: r["work_id"] is None)
     if not terms:   # no relevance ranking available: order like the folder tree
-        results.sort(key=lambda r: (
-            r["locations"][0]["context"] or "",
-            r["locations"][0]["topic_order"] if r["locations"][0]["topic_order"] is not None else 999,
-            r["locations"][0]["path"],
-        ))
+        def folder_order(r: dict) -> tuple:
+            if not r["locations"]:
+                return ("~", 999, r["title"] or "")          # no file: after everything else
+            first = r["locations"][0]
+            return (first["context"] or "",
+                    first["topic_order"] if first["topic_order"] is not None else 999,
+                    first["path"])
+        results.sort(key=folder_order)
     return results[:limit] if limit else results

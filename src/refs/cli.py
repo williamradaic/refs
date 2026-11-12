@@ -561,6 +561,79 @@ def cmd_wanted(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Start the web interface on this computer only."""
+    import uvicorn
+
+    from .web.app import create_app
+
+    url = f"http://127.0.0.1:{args.port}"
+    print(f"refs is running at {url}  (Ctrl-C to stop)")
+    if args.open:
+        subprocess.Popen(["open", url])
+    # host 127.0.0.1: reachable from this Mac only, not from the network.
+    uvicorn.run(create_app(), host="127.0.0.1", port=args.port, log_level="warning")
+    return 0
+
+
+def cmd_zotero_import(args: argparse.Namespace) -> int:
+    """Bring a Zotero library in: references, collections, tags, notes, citation keys."""
+    import shutil
+    from pathlib import Path
+
+    from . import works, zotero
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    zotero_dir = Path(args.zotero_dir).expanduser()
+    if not (zotero_dir / "zotero.sqlite").exists():
+        print(f"No zotero.sqlite in {zotero_dir}.", file=sys.stderr)
+        return 1
+    items = zotero.read_items(zotero.snapshot(zotero_dir))
+
+    known_paths = {r["path"]: r["hash"] for r in conn.execute("SELECT path, hash FROM paths")}
+    known_hashes = set(known_paths.values())
+    importer = works.Importer(cfg)
+    matched = unmatched = copied = 0
+    for item in items:
+        hashes = []
+        for attachment in item["attachments"]:
+            file_hash, on_disk = zotero.locate_attachment(
+                cfg, zotero_dir, attachment, known_paths, known_hashes)
+            if file_hash:
+                hashes.append(file_hash)
+                matched += 1
+            elif on_disk is not None:
+                unmatched += 1
+                # A PDF that lives only inside Zotero: optionally copy it to the
+                # dump, where the normal pipeline will pick it up and attach it.
+                if args.copy_pdfs and not args.dry_run:
+                    target = cfg.absolute(cfg.dump) / on_disk.name
+                    if not target.exists():
+                        shutil.copy2(on_disk, target)
+                        copied += 1
+        importer.add(
+            zotero.to_record(item), file_hashes=hashes,
+            external={"key": item["key"], "citekey": item["fields"].get("citationKey"),
+                      "added": item["added"]},
+            tags=item["tags"], collections=item["collections"], notes=item["notes"],
+        )
+
+    print(f"Zotero library at {zotero_dir}: {_plural(len(items), 'reference')} (trash excluded).")
+    print(f"  {importer.joined:,} already in the library (joined to the existing work)")
+    print(f"  {importer.created:,} new works")
+    print(f"  PDFs: {matched:,} already in Dropbox and linked; {unmatched:,} exist only inside Zotero"
+          + (f"; {copied:,} copied to {cfg.dump}" if copied else ""))
+    if args.dry_run:
+        print("Dry run: nothing was written.")
+        return 0
+    importer.save()
+    scanner.scan(cfg, conn)
+    if unmatched and not args.copy_pdfs:
+        print("Run again with --copy-pdfs to copy the Zotero-only PDFs into the dump.")
+    return 0
+
+
 def cmd_setup_key(args: argparse.Namespace) -> int:
     """Store the Anthropic API key in the macOS Keychain and check that it works."""
     import getpass
@@ -658,6 +731,18 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("eval", help="check results against convention-style file names")
     p.add_argument("query", nargs="*")
     p.set_defaults(run=cmd_eval)
+
+    p = sub.add_parser("zotero-import", help="import references from a Zotero library")
+    p.add_argument("--zotero-dir", default="~/Zotero")
+    p.add_argument("--dry-run", action="store_true", help="report what would happen, write nothing")
+    p.add_argument("--copy-pdfs", action="store_true",
+                   help="copy PDFs that exist only inside Zotero into the dump")
+    p.set_defaults(run=cmd_zotero_import)
+
+    p = sub.add_parser("serve", help="start the web interface")
+    p.add_argument("--port", type=int, default=8377)
+    p.add_argument("--open", action="store_true", help="open it in the browser")
+    p.set_defaults(run=cmd_serve)
 
     p = sub.add_parser("setup-key", help="store the Anthropic API key in the Keychain")
     p.set_defaults(run=cmd_setup_key)

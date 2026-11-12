@@ -5,7 +5,8 @@ they are, in course and research folders; `refs` indexes them, recognises which
 course or project each one belongs to, and follows renames, moves and copies.
 
 Status: **Phases 1 and 2 of 4 built** (engine, metadata pipeline, works, quick
-add, rename with undo, BibTeX). Next: the web UI and live folder watching. The
+add, rename with undo, BibTeX), and a first version of the Phase 3 web UI.
+Next: live folder watching and launch at login. The
 full plan is in `local/admin/plan.md`.
 
 ## Use
@@ -31,7 +32,14 @@ refs wanted                    # works saved without a PDF yet
 refs bib blp                   # BibTeX for the best match (or `refs bib project:bets`)
 refs rename in:dump            # propose canonical names; add --apply to rename
 refs rename --undo 3           # reverse the last 3 renames
+
+refs serve --open              # the web interface, at http://127.0.0.1:8377
+refs zotero-import --dry-run   # what importing ~/Zotero would do; drop --dry-run to do it
 ```
+
+The web interface is keyboard-driven (`j`/`k` to move, `/` to search, `?` for
+all keys) and lives in `src/refs/web/`: `app.py` is the local server and JSON
+API, `static/` holds the page (plain HTML, CSS and JavaScript, no build step).
 
 Filters for `find`: `course:` / `project:` (folder slug), `term:`, `area:`,
 `in:` (context contains), `topic:`, `section:`, `kind:`, `year:`, `author:`,

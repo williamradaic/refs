@@ -32,7 +32,7 @@ def proposed_name(work: dict, current_name: str, *, allow_unverified: bool = Fal
     surnames = [a["family"] for a in meta.get("authors") or [] if a.get("family")]
     if not surnames or not meta.get("title"):
         return None
-    if meta.get("status") != "verified" and not allow_unverified:
+    if meta.get("status") not in {"verified", "confirmed"} and not allow_unverified:
         return None
     # Keep an existing "-ocr" marker: it says the file is a scan with added text.
     is_ocr = PurePosixPath(current_name).stem.lower().endswith("ocr")

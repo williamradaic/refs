@@ -122,3 +122,63 @@ def test_stub_work_is_completed_when_its_pdf_arrives(cfg):
     assert mapping["aaa"] == stub["id"]
     done = works.load_all(cfg)[stub["id"]]
     assert done["files"] == ["aaa"] and done["user"]["source_url"] == "https://example.org/blp"
+
+
+def test_user_edits_override_and_survive_resync(cfg):
+    # A needs-review item whose registry "venue" is a repository.
+    write_read(cfg, "aaa", title="Psychology and Economics", family="Rabin", year=1997,
+               doi=None, venue="RePEc: Research Papers in Economics", record_type="article")
+    work_id = works.sync(cfg)["aaa"]
+    work = works.load_all(cfg)[work_id]
+    assert work["meta"]["venue"] is None                 # a repository is not a venue
+    assert work["meta"]["is_working_paper"]
+
+    work["user"]["overrides"] = {"year": 1998, "venue": "Journal of Economic Literature",
+                                 "type": "journal-article", "volume": "36", "pages": "11-46"}
+    (works.works_dir(cfg) / f"{work_id}.json").write_text(json.dumps(work))
+    works.sync(cfg)                                      # re-processing must not undo the edit
+    edited = works.load_all(cfg)[work_id]
+    assert edited["meta"]["status"] == "confirmed" and edited["meta"]["year"] == 1998
+    assert edited["meta"]["source"] == "you" and not edited["meta"]["is_working_paper"]
+    assert "journal = {Journal of Economic Literature}" in bib.entry(edited)
+    assert edited["citekey"] == "rabin1997psychology"    # the key itself never changes
+
+
+def test_venue_labels_and_abbreviations():
+    from refs import venues
+    assert venues.abbreviation("The Quarterly Journal of Economics") == "QJE"
+    assert venues.abbreviation("Journal of Economic Behavior &amp; Organization") == "JEBO"
+    assert venues.abbreviation("Some Obscure Journal") is None
+    assert venues.clean("RePEc: Research Papers in Economics") is None
+    assert venues.label({"kind": "book", "venue": None}) == "book"
+    assert venues.label({"kind": "chapter", "venue": "Handbook of Econometrics"}) == "in Handbook of Econometrics"
+    assert venues.label({"kind": "paper", "doi": "10.3386/w32515", "type": "report"}) == "NBER working paper"
+    assert venues.label({"kind": "paper", "venue": "Econometrica", "type": "journal-article"}) == "Econometrica"
+    assert venues.label({"kind": "paper", "venue": None, "is_working_paper": True}) == "working paper"
+
+
+def test_importer_joins_existing_work_and_is_idempotent(cfg):
+    write_read(cfg, "aaa", title="Automobile Prices in Market Equilibrium", family="Berry",
+               year=1995, doi="10.2307/2171802", venue="Econometrica")
+    existing = works.sync(cfg)["aaa"]
+    blp = {"title": "Automobile prices in market equilibrium", "year": 1995, "doi": None,
+           "authors": [{"given": "Steven", "family": "Berry"}], "venue": "Econometrica",
+           "type": "journal-article", "kind": "paper", "source": "zotero"}
+    new = {"title": "A Paper Only Zotero Knows", "year": 2020, "doi": "10.1/zzz",
+           "authors": [{"given": "A.", "family": "Nobody"}], "venue": "SSRN Electronic Journal",
+           "type": "posted-content", "kind": "paper", "source": "zotero"}
+    for _ in range(2):                                   # importing twice changes nothing
+        importer = works.Importer(cfg)
+        for record, key in ((blp, "Z1"), (new, "Z2")):
+            importer.add(record, file_hashes=[], external={"key": key, "citekey": f"zot{key}"},
+                         tags=["bets"], collections=["Credit Cards!"], notes=["a note"])
+        importer.save()
+    all_works = works.load_all(cfg)
+    assert len(all_works) == 2
+    joined = all_works[existing]
+    assert joined["meta"]["status"] == "verified"        # registry metadata is kept
+    assert joined["user"]["tags"] == ["bets"] and joined["user"]["notes"] == "a note"
+    assert joined["aliases"] == ["zotZ1"]
+    created = next(w for w in all_works.values() if w["id"] != existing)
+    assert created["meta"]["status"] == "imported" and created["meta"]["venue"] is None
+    assert created["files"] == []

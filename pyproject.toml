@@ -9,10 +9,12 @@ requires-python = ">=3.12"
 # rapidfuzz, bibtexparser.
 dependencies = [
     "anthropic>=2.8.0",
+    "fastapi>=0.162.5",
     "httpx>=0.28.1",
     "keyring>=25.7.0",
     "pymupdf>=2.1",
     "rapidfuzz>=3.14.6",
+    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]

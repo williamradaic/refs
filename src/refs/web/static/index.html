@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>refs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header>
+    <span class="brand">refs</span>
+    <span class="prompt" id="prompt">/</span>
+    <input id="q" autocomplete="off" spellcheck="false"
+           placeholder="search   author:saez   course:220a   tag:theory   year:2019">
+    <span class="count" id="count"></span>
+  </header>
+
+  <main>
+    <nav id="side" aria-label="Library"></nav>
+    <div class="split" data-pane="side" title="drag to resize"></div>
+    <section id="list" aria-label="Works"></section>
+    <div class="split" data-pane="detail" title="drag to resize"></div>
+    <aside id="detail" aria-label="Details"></aside>
+  </main>
+
+  <footer>
+    <span class="keys">
+      <kbd>j</kbd><kbd>k</kbd> move <kbd>/</kbd> search <kbd>⏎</kbd> open
+      <kbd>y</kbd> citekey <kbd>b</kbd> bibtex <kbd>r</kbd> read
+      <kbd>a</kbd> add <kbd>m</kbd> materials <kbd>?</kbd> help
+    </span>
+    <span class="message" id="message"></span>
+  </footer>
+
+  <dialog id="help">
+    <pre id="helptext"></pre>
+  </dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "refs",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "refs", "serve", "--port", "8377"],
+      "port": 8377
+    }
+  ]
+}

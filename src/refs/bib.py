@@ -18,6 +18,8 @@ def _tex(text: str) -> str:
 
 def _entry_type(meta: dict) -> str:
     kind, record_type = meta.get("kind"), meta.get("type") or ""
+    if kind == "book":
+        return "book"
     if record_type == "journal-article" and not meta.get("is_working_paper"):
         return "article"
     if record_type in {"book", "monograph", "edited-book", "reference-book"} or kind == "book":
