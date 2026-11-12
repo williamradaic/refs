@@ -14,6 +14,7 @@ What is rebuilt from the read records on every sync:
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,11 +86,28 @@ def _meta_from(read: dict) -> dict:
                 ("title", "authors", "venue", "type", "doi", "volume", "issue", "pages", "publisher")}
         meta["year"] = registry.get("year_printed") or record.get("year")
         meta["source"] = record.get("source")
+        # Registries are sometimes incomplete (a first page with no end, no
+        # volume). Where the PDF is the published version and prints the missing
+        # detail, take it from the PDF, and say so in `from_pdf`.
+        meta["from_pdf"] = []
+        if not reading.get("is_working_paper"):
+            for key in ("volume", "issue"):
+                if not meta.get(key) and reading.get(key):
+                    meta[key] = str(reading[key])
+                    meta["from_pdf"].append(key)
+            printed = (reading.get("pages") or "").replace("–", "-").replace(" ", "")
+            registered = (meta.get("pages") or "").strip()
+            is_range = re.fullmatch(r"\w*\d+-\w*\d+", printed) is not None
+            # Only complete a range that starts on the page the registry gives.
+            if is_range and "-" not in registered and (not registered or printed.startswith(registered + "-")):
+                meta["pages"] = printed
+                meta["from_pdf"].append("pages")
     else:
         meta = {
             "title": reading.get("title"), "authors": reading.get("authors") or [],
             "year": reading.get("year"), "venue": reading.get("venue"),
-            "type": None, "doi": None, "volume": None, "issue": None, "pages": None,
+            "type": None, "doi": None, "volume": reading.get("volume"),
+            "issue": reading.get("issue"), "pages": reading.get("pages"),
             "publisher": None, "source": "pdf",
         }
     meta["kind"] = reading.get("kind")

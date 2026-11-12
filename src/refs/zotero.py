@@ -119,8 +119,9 @@ def to_record(item: dict) -> dict:
 
 
 def locate_attachment(cfg: Config, zotero_dir: Path, attachment: dict,
-                      known_paths: dict[str, str], known_hashes: set[str]) -> tuple[str | None, Path | None]:
-    """Find an attachment among indexed files. Returns (file hash, file on disk).
+                      known_paths: dict[str, str], known_hashes: set[str],
+                      ) -> tuple[str | None, Path | None, bool]:
+    """Find an attachment. Returns (content hash, file on disk, already indexed?).
 
     Linked files: the stored path may come from another computer, so only the
     part from a scanned folder's name onward is trusted ("…/1-Papers Library/x.pdf"
@@ -135,11 +136,11 @@ def locate_attachment(cfg: Config, zotero_dir: Path, attachment: dict,
             if anchor in parts:
                 rel = "/".join([root, *parts[parts.index(anchor) + 1:]])
                 if rel in known_paths:
-                    return known_paths[rel], cfg.absolute(rel)
-        return None, None
+                    return known_paths[rel], cfg.absolute(rel), True
+        return None, None, False
     stored = zotero_dir / "storage" / attachment["key"] / path.removeprefix("storage:")
     if not stored.is_file():
-        return None, None
+        return None, None, False
     with stored.open("rb") as handle:
         digest = hashlib.file_digest(handle, "sha256").hexdigest()
-    return (digest if digest in known_hashes else None), stored
+    return digest, stored, digest in known_hashes

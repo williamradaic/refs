@@ -87,7 +87,7 @@ def discover(target: Target) -> Target:
     if not target.pdf_url and (doi := target.ids.get("doi")):
         try:
             response = resolve._get(f"https://api.openalex.org/works/doi:{doi}")
-        except httpx.HTTPError:
+        except (httpx.HTTPError, resolve.Unavailable):
             response = None
         if response is not None:
             work = response.json()

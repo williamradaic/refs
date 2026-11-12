@@ -23,27 +23,39 @@ const GLYPH = { verified: "●", confirmed: "✓", imported: "◆", extracted: "
 // the remaining space), how to sort, and what to show.
 const last = "￿";      // sorts after every real string: empty values go to the end
 const COLUMNS = {
-  st:      { label: "",        width: 2,  sort: (i) => i.status ?? last,
+  st:      { label: "",        width: 2,  align: "center", sort: (i) => i.status ?? last,
              cell: (i) => { const st = i.status ?? "classified";
                return `<span class="st ${st}" title="${st}">${GLYPH[st] ?? "·"}</span>`; } },
   authors: { label: "authors", width: 20, cls: "au", sort: (i) => (i.authors?.[0] ?? last).toLowerCase(),
              text: (i) => authorsShort(i.authors) },
-  year:    { label: "year",    width: 5,  cls: "yr", sort: (i) => i.year ?? 0, text: (i) => i.year ?? "" },
+  year:    { label: "year",    width: 5,  cls: "yr", align: "right", sort: (i) => i.year ?? 0, text: (i) => i.year ?? "" },
   title:   { label: "title",   width: null, cls: "ti", sort: (i) => (i.title ?? last).toLowerCase(),
              text: (i) => i.title ?? i.locations[0]?.path.split("/").pop() },
   abbr:    { label: "jrnl",    width: 9,  cls: "ab", sort: (i) => (i.abbr ?? last).toLowerCase(),
              text: (i) => i.abbr ?? "" },
-  venue:   { label: "venue",   width: 22, cls: "ve", sort: (i) => (i.venue_label ?? last).toLowerCase(),
-             text: (i) => i.venue_label ?? "" },
+  venue:   { label: "publication", name: "publication", width: 22, cls: "ve",
+             sort: (i) => (i.venue_label ?? last).toLowerCase(), text: (i) => i.venue_label ?? "" },
+  // Dates are YYYY-MM-DD, so sorting them as text is sorting them in time.
+  added:   { label: "added",    width: 10, cls: "da", sort: (i) => i.added ?? "",
+             text: (i) => i.added ?? "" },
+  modified: { label: "modified", width: 10, cls: "da", sort: (i) => i.modified ?? "",
+             text: (i) => i.modified ?? "" },
 };
-const DEFAULT_LAYOUT = { order: ["st", "authors", "year", "title", "abbr", "venue"],
-  widths: {}, sort: null, side: null, detail: null };
+COLUMNS.st.name = "status"; COLUMNS.abbr.name = "journal abbreviation";
+const DEFAULT_LAYOUT = { order: ["st", "authors", "year", "title", "abbr", "venue", "added", "modified"],
+  hidden: [], widths: {}, sort: null, side: null, detail: null };
 
 // Column order, widths, sort and pane sizes are remembered in this browser.
 function loadLayout() {
   try {
     const saved = JSON.parse(localStorage.getItem("refs-layout"));
-    if (saved?.order?.length === DEFAULT_LAYOUT.order.length) return { ...DEFAULT_LAYOUT, ...saved };
+    if (saved?.order) {
+      // Keep the saved order, drop columns that no longer exist, and append
+      // any column added to the app since the layout was saved.
+      const order = saved.order.filter((id) => id in COLUMNS);
+      for (const id of DEFAULT_LAYOUT.order) if (!order.includes(id)) order.push(id);
+      return { ...DEFAULT_LAYOUT, ...saved, order, hidden: saved.hidden ?? [] };
+    }
   } catch {}
   return structuredClone(DEFAULT_LAYOUT);
 }
@@ -52,11 +64,12 @@ function saveLayout() {
 }
 function applyLayout() {
   const root = document.documentElement.style;
-  root.setProperty("--cols", layout.order.map((id) => COLUMNS[id].width === null
+  root.setProperty("--cols", visibleColumns().map((id) => COLUMNS[id].width === null
     ? "minmax(14ch, 1fr)" : `${layout.widths[id] ?? COLUMNS[id].width}ch`).join(" "));
   if (layout.side) root.setProperty("--side-w", `${layout.side}px`);
   if (layout.detail) root.setProperty("--detail-w", `${layout.detail}px`);
 }
+const visibleColumns = () => layout.order.filter((id) => !layout.hidden.includes(id));
 let layout = loadLayout();
 
 // --- talking to the server ---------------------------------------------------
@@ -91,6 +104,9 @@ async function loadSidebar() {
   html += nav("unread", data.presets.unread, `data-view="unread"`);
   html += nav("needs review", data.presets.review, `data-view="review"`);
   html += nav("no pdf yet", data.presets.wanted, `data-view="wanted"`);
+  // PDFs that are on disk but were never read (an interrupted add, or a file
+  // that arrived through Finder). Shown only when there are some.
+  if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
 
   // Contexts arrive as keys like "coursework/2026-fall/220a"; group by area,
   // and within coursework by term (newest first).
@@ -187,12 +203,16 @@ function sortItems() {
 }
 
 function renderHead() {
-  return `<div class="head">` + layout.order.map((id) => {
+  return `<div class="head">` + visibleColumns().map((id) => {
     const column = COLUMNS[id];
     const arrow = layout.sort?.col === id ? (layout.sort.dir === "desc" ? "▼" : "▲") : "";
     const grip = column.width === null ? "" : `<b class="grip" data-col="${id}"></b>`;
-    return `<span class="hc" draggable="true" data-col="${id}" title="click to sort, drag to move">${
-      esc(column.label)}<i>${arrow}</i>${grip}</span>`;
+    // The label sits on the same edge as the column's contents; the sort arrow
+    // goes on the inner side, so the label itself stays flush with the data.
+    const label = `<span class="hl">${esc(column.label)}</span>`;
+    const mark = arrow ? `<i>${arrow}</i>` : "";
+    return `<span class="hc ${column.align ?? "left"}" draggable="true" data-col="${id}"
+      title="click to sort, drag to move">${column.align === "right" ? mark + label : label + mark}${grip}</span>`;
   }).join("") + `</div>`;
 }
 
@@ -215,9 +235,10 @@ function renderList() {
       html += `<div class="topic">${esc(number + (loc.topic ?? loc.section ?? "unfiled"))}</div>`;
     }
     const cls = ["row", i === state.selected ? "sel" : "", item.read_status === "read" ? "read" : ""].join(" ");
-    html += `<div class="${cls}" data-i="${i}">` + layout.order.map((id) => {
+    html += `<div class="${cls}" data-i="${i}">` + visibleColumns().map((id) => {
       const column = COLUMNS[id];
-      return column.cell ? column.cell(item) : `<span class="${column.cls}">${esc(column.text(item))}</span>`;
+      return column.cell ? column.cell(item)
+        : `<span class="${column.cls} ${column.align ?? "left"}">${esc(column.text(item))}</span>`;
     }).join("") + `</div>`;
   });
   $("list").innerHTML = html;
@@ -278,6 +299,33 @@ $("list").addEventListener("drop", (event) => {
   draggedColumn = null;
   saveLayout(); applyLayout(); renderList();
 });
+
+// --- columns menu: show or hide each column -----------------------------------------
+
+function renderColumnMenu() {
+  $("colmenu").innerHTML = layout.order.map((id) => {
+    const shown = !layout.hidden.includes(id);
+    const name = COLUMNS[id].name ?? COLUMNS[id].label;
+    return `<div data-col="${id}" class="${shown ? "" : "off"}">[${shown ? "x" : " "}] ${esc(name)}</div>`;
+  }).join("");
+}
+$("colbutton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  renderColumnMenu();
+  $("colmenu").hidden = !$("colmenu").hidden;
+});
+$("colmenu").addEventListener("click", (event) => {
+  event.stopPropagation();                       // keep the menu open while toggling
+  const id = event.target.closest("[data-col]")?.dataset.col;
+  if (!id) return;
+  const shown = !layout.hidden.includes(id);
+  // Never hide the last visible column.
+  if (shown && visibleColumns().length === 1) return;
+  layout.hidden = shown ? [...layout.hidden, id] : layout.hidden.filter((x) => x !== id);
+  if (layout.sort && layout.hidden.includes(layout.sort.col)) { layout.sort = null; sortItems(); }
+  saveLayout(); applyLayout(); renderColumnMenu(); renderList();
+});
+document.addEventListener("click", () => { $("colmenu").hidden = true; });
 
 // --- pane dividers -----------------------------------------------------------------
 
@@ -360,6 +408,8 @@ async function renderDetail() {
   if (meta.doi) html += `<dt>doi</dt><dd><a href="https://doi.org/${esc(meta.doi)}" target="_blank" rel="noreferrer">${esc(meta.doi)}</a></dd>`;
   html += `<dt>kind</dt><dd>${esc(item.kind)}</dd>`;
   if (item.read_status) html += `<dt>read</dt><dd>${esc(item.read_status)}</dd>`;
+  if (item.added) html += `<dt>added</dt><dd>${esc(item.added)}</dd>`;
+  if (item.modified) html += `<dt>modified</dt><dd>${esc(item.modified)}</dd>`;
   html += `</dl>`;
   if (work) {
     // Corrections: edit any field by hand, pull the record for a DOI you know,
@@ -382,6 +432,10 @@ async function renderDetail() {
       item.tags.map((t) => `<span class="tag" data-tag="${esc(t)}">${esc(t)}</span>`).join("") + `</div>`;
   }
 
+  if (!item.status && item.locations.length) {
+    html += `<p class="where" style="margin-top:8px">This PDF is on disk but has not been read yet.</p>
+      <div class="acts"><button class="act" data-identify="${esc(item.locations[0].path)}">identify it now</button></div>`;
+  }
   html += `<div class="label">Files</div>`;
   if (!item.locations.length) html += `<p class="where">no pdf yet. Save it into papers-dump and it attaches itself.</p>`;
   for (const loc of item.locations) {
@@ -395,6 +449,10 @@ async function renderDetail() {
       </div></div>`;
   }
 
+  if (work?.user?.former_names?.length) {
+    html += `<div class="label">Former file names</div>` +
+      work.user.former_names.map((n) => `<div class="path">${esc(n)}</div>`).join("");
+  }
   if (bibtex) {
     html += `<div class="label">BibTeX</div><pre class="bib">${esc(bibtex)}</pre>`;
     html += `<div class="acts" style="margin-top:6px">
@@ -469,7 +527,12 @@ $("detail").addEventListener("submit", (event) => {
 
 $("detail").addEventListener("click", (event) => {
   const el = event.target;
-  if (el.dataset.open) post("/api/open", { path: el.dataset.open });
+  if (el.dataset.identify) {
+    const name = el.dataset.identify.split("/").pop();
+    say(`adding ${name} …`, 0);
+    follow(post("/api/identify", { path: el.dataset.identify }), name);
+  }
+  else if (el.dataset.open) post("/api/open", { path: el.dataset.open });
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
   else if (el.dataset.act === "edit") showEditor();
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
@@ -545,11 +608,73 @@ $("q").addEventListener("keydown", async (event) => {
     if (!thing) return;
     setAdding(false); $("q").blur();
     say(`adding ${thing} …`, 0);
-    const result = await post("/api/add", { thing });
-    say(result.message.split("\n")[0], 9000);
-    loadSidebar(); search();
+    follow(post("/api/add", { thing }), thing);
   }
   if (event.key === "ArrowDown") { event.preventDefault(); $("q").blur(); }
+});
+
+// --- following an "add" job -----------------------------------------------------------
+
+// Adding runs in the background on the server. Show elapsed time while it
+// runs, the outcome when it ends, and say so plainly if contact is lost.
+async function follow(start, label) {
+  try {
+    const begun = await start;
+    if (begun.message) { say(begun.message.split("\n")[0], 9000); return; }   // e.g. already in the library
+    if (!begun.job) { say(begun.detail ?? "could not start", 9000); return; }
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const job = await get(`/api/job/${begun.job}`);
+      if (job.state === "running") { say(`adding ${label} … ${job.seconds}s`, 0); continue; }
+      say((job.state === "failed" ? "failed: " : "") + (job.message.split("\n")[0] || job.state), 12000);
+      break;
+    }
+  } catch {
+    say(`lost contact with refs while adding ${label}. The file, if saved, is in papers-dump.`, 0);
+  }
+  loadSidebar(); search();
+}
+
+// --- adding by drop or paste ---------------------------------------------------------
+
+$("addbutton").addEventListener("click", () => setAdding(true));
+
+// A link, DOI, arXiv id or NBER number pasted anywhere (outside a text field)
+// opens the add bar with it filled in; Enter confirms.
+const LOOKS_ADDABLE = /^(https?:\/\/\S+|10\.\d{4,9}\/\S+|(arxiv:)?\d{4}\.\d{4,5}(v\d+)?|w\d{4,5})$/i;
+document.addEventListener("paste", (event) => {
+  if (event.target.matches?.("input, textarea, select")) return;
+  const text = (event.clipboardData?.getData("text") ?? "").trim();
+  if (!LOOKS_ADDABLE.test(text)) return;
+  event.preventDefault();
+  setAdding(true);
+  $("q").value = text;
+  say("press Enter to add it");
+});
+
+// Dragging files over the window (as opposed to dragging a column header).
+const draggingFiles = (event) => [...(event.dataTransfer?.types ?? [])].includes("Files");
+window.addEventListener("dragover", (event) => {
+  if (!draggingFiles(event)) return;
+  event.preventDefault();
+  document.body.classList.add("dropping");
+});
+window.addEventListener("dragleave", (event) => {
+  if (!event.relatedTarget) document.body.classList.remove("dropping");
+});
+window.addEventListener("drop", async (event) => {
+  if (!draggingFiles(event)) return;
+  event.preventDefault();
+  document.body.classList.remove("dropping");
+  const files = [...event.dataTransfer.files].filter((f) => f.name.toLowerCase().endsWith(".pdf"));
+  if (!files.length) { say("only PDF files can be added"); return; }
+  for (const file of files) {
+    say(`adding ${file.name} …`, 0);
+    const upload = fetch(`/api/upload?name=${encodeURIComponent(file.name)}`, {
+      method: "POST", headers: { "X-Refs": "1", "Content-Type": "application/pdf" }, body: file,
+    }).then((response) => response.json());
+    await follow(upload, file.name);       // one at a time, so progress stays readable
+  }
 });
 
 // --- keyboard ---------------------------------------------------------------------------
@@ -620,6 +745,18 @@ try {
   const saved = localStorage.getItem("refs-theme");
   if (saved) document.documentElement.dataset.theme = saved;
 } catch {}
+// Links into the app: /?q=blp opens with that search, /?add=<link> opens the
+// add bar with the link filled in (Enter confirms). Used by the Raycast quicklinks.
+const params = new URLSearchParams(location.search);
+if (params.get("q")) {
+  state.query = params.get("q").trim();
+  $("q").value = state.query;
+}
 applyLayout();
 loadSidebar();
 search();
+if (params.get("add")) {
+  setAdding(true);
+  $("q").value = params.get("add").trim();
+  say("press Enter to add it");
+}

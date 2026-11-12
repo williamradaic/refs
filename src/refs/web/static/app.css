@@ -111,16 +111,25 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
   gap: 1ch; padding: 1px 2ch;
   border-left: 2px solid transparent;
 }
-/* Column headers: stay at the top while the list scrolls. */
+/* Column headers: stay at the top while the list scrolls.
+   The header row keeps the SAME font size as the rows. Column widths are in
+   "ch" (character widths), which depend on font size, so a smaller header
+   font would make every header column narrower than its data column. The
+   small-capitals look is applied to the label inside instead. */
 .head {
   position: sticky; top: 0; z-index: 1;
   background: var(--bg); border-bottom: 1px solid var(--line);
-  color: var(--dim); font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
-  padding-top: 5px; padding-bottom: 4px; user-select: none;
+  padding-top: 4px; padding-bottom: 3px; user-select: none;
 }
-.hc { position: relative; cursor: pointer; white-space: nowrap; overflow: visible; }
+.hc { position: relative; cursor: pointer; white-space: nowrap; color: var(--dim); }
 .hc:hover { color: var(--fg); }
-.hc i { font-style: normal; color: var(--accent); margin-left: .6ch; font-size: 9px; }
+.hl { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+.hc i { font-style: normal; color: var(--accent); font-size: 9px; margin: 0 .6ch; }
+/* Alignment by type of content: text left, numbers right, glyphs centred. */
+.left { text-align: left; }
+.right { text-align: right; }
+.center { text-align: center; }
+.hc.right .hl { margin-right: -.1em; }   /* cancel the trailing letter-spacing */
 /* The grab area on a column's right edge. */
 .grip {
   position: absolute; top: -4px; bottom: -4px; right: -1ch; width: 1ch;
@@ -219,3 +228,25 @@ dialog pre { margin: 0; font: inherit; }
 @media (prefers-reduced-motion: no-preference) {
   .row, .nav { transition: background-color 60ms linear; }
 }
+
+/* Dropping a PDF anywhere on the window adds it: show a frame while dragging. */
+body.dropping::after {
+  content: "drop the PDF to add it";
+  position: fixed; inset: 10px; z-index: 10;
+  display: grid; place-items: center;
+  border: 1px dashed var(--accent); color: var(--accent);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  font-size: 15px; letter-spacing: .08em; pointer-events: none;
+}
+header .act { white-space: nowrap; }
+
+/* The columns menu: a plain list of [x] toggles under its button. */
+.menuwrap { position: relative; }
+.menu {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 5;
+  background: var(--bg); border: 1px solid var(--fg); padding: 6px 0; min-width: 22ch;
+}
+.menu div { padding: 0 2ch; cursor: pointer; white-space: nowrap; }
+.menu div:hover { background: var(--sel); }
+.menu .off { color: var(--dim); }
+.row .da { color: var(--dim); }

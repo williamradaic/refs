@@ -58,6 +58,9 @@ class Reading(BaseModel):
     authors: list[Author]
     year: Optional[int]
     venue: Optional[str]
+    volume: Optional[str]
+    issue: Optional[str]
+    pages: Optional[str]
     is_working_paper: bool
     description: Optional[str]
     fields: list[str]
@@ -104,6 +107,9 @@ credited as authors of this document.
 article, the draft or series date for a working paper).
 - venue: the journal, series or publisher as printed, e.g. "Econometrica" or \
 "NBER Working Paper".
+- volume, issue, pages: for a published article or chapter, the volume, issue \
+number and page range exactly as printed on these pages (pages as a range such as \
+"841-890"). Null when not printed; always null for working papers.
 - is_working_paper: true for working papers, preprints, drafts and job market \
 papers; false for published articles and everything else.
 - description: for a paper, book or chapter, two or three plain sentences saying \

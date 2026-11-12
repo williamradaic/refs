@@ -38,6 +38,9 @@ DEFAULTS: dict = {
     "no_llm": ["phd/referee"],
     # Folder names whose files the app must never rename (managed by other tools).
     "no_rename": ["canvas-sync", "overleaf"],
+    # Optional. Crossref and OpenAlex allow more requests per second to clients
+    # that identify themselves with an email. Empty = send none.
+    "contact_email": "",
 }
 
 
@@ -120,3 +123,14 @@ def load() -> Config:
         no_llm=list(settings["no_llm"]),
         no_rename=list(settings["no_rename"]),
     )
+
+
+def contact_email() -> str:
+    """The email to show registries, if you chose to set one in config.toml."""
+    config_file = Path(
+        os.environ.get("REFS_CONFIG", Path.home() / ".config" / "refs" / "config.toml"))
+    try:
+        with config_file.open("rb") as handle:
+            return str(tomllib.load(handle).get("contact_email", "")).strip()
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""

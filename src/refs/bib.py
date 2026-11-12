@@ -65,7 +65,7 @@ def entry(work: dict) -> str:
                 and not (name == "publisher" and kind == "article"):
             fields.append((name, _tex(meta[key])))
     if meta.get("pages") and kind in {"article", "incollection"}:
-        fields.append(("pages", re.sub(r"\s*-+\s*", "--", meta["pages"])))
+        fields.append(("pages", re.sub(r"\s*[-–]+\s*", "--", meta["pages"])))
     if doi:
         fields.append(("doi", doi))            # verbatim: biblatex prints DOIs as-is
 

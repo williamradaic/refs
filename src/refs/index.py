@@ -218,6 +218,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
         # paper filed under its published version is listed as that publication.
         work_id = file_to_work.get(file_hash) or file_to_work.get(supersedes.get(file_hash) or "")
         citekey = None
+        former_names: list[str] = []
         if work_id and "meta" in all_works.get(work_id, {}):
             work = all_works[work_id]
             meta, citekey = work["meta"], work["citekey"]
@@ -227,6 +228,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
             tags = list(dict.fromkeys([*tags, *work["user"].get("tags", []),
                                        *work["user"].get("collections", [])]))   # no repeats, order kept
             ids.update({f"alias{n}": a for n, a in enumerate(work.get("aliases", []))})
+            former_names = work["user"].get("former_names", [])
 
         conn.execute(
             "UPDATE files SET g_title=?, g_authors=?, g_year=?, g_ids=?, kind=?, kind_source=?, "
@@ -247,7 +249,8 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
                 title or "",
                 " ".join(authors),
                 " ".join(filter(None, [initials, citekey, *ids.values()])),
-                " ".join(PurePosixPath(p).stem for p, _ in located),
+                " ".join([*(PurePosixPath(p).stem for p, _ in located),
+                          *(PurePosixPath(n).stem for n in former_names)]),
                 " ".join(f"{ctx.key} {ctx.topic or ''} {ctx.section or ''}" for _, ctx in located),
                 venue or "",
                 " ".join(tags),

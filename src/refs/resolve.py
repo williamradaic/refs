@@ -30,11 +30,57 @@ CACHE_DIR = Path.home() / "Library" / "Caches" / "refs" / "http"
 # A generic client name. Registries answer faster when given a contact email,
 # but none is sent unless you add one yourself (a later config option).
 USER_AGENT = "refs/0.1 (personal reference manager)"
-PAUSE_SECONDS = 0.15      # be gentle: a short pause between live requests
 MAX_ATTEMPTS = 6
+# Minimum seconds between two requests to the same host. Crossref allows
+# anonymous clients one request per second and says so in its response
+# headers; the pause for each host is updated from those headers as we go.
+_pause: dict[str, float] = {"api.crossref.org": 1.05}
+_DEFAULT_PAUSE = 0.15
+_next_allowed: dict[str, float] = {}
 # Several files are processed at once, but registry requests go out one at a
 # time: Crossref answers "429 Too Many Requests" to bursts.
 _request_lock = threading.Lock()
+
+
+class Unavailable(Exception):
+    """A registry cannot be used for now (its usage quota is exhausted)."""
+
+
+# When a registry says "come back in N seconds" with a large N, that is a used-up
+# quota, not a burst limit. Remember it on disk, so every later command skips
+# that registry at once instead of waiting on it.
+_BLOCK_FILE = CACHE_DIR.parent / "registry-blocks.json"
+_QUOTA_THRESHOLD = 120          # a retry-after longer than this many seconds = quota
+
+
+def blocked_for(host: str) -> float:
+    """Seconds until `host` may be used again (0 if it is usable now)."""
+    try:
+        until = json.loads(_BLOCK_FILE.read_text()).get(host, 0)
+    except (OSError, ValueError):
+        return 0.0
+    return max(0.0, until - time.time())
+
+
+def _block(host: str, seconds: float) -> None:
+    try:
+        blocks = json.loads(_BLOCK_FILE.read_text())
+    except (OSError, ValueError):
+        blocks = {}
+    blocks[host] = time.time() + seconds
+    _BLOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _BLOCK_FILE.write_text(json.dumps(blocks))
+
+
+_email_cache: list[str] = []
+
+
+def _contact_email() -> str:
+    """Read the optional contact email once per run."""
+    if not _email_cache:
+        from .config import contact_email
+        _email_cache.append(contact_email())
+    return _email_cache[0]
 
 
 @dataclass
@@ -77,17 +123,31 @@ def _get(url: str, params: dict | None = None) -> httpx.Response | None:
             return None
         return httpx.Response(200, content=body)
 
+    host = httpx.URL(url).host
+    if blocked_for(host):
+        raise Unavailable(host)
+    email = _contact_email()
+    agent = f"{USER_AGENT[:-1]}; mailto:{email})" if email else USER_AGENT
     with _request_lock:
         for attempt in range(MAX_ATTEMPTS):
-            time.sleep(PAUSE_SECONDS)
-            response = httpx.get(
-                url, params=params, headers={"User-Agent": USER_AGENT},
-                timeout=30, follow_redirects=True,
-            )
+            # Wait until this host may be asked again.
+            time.sleep(max(0.0, _next_allowed.get(host, 0.0) - time.monotonic()))
+            response = httpx.get(url, params=params, headers={"User-Agent": agent},
+                                 timeout=30, follow_redirects=True)
+            # "x-rate-limit-limit: 1" with "x-rate-limit-interval: 1s" means one
+            # request per second: space requests accordingly, plus a margin.
+            limit = response.headers.get("x-rate-limit-limit", "")
+            interval = response.headers.get("x-rate-limit-interval", "").rstrip("s")
+            if limit.isdigit() and interval.replace(".", "", 1).isdigit() and int(limit) > 0:
+                _pause[host] = float(interval) / int(limit) * 1.05
+            _next_allowed[host] = time.monotonic() + _pause.get(host, _DEFAULT_PAUSE)
             # Rate limit or temporary outage: wait (as long as the server asks,
             # otherwise 2, 4, 8, ... seconds) and try again.
+            asked = response.headers.get("retry-after", "")
+            if response.status_code == 429 and asked.isdigit() and int(asked) > _QUOTA_THRESHOLD:
+                _block(host, int(asked))               # quota used up: do not wait for it
+                raise Unavailable(host)
             if response.status_code in {429, 500, 502, 503, 504} and attempt < MAX_ATTEMPTS - 1:
-                asked = response.headers.get("retry-after", "")
                 time.sleep(min(float(asked) if asked.isdigit() else 2 ** (attempt + 1), 60))
                 continue
             break
@@ -150,7 +210,10 @@ def _openalex_authors(doi: str) -> list[dict]:
     OpenAlex gives full display names ("Henrik Jacobsen Kleven"); the last word
     is taken as the surname, which is right for most but not all names.
     """
-    response = _get(f"https://api.openalex.org/works/doi:{doi}")
+    try:
+        response = _get(f"https://api.openalex.org/works/doi:{doi}")
+    except Unavailable:
+        return []
     if response is None:
         return []
     authors = []
@@ -367,8 +430,10 @@ def check(record: Record, title: str, surnames: list[str], year: int | None) -> 
 
 
 def best_match(title: str, surnames: list[str], year: int | None, *,
-               venue: str | None = None, is_working_paper: bool = False) -> Match | None:
-    """Search the registries and return the best candidate that passes the check.
+               venue: str | None = None, is_working_paper: bool = False,
+               ) -> tuple[Match | None, list[str]]:
+    """Search the registries and return the best candidate that passes the check,
+    plus the names of any registry that had to be skipped (quota used up).
 
     Passing the check (title and authors agree) establishes that a candidate is
     the same *work*. This function then picks the right *version* of it:
@@ -394,16 +459,22 @@ def best_match(title: str, surnames: list[str], year: int | None, *,
                 -m.title_similarity, m.year_gap if m.year_gap is not None else 99)
 
     accepted: list[Match] = []
-    for candidates in (lambda: search_crossref(title, surnames, year, venue),
-                       lambda: search_openalex(title)):
-        accepted += [m for m in (check(r, title, surnames, year) for r in candidates()) if m.accepted]
+    skipped: list[str] = []
+    for name, candidates in (("crossref", lambda: search_crossref(title, surnames, year, venue)),
+                             ("openalex", lambda: search_openalex(title))):
+        try:
+            found = candidates()
+        except Unavailable:
+            skipped.append(name)
+            continue
+        accepted += [m for m in (check(r, title, surnames, year) for r in found) if m.accepted]
         if any(ideal(m) for m in accepted):
             break
     if not accepted:
-        return None
+        return None, skipped
     best = sorted(accepted, key=rank)[0]
     # A published record far from the printed year, for a PDF that is itself a
     # published article, is a different edition or a reprint: do not use it.
     if is_published(best.record) and not ideal(best):
-        return None
-    return best
+        return None, skipped
+    return best, skipped

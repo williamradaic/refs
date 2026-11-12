@@ -60,7 +60,7 @@ def process_file(cfg: Config, api, file_hash: str, rel: str,
         "pdf": {"pages": info.pages, "has_text": info.has_text, "ids": ids,
                 "fingerprint": info.fingerprint},
         "reading": None, "registry": None, "status": "needs-review",
-        "issues": [], "usage": {}, "model": None, "reused_reading": False,
+        "issues": [], "pending": [], "usage": {}, "model": None, "reused_reading": False,
     }
 
     def save() -> dict:
@@ -81,7 +81,8 @@ def process_file(cfg: Config, api, file_hash: str, rel: str,
 
     # --- Step 1: the model reads the opening pages ----------------------------
     if previous and previous.get("reading"):
-        reading = llm.Reading(**previous["reading"])
+        # Records made before volume/issue/pages were transcribed lack those keys.
+        reading = llm.Reading(**{"volume": None, "issue": None, "pages": None, **previous["reading"]})
         result["usage"], result["model"] = previous.get("usage", {}), previous.get("model")
         result["reused_reading"] = True
     else:
@@ -122,8 +123,13 @@ def process_file(cfg: Config, api, file_hash: str, rel: str,
         found: resolve.Match | None = None
         id_is_published = by_id is not None and resolve.is_published(by_id.record)
         if title and not id_is_published:
-            found = resolve.best_match(title, surnames, reading.year, venue=reading.venue,
-                                       is_working_paper=reading.is_working_paper)
+            found, skipped = resolve.best_match(
+                title, surnames, reading.year, venue=reading.venue,
+                is_working_paper=reading.is_working_paper)
+            # A registry that could not be asked (quota used up) is noted, so
+            # this file is looked up again once it is available.
+            if found is None and skipped:
+                result["pending"] = skipped
     except Exception as error:                 # registry unreachable: keep the reading
         result["issues"].append(f"registry lookup failed: {type(error).__name__}: {error}")
         result["status"] = "extracted" if title and reading.confidence != "low" else "needs-review"

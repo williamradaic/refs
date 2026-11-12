@@ -276,7 +276,7 @@ def cmd_process(args: argparse.Namespace) -> int:
     """Run the reading + lookup pipeline on the files a query selects."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from . import llm, pipeline
+    from . import llm, pipeline, resolve
 
     cfg = config.load()
     conn = index.connect(cfg)
@@ -285,7 +285,8 @@ def cmd_process(args: argparse.Namespace) -> int:
         print("Say which files (e.g. `refs process course:220a kind:paper`), or pass --all.",
               file=sys.stderr)
         return 2
-    files = index.search(conn, terms, filters, limit=None)
+    # Works without a PDF have nothing to read.
+    files = [f for f in index.search(conn, terms, filters, limit=None) if f["locations"]]
     # Each file is paid for once. A file is (re)done when it has no read record,
     # when an earlier attempt failed part-way, or when asked: --relookup repeats
     # only the free registry step, --redo starts from scratch.
@@ -297,7 +298,10 @@ def cmd_process(args: argparse.Namespace) -> int:
             return old is not None and bool(old.get("reading"))
         if old is None or args.redo:
             return True
-        return any("failed" in issue for issue in old["issues"])
+        # A lookup that was skipped because OpenAlex's quota was used up is
+        # retried once OpenAlex is available again (the saved reading is reused).
+        waiting = old.get("pending") and not resolve.blocked_for("api.openalex.org")
+        return bool(waiting) or any("failed" in issue for issue in old["issues"])
 
     todo = [f for f in files if needs_work(f)]
     if args.limit:
@@ -524,14 +528,25 @@ def cmd_rename(args: argparse.Namespace) -> int:
             continue
         final = rename.disambiguate(new_name, set(names), is_wp)
         names[final] = file_hash
-        planned.append((rel, final))
+        planned.append((rel, final, file_hash))
 
     done = 0
-    for rel, new_name in planned:
-        if args.apply:
-            done += rename.apply(cfg, rel, new_name) is not None
-        else:
+    file_to_work = {h: w for w in all_works.values() for h in w["files"]}
+    for rel, new_name, file_hash in planned:
+        if not args.apply:
             print(f"{rel}\n    -> {new_name}")
+            continue
+        if rename.apply(cfg, rel, new_name, file_hash) is None:
+            continue
+        done += 1
+        # Keep the old name on the work: your descriptive names stay searchable.
+        work = file_to_work.get(file_hash)
+        if work is not None:
+            former = work["user"].setdefault("former_names", [])
+            old_name = PurePosixPath(rel).name
+            if old_name not in former:
+                former.append(old_name)
+                records.write_json(works.works_dir(cfg) / f"{work['id']}.json", work)
     if args.apply:
         scanner.scan(cfg, conn)
         print(f"Renamed {done:,} of {len(planned):,} files. Undo with `refs rename --undo {done}`.")
@@ -567,11 +582,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     from .web.app import create_app
 
-    url = f"http://127.0.0.1:{args.port}"
+    url = f"http://refs.localhost:{args.port}"
     print(f"refs is running at {url}  (Ctrl-C to stop)")
     if args.open:
         subprocess.Popen(["open", url])
-    # host 127.0.0.1: reachable from this Mac only, not from the network.
+    # Always 127.0.0.1: the server is reachable from this Mac only, never from
+    # the network. (That is also why the address keeps its port number: without
+    # admin rights, macOS only allows port 80 on all network interfaces.)
     uvicorn.run(create_app(), host="127.0.0.1", port=args.port, log_level="warning")
     return 0
 
@@ -598,20 +615,22 @@ def cmd_zotero_import(args: argparse.Namespace) -> int:
     for item in items:
         hashes = []
         for attachment in item["attachments"]:
-            file_hash, on_disk = zotero.locate_attachment(
+            file_hash, on_disk, indexed = zotero.locate_attachment(
                 cfg, zotero_dir, attachment, known_paths, known_hashes)
-            if file_hash:
+            if indexed:
                 hashes.append(file_hash)
                 matched += 1
             elif on_disk is not None:
                 unmatched += 1
                 # A PDF that lives only inside Zotero: optionally copy it to the
-                # dump, where the normal pipeline will pick it up and attach it.
+                # dump. Its content hash is attached to the work right away, so
+                # the copy belongs to the right paper without being re-identified.
                 if args.copy_pdfs and not args.dry_run:
                     target = cfg.absolute(cfg.dump) / on_disk.name
                     if not target.exists():
                         shutil.copy2(on_disk, target)
                         copied += 1
+                    hashes.append(file_hash)
         importer.add(
             zotero.to_record(item), file_hashes=hashes,
             external={"key": item["key"], "citekey": item["fields"].get("citationKey"),

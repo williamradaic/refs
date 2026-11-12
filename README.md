@@ -47,6 +47,14 @@ Filters for `find`: `course:` / `project:` (folder slug), `term:`, `area:`,
 Add `--json` to `find`, `status`, `contexts`, `dupes` or `scan` for machine-readable
 output; this is how coding agents query the library.
 
+## Launching
+
+- Address: `http://refs.localhost:8377` (any `.localhost` name points at this Mac).
+  `/?q=blp` opens with a search; `/?add=<link>` opens the add bar filled in.
+- Raycast: run **Import Quicklinks** and choose `extras/raycast-quicklinks.json`
+  for three quicklinks: `refs`, `refs search`, `refs add`.
+- As an app: in Chrome, ⋮ → Cast, Save and Share → Install page as app.
+
 ## How it identifies files
 
 A file is its content (SHA-256 hash), not its path. One scan classifies every PDF:

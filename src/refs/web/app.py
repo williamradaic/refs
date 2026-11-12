@@ -7,12 +7,20 @@ the endpoints below, which reuse the same index and work files as the CLI.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import re
+import secrets
 import subprocess
 import sys
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 
-from fastapi import Body, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, PlainTextResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .. import bib, config, index, records, resolve, venues, works
@@ -27,6 +35,50 @@ def create_app() -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
+    # --- who may talk to this server -----------------------------------------------
+    # 1. Only this computer. The server already listens on 127.0.0.1 only; this
+    #    check is a second lock in case it is ever started some other way.
+    @app.middleware("http")
+    async def local_only(request, call_next):
+        client = request.client.host if request.client else ""
+        if client not in {"127.0.0.1", "::1", "testclient"}:
+            return PlainTextResponse("refs only answers this computer.", status_code=403)
+        return await call_next(request)
+
+    # 2. Only under its own names. This stops a web page elsewhere from pointing
+    #    a domain it controls at 127.0.0.1 and talking to refs through the browser.
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[
+        "localhost", "127.0.0.1", "*.localhost", "refs.test", "testserver"])
+
+    # --- background jobs ------------------------------------------------------------
+    # Adding a paper means downloading, reading and looking it up, which can
+    # take from seconds to minutes. The request returns at once with a job id,
+    # and the page asks how the job is doing until it finishes.
+    jobs: dict[str, dict] = {}
+
+    def start_add(thing: str, label: str) -> dict:
+        job_id = secrets.token_hex(4)
+        jobs[job_id] = {"state": "running", "label": label, "message": "", "started": time.time()}
+
+        def run() -> None:
+            try:
+                done = subprocess.run([sys.executable, "-m", "refs.cli", "add", thing],
+                                      capture_output=True, text=True, timeout=1800)
+                jobs[job_id].update(state="done" if done.returncode == 0 else "failed",
+                                    message=(done.stdout or done.stderr).strip())
+            except Exception as error:                     # timeout, or could not start
+                jobs[job_id].update(state="failed", message=f"{type(error).__name__}: {error}")
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"job": job_id}
+
+    @app.get("/api/job/{job_id}")
+    def job(job_id: str) -> dict:
+        found = jobs.get(job_id)
+        if found is None:
+            raise HTTPException(404)
+        return {**found, "seconds": int(time.time() - found["started"])}
+
     # --- helpers ---------------------------------------------------------------
 
     def guard(marker: str | None) -> None:
@@ -39,11 +91,37 @@ def create_app() -> FastAPI:
         if marker != "1":
             raise HTTPException(403, "missing X-Refs header")
 
+    def dates(locations: list[dict], work: dict | None) -> tuple[str | None, str | None]:
+        """(date added, date modified) as YYYY-MM-DD.
+
+        Added: when the earliest PDF of the work appeared on disk, or the date
+        it was added to Zotero if that is earlier; a work with no PDF uses the
+        day it entered the library. Modified: the newest change to any of its PDFs.
+        """
+        created, changed = [], []
+        for loc in locations:
+            try:
+                info = os.stat(cfg.absolute(loc["path"]))
+            except OSError:
+                continue
+            created.append(getattr(info, "st_birthtime", info.st_mtime))
+            changed.append(info.st_mtime)
+        day = lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%d")   # noqa: E731
+        candidates = [day(min(created))] if created else []
+        user = (work or {}).get("user", {})
+        if (user.get("zotero") or {}).get("added"):
+            candidates.append(user["zotero"]["added"][:10])
+        if not candidates and work:
+            candidates.append(work["created"][:10])
+        return (min(candidates) if candidates else None), (day(max(changed)) if changed else None)
+
     def shape(item: dict, all_works: dict) -> dict:
         """One search result as the page needs it."""
         work = all_works.get(item["work_id"] or "")
         meta = (work or {}).get("meta") or {}
+        added, modified = dates(item["locations"], work)
         return {
+            "added": added, "modified": modified,
             # Venue column: the journal for articles, otherwise what the item is.
             "venue_label": venues.label(meta) if meta else item["kind"],
             "abbr": venues.abbreviation(meta.get("venue")) if meta else None,
@@ -60,6 +138,7 @@ def create_app() -> FastAPI:
         """A work saved without a PDF, shaped like a search result."""
         meta = work["meta"]
         return {
+            "added": dates([], work)[0], "modified": None,
             "venue_label": venues.label(meta), "abbr": venues.abbreviation(meta.get("venue")),
             "id": work["id"], "work_id": work["id"], "citekey": work["citekey"],
             "title": meta.get("title"), "year": meta.get("year"), "venue": meta.get("venue"),
@@ -89,6 +168,8 @@ def create_app() -> FastAPI:
         terms, filters = _split_query(q.split())
         if view == "review":
             filters["status"] = "needs-review"
+        if view == "unprocessed":                  # PDFs on disk that were never read
+            filters["status"], scope = "unprocessed", "all"
         try:
             found = index.search(conn, terms, filters, limit=None)
         except ValueError as error:
@@ -119,6 +200,9 @@ def create_app() -> FastAPI:
                 "unread": sum(user(i).get("read_status") == "unread" for i in library),
                 "review": sum(i["status"] == "needs-review" for i in library),
                 "wanted": sum(not w["files"] for w in all_works.values()),
+                "unprocessed": conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE status IS NULL "
+                    "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
             },
             "contexts": [{"key": key, "count": len(ids)} for key, ids in sorted(contexts.items())],
             "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
@@ -225,8 +309,44 @@ def create_app() -> FastAPI:
         """Quick add. Runs the same code as `refs add`, as a separate process,
         because it can take a while (download, model, registry)."""
         guard(x_refs)
-        done = subprocess.run([sys.executable, "-m", "refs.cli", "add", thing],
-                              capture_output=True, text=True, timeout=300)
-        return {"ok": done.returncode == 0, "message": (done.stdout or done.stderr).strip()}
+        return start_add(thing, thing)
+
+    @app.post("/api/identify")
+    def identify(path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
+        """Run the pipeline on a PDF that is indexed but was never identified."""
+        guard(x_refs)
+        conn = index.connect(cfg)
+        if conn.execute("SELECT 1 FROM paths WHERE path=?", (path,)).fetchone() is None:
+            raise HTTPException(404)
+        return start_add(str(cfg.absolute(path)), Path(path).name)
+
+    @app.post("/api/upload")
+    async def upload(request: Request, name: str = "upload.pdf",
+                     x_refs: str | None = Header(default=None)) -> dict:
+        """A PDF dropped on the page: save it into the dump, then add it like any other."""
+        guard(x_refs)
+        body = await request.body()
+        if not body.startswith(b"%PDF"):
+            raise HTTPException(400, "that file is not a PDF")
+        # The same PDF may already be in the library: do not store a second copy.
+        known = index.connect(cfg).execute(
+            "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
+            (hashlib.sha256(body).hexdigest(),)).fetchone()
+        if known is not None and known["status"] is None:
+            # On disk, but never identified (an earlier attempt was interrupted).
+            return start_add(str(cfg.absolute(known["path"])), Path(known["path"]).name)
+        if known is not None:
+            return {"ok": True, "message": f"Already in the library: {known['path']}"}
+        # Keep the dropped file's name, minus anything unsafe in a file name.
+        safe = re.sub(r"[^\w .()+,&'-]", "_", Path(name).name).strip() or "upload.pdf"
+        if not safe.lower().endswith(".pdf"):
+            safe += ".pdf"
+        target = cfg.absolute(cfg.dump) / safe
+        number = 2
+        while target.exists():                     # never overwrite an existing file
+            target = target.with_name(f"{Path(safe).stem}-{number}.pdf")
+            number += 1
+        target.write_bytes(body)
+        return start_add(str(target), target.name)
 
     return app

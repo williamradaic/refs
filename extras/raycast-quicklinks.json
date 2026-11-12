@@ -1,0 +1,17 @@
+[
+  {
+    "name": "refs",
+    "link": "http://refs.localhost:8377/",
+    "iconName": "book-16"
+  },
+  {
+    "name": "refs search",
+    "link": "http://refs.localhost:8377/?q={argument name=\"query\"}",
+    "iconName": "magnifying-glass-16"
+  },
+  {
+    "name": "refs add",
+    "link": "http://refs.localhost:8377/?add={argument name=\"link, DOI, arXiv id or NBER number\"}",
+    "iconName": "plus-16"
+  }
+]
