@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- refs favicon: "r/" in JetBrains Mono Bold, outlined to paths (a favicon
+       cannot load web fonts). Colours from app.css: dark-theme bg, light-theme
+       bg as the white, dark-theme accent for the slash. -->
+  <rect width="64" height="64" rx="12" fill="#101211"/>
+  <!-- font units (y up, 1000/em) to the 64px box: scale 0.042 (glyphs span
+       ~44px, leaving ~10px padding each side), flipped, centred on their bbox -->
+  <g transform="translate(6.023 47.12) scale(0.042 -0.042)">
+    <path fill="#f5f3ec" d="M97 0V550H219V443Q229 497 268.5 528.5Q308 560 371 560Q455 560 502.0 506.0Q549 452 549 355V303H424V349Q424 399 398.0 425.5Q372 452 324 452Q274 452 248.0 422.0Q222 392 222 337V0Z"/>
+    <path fill="#e3a750" transform="translate(600 0)" d="M60 -110 410 830H540L190 -110Z"/>
+  </g>
+</svg>
