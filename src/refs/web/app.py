@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -30,9 +31,24 @@ from ..cli import _split_query
 STATIC = Path(__file__).parent / "static"
 
 
-def create_app() -> FastAPI:
+def create_app(watch: bool = False) -> FastAPI:
+    """The server. `watch=True` also follows Dropbox for changes (watch.py)
+    for as long as the server runs, which is how `refs serve` starts it."""
     cfg = config.load()
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    watcher = None
+    if watch:
+        from ..watch import Watcher
+        watcher = Watcher(cfg)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if watcher is not None:
+            watcher.start()
+        yield
+        if watcher is not None:
+            watcher.stop()
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     # --- who may talk to this server -----------------------------------------------
@@ -71,6 +87,14 @@ def create_app() -> FastAPI:
 
         threading.Thread(target=run, daemon=True).start()
         return {"job": job_id}
+
+    @app.get("/api/changes")
+    def changes() -> dict:
+        """What the folder watcher last did. The page polls this and reloads the
+        list when `generation` moves, so a PDF saved in Finder shows up by itself."""
+        if watcher is None:
+            return {"watching": False, "generation": 0, "last_pass": None, "message": ""}
+        return watcher.status()
 
     @app.get("/api/job/{job_id}")
     def job(job_id: str) -> dict:

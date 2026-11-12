@@ -4,10 +4,11 @@ A folder-aware reference manager that sits on top of Dropbox. PDFs stay where
 they are, in course and research folders; `refs` indexes them, recognises which
 course or project each one belongs to, and follows renames, moves and copies.
 
-Status: **Phases 1 and 2 of 4 built** (engine, metadata pipeline, works, quick
-add, rename with undo, BibTeX), and a first version of the Phase 3 web UI.
-Next: live folder watching and launch at login. The
-full plan is in `local/admin/plan.md`.
+Status: **Phases 1–3 of 4 built**: engine, metadata pipeline, works, quick
+add, rename with undo, BibTeX, the web UI, live folder watching and launch at
+login. Still open from Phase 3: the bookmarklet and first-page thumbnails.
+Next: Phase 4 (filing out of the dump, rename approval in the UI, project
+`.bib` files). The full plan is in `local/admin/plan.md`.
 
 ## Use
 
@@ -33,7 +34,8 @@ refs bib blp                   # BibTeX for the best match (or `refs bib project
 refs rename in:dump            # propose canonical names; add --apply to rename
 refs rename --undo 3           # reverse the last 3 renames
 
-refs serve --open              # the web interface, at http://127.0.0.1:8377
+refs serve --open              # the web interface, at http://127.0.0.1:8377 (also watches Dropbox)
+refs watch                     # watch Dropbox without the web interface; --once for one pass
 refs zotero-import --dry-run   # what importing ~/Zotero would do; drop --dry-run to do it
 ```
 
@@ -46,6 +48,29 @@ Filters for `find`: `course:` / `project:` (folder slug), `term:`, `area:`,
 `status:` (verified, extracted, needs-review, classified, unprocessed), `tag:`.
 Add `--json` to `find`, `status`, `contexts`, `dupes` or `scan` for machine-readable
 output; this is how coding agents query the library.
+
+## Following Dropbox
+
+While refs runs (`refs serve`, so also the login service) it watches the
+scanned folders (`src/refs/watch.py`). A few seconds after changes settle it
+scans, then reads any PDF it has never read (`src/refs/ingest.py`, the same
+steps as `refs add`):
+
+| Where the new PDF is | What happens |
+|---|---|
+| `papers-dump` (saved from a browser, Finder, Dropbox on the phone) | read, filed under its work, renamed if verified; a notification says what arrived |
+| anywhere else under the roots | read and filed; never renamed |
+| moved, renamed, copied or annotated | recognised from the scan; nothing is read again |
+| still downloading (no `%%EOF` yet) | left until the download finishes |
+
+At startup it does one pass, which catches whatever changed while it was off.
+A file whose reading failed is not retried automatically (`refs process` does
+that). `auto_process` in `~/.config/refs/config.toml` sets what is read:
+`"all"` (default, about $0.001 a file), `"dump"`, or `"none"`. Online-only
+Dropbox files are not read until they are downloaded. Only one refs process
+watches at a time, and an ingest from `refs add` and one from the watcher
+never run together, so no file is paid for twice. The web page reloads its
+list by itself when something changed.
 
 ## Launching
 
@@ -111,10 +136,17 @@ no usable registry record and end as extracted or needs-review.
 | Registry response cache | `~/Library/Caches/refs/http/` |
 | Settings override (optional) | `~/.config/refs/config.toml` |
 
-Defaults (`src/refs/config.py`): scans `Dropbox/phd` and `Dropbox/papers-dump`;
-never enters `phd/admission` or `phd/move-in` (personal paperwork), figure
-folders, `_versions`, or its own state folder. Online-only Dropbox files are
-listed but not read, because reading them would force a download.
+Defaults (`src/refs/config.py`): scans `Dropbox/phd` and `Dropbox/papers-dump`
+(not `~/phd`, so `~/phd/admin` is never seen); never enters `phd/admission` or
+`phd/move-in` (personal paperwork), any folder named `admin` at any depth,
+figure folders, `_versions`, or its own state folder. Online-only Dropbox files
+are listed but not read, because reading them would force a download.
+
+To keep more away from refs, list folders or single files under
+`exclude_paths` in `~/.config/refs/config.toml`; they are added to the
+defaults, never in place of them. Or put paperwork in a folder named `admin`.
+An excluded file disappears from the index on the next scan; whatever was
+already read from it stays in `dropbox/reads/` until you delete that record.
 
 ## What refs puts on this Mac
 
@@ -124,7 +156,7 @@ Everything outside this repository, so it can be tracked and removed.
 |---|---|---|
 | The `refs` command | `~/.local/bin/refs` (a uv tool, editable install of this repo) | `uv tool install --editable .` |
 | Login service | `~/Library/LaunchAgents/com.williamradaic.refs.plist` | `refs service install` |
-| Service log | `~/Library/Logs/refs.log` | the service |
+| Service log (incl. what the watcher did) | `~/Library/Logs/refs.log` | the service |
 | Settings | `~/.config/refs/config.toml` (contact email for registries) | by hand |
 | API key | macOS Keychain, item `refs` | `refs setup-key` |
 | Index (rebuildable) | `~/Library/Application Support/refs/` | `refs scan` |
@@ -166,8 +198,12 @@ Dropbox and your PDFs are left untouched.
 ```sh
 uv sync            # create .venv with the dev tools
 uv run pytest      # run the tests
-uv tool install --editable .   # (re)install the `refs` command
+uv tool install --editable . --force   # (re)install the `refs` command
 ```
+
+The `refs` command runs from its own environment. Code changes reach it
+through the editable install (`refs service restart` to load them), but a new
+dependency in `pyproject.toml` needs the `uv tool install` line again first.
 
 `scripts/measure_identifiers.py` reports how many papers carry an identifier a
 registry can resolve (about a third, as of the first run).

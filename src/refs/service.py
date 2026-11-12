@@ -79,7 +79,14 @@ def restart() -> str:
     """Stop and start the service, e.g. to pick up changes to the code."""
     if not is_loaded():
         return "The service is not installed. Run `refs service install`."
-    subprocess.run(["launchctl", "kickstart", "-k", f"{_domain()}/{LABEL}"], capture_output=True)
+    # kickstart can hang when launchd has given up on a service that kept
+    # failing to start (say, while `uv tool install` was replacing the program).
+    # Unloading and loading it again always works, so fall back to that.
+    try:
+        subprocess.run(["launchctl", "kickstart", "-k", f"{_domain()}/{LABEL}"],
+                       capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return install()
     return "Restarted."
 
 

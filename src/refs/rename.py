@@ -57,6 +57,21 @@ def disambiguate(name: str, taken: set[str], is_working_paper: bool) -> str:
     return f"{stem}-{number}.pdf"
 
 
+def free_name(cfg: Config, rel: str, new_name: str, is_working_paper: bool) -> str | None:
+    """The name one file should get in its own folder, or None to leave it as is.
+
+    Other PDFs already in the folder keep their names; the file's own current
+    name does not count as taken, since renaming frees it. So a working paper
+    already called "...-wp.pdf" next to the published "....pdf" stays put
+    instead of becoming "...-2.pdf".
+    """
+    current = PurePosixPath(rel).name
+    folder = cfg.absolute(rel).parent
+    taken = {p.name for p in folder.glob("*.pdf")} - {current}
+    final = disambiguate(new_name, taken, is_working_paper)
+    return None if final == current else final
+
+
 def blocked_reason(cfg: Config, rel: str) -> str | None:
     """Why this file must be left alone, or None if renaming is allowed."""
     parts = PurePosixPath(rel).parts[:-1]

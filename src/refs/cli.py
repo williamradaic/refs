@@ -7,6 +7,7 @@
     refs dupes                files stored in more than one place
     refs open blp             open the best match in the default PDF viewer
     refs path blp             print its full path (handy inside scripts)
+    refs watch                follow Dropbox for new PDFs (`refs serve` already does)
 
 `find`, `status`, `contexts` and `dupes` accept --json, which is what lets
 coding agents use the library.
@@ -415,7 +416,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     import shutil
     from pathlib import Path
 
-    from . import bib, capture, llm, pipeline, rename, resolve, storage, works
+    from . import capture, ingest, resolve, works
 
     cfg = config.load()
     conn = index.connect(cfg)
@@ -447,32 +448,25 @@ def cmd_add(args: argparse.Namespace) -> int:
         print(f"  @{work['citekey']} . Save the PDF into papers-dump and it will attach itself.")
         return 0
 
-    # 3. Index the new file, run the pipeline on it, and file it under its work.
+    # 3. Index the new file, then read it, file it under its work and, inside
+    #    the dump, rename it (ingest.py; the folder watcher runs the same steps).
+    #    The lock keeps the watcher from reading the same new file in parallel.
     rel = str(path.relative_to(cfg.dropbox_root))
-    scanner.scan(cfg, conn)
-    row = conn.execute("SELECT hash FROM paths WHERE path=?", (rel,)).fetchone()
-    if row is None:
-        print(f"The file was saved to {rel} but could not be indexed.")
+    with ingest.exclusive(cfg):
+        scanner.scan(cfg, conn)
+        row = conn.execute("SELECT hash FROM paths WHERE path=?", (rel,)).fetchone()
+        if row is None:
+            print(f"The file was saved to {rel} but could not be indexed.")
+            return 1
+        [item] = ingest.ingest(cfg, conn, [(rel, row["hash"])], source_url=source_url,
+                               check_complete=False)
+    if item.read is None:
+        print(f"Saved to {item.rel}, but not read: {item.skipped}.")
         return 1
-    read = pipeline.load_read(cfg, row["hash"]) or pipeline.process_file(
-        cfg, llm.client(), row["hash"], rel, pipeline.known_topics(cfg))
-    file_to_work = works.sync(cfg)
-    work = works.load_all(cfg).get(file_to_work.get(row["hash"], ""))
-    if work and source_url and not work["user"].get("source_url"):
-        work["user"]["source_url"] = source_url
-        pipeline.records.write_json(works.works_dir(cfg) / f"{work['id']}.json", work)
 
-    # 4. Inside the dump, a verified paper gets its proper name straight away.
-    if work and rel.startswith(cfg.dump + "/"):
-        downloaded = path.name.startswith("added-")      # the app's own temporary name
-        new_name = rename.proposed_name(work, path.name, allow_unverified=downloaded)
-        rel = (new_name and rename.apply(cfg, rel, new_name, row["hash"])) or rel
-    scanner.scan(cfg, conn)
-
-    meta = pipeline.final_metadata(read)
-    print(f"Added [{read['status']}]: {', '.join(meta['surnames'][:3])} ({meta['year']}) {meta['title']}")
-    print(f"  {rel}" + (f"   @{work['citekey']}" if work else ""))
-    for issue in read["issues"]:
+    print(f"Added {ingest.headline(item)}")
+    print(f"  {item.rel}" + (f"   @{item.work['citekey']}" if item.work else ""))
+    for issue in item.read["issues"]:
         print(f"  ! {issue}")
     return 0
 
@@ -526,7 +520,13 @@ def cmd_rename(args: argparse.Namespace) -> int:
         if names.get(new_name) == file_hash:
             copies.append(rel)                     # same content as a file already planned
             continue
-        final = rename.disambiguate(new_name, set(names), is_wp)
+        # The file's own current name is not "taken": renaming frees it. (Counting
+        # it turned "x-wp.pdf", next to the published "x.pdf", into "x-2.pdf".)
+        current = PurePosixPath(rel).name
+        others = {n for n, owner in names.items() if not (n == current and owner in ("", file_hash))}
+        final = rename.disambiguate(new_name, others, is_wp)
+        if final == current:
+            continue                               # already has the right name
         names[final] = file_hash
         planned.append((rel, final, file_hash))
 
@@ -583,13 +583,36 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from .web.app import create_app
 
     url = f"http://refs.localhost:{args.port}"
-    print(f"refs is running at {url}  (Ctrl-C to stop)")
+    print(f"refs is running at {url}  (Ctrl-C to stop)", flush=True)
     if args.open:
         subprocess.Popen(["open", url])
     # Always 127.0.0.1: the server is reachable from this Mac only, never from
     # the network. (That is also why the address keeps its port number: without
     # admin rights, macOS only allows port 80 on all network interfaces.)
-    uvicorn.run(create_app(), host="127.0.0.1", port=args.port, log_level="warning")
+    uvicorn.run(create_app(watch=not args.no_watch), host="127.0.0.1", port=args.port,
+                log_level="warning")
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Follow Dropbox in the foreground, without the web interface (watch.py)."""
+    import time
+
+    from .watch import Watcher, notify
+
+    cfg = config.load()
+    watcher = Watcher(cfg, notifier=None if args.quiet else notify)
+    if args.once:
+        watcher.run_pass()
+        return 0
+    if not watcher.start():
+        return 1
+    print("Watching for changes (Ctrl-C to stop).", flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        watcher.stop()
     return 0
 
 
@@ -771,7 +794,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("serve", help="start the web interface")
     p.add_argument("--port", type=int, default=8377)
     p.add_argument("--open", action="store_true", help="open it in the browser")
+    p.add_argument("--no-watch", action="store_true",
+                   help="do not follow Dropbox for new and changed PDFs")
     p.set_defaults(run=cmd_serve)
+
+    p = sub.add_parser("watch", help="follow Dropbox for new PDFs (already part of `serve`)")
+    p.add_argument("--once", action="store_true", help="one scan-and-read pass, then stop")
+    p.add_argument("--quiet", action="store_true", help="no macOS notifications")
+    p.set_defaults(run=cmd_watch)
 
     p = sub.add_parser("service", help="run refs in the background, starting at login")
     p.add_argument("action", choices=["install", "uninstall", "restart", "status"])

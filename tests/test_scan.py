@@ -204,3 +204,21 @@ def test_processed_files_are_searchable_by_registry_metadata(lib):
     assert item["authors"] == ["Barberis", "Shleifer", "Vishny"]
     assert item["kind"] == "paper" and item["doi"].startswith("10.1016/")
     assert index.search(lib.conn, [], {"status": "unprocessed"}) == []
+
+
+def test_admin_folders_and_excluded_files_are_never_read(lib, tmp_path, monkeypatch):
+    # Paperwork in any folder named "admin" is skipped, at any depth.
+    lib.write("phd/admin/gsr-contract.pdf", b"contract")
+    lib.write("phd/research/bets/local/Admin/reimbursement.pdf", b"receipt")
+    lib.write(f"{READING}/transcript.pdf", b"grades")
+    lib.write(BLP, b"blp content")
+
+    # One more file excluded in config.toml; the default exclusions still hold.
+    settings = tmp_path / "config.toml"
+    settings.write_text(f'exclude_paths = ["{READING}/transcript.pdf"]\n')
+    monkeypatch.setenv("REFS_CONFIG", str(settings))
+    lib.cfg = config.load()
+    assert "phd/admission" in lib.cfg.exclude_paths and "admin" in lib.cfg.ignore_dirs
+
+    report = lib.scan()
+    assert report.added == [BLP]

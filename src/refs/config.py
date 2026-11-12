@@ -5,6 +5,10 @@ and set only the keys you want to override, for example:
 
     roots = ["phd", "papers-dump", "Theory Reading Group"]
 
+The lists that keep files away from the app (exclude_paths, ignore_dirs,
+no_llm, no_rename) are the exception: entries in the file are added to the
+defaults, never in place of them.
+
 All folder settings are written relative to the Dropbox root (never as
 `/Users/...`), so the same settings work on another Mac or on a server.
 """
@@ -27,21 +31,33 @@ DEFAULTS: dict = {
     "state_dir": "phd/tools/refs",
     # Folders left out entirely: visa, immigration and insurance paperwork.
     # They are not references, and must never reach an index or an LLM.
+    # Single files can be listed too (say, a transcript inside a course folder).
     "exclude_paths": ["phd/admission", "phd/move-in"],
     # Folder names skipped everywhere (compared case-insensitively). Figure
     # folders hold plots, not documents; `_versions` holds old canvas-sync copies.
+    # `admin` is where paperwork goes (reimbursements, contracts, the `local/admin`
+    # of the project layout): any folder of that name is never read.
     "ignore_dirs": [
         ".git", ".claude", ".venv", "node_modules", "__pycache__",
-        "_versions", "fig", "figs", "figures",
+        "_versions", "fig", "figs", "figures", "admin",
     ],
     # Path prefixes whose contents are never sent to an LLM (confidential).
     "no_llm": ["phd/referee"],
     # Folder names whose files the app must never rename (managed by other tools).
     "no_rename": ["canvas-sync", "overleaf"],
+    # What the folder watcher (part of `refs serve`) reads when a new PDF
+    # appears: "all" = new PDFs anywhere under the roots (about $0.001 each),
+    # "dump" = only those saved into the dump, "none" = keep the index current
+    # but leave reading to `refs process`. Renaming happens only in the dump.
+    "auto_process": "all",
     # Optional. Crossref and OpenAlex allow more requests per second to clients
     # that identify themselves with an email. Empty = send none.
     "contact_email": "",
 }
+
+
+# Settings whose config.toml values are added to the defaults instead of replacing them.
+PROTECTIVE = ("exclude_paths", "ignore_dirs", "no_llm", "no_rename")
 
 
 @dataclass(frozen=True)
@@ -57,6 +73,7 @@ class Config:
     ignore_dirs: frozenset[str] = frozenset()
     no_llm: list[str] = field(default_factory=list)
     no_rename: list[str] = field(default_factory=list)
+    auto_process: str = "all"
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -98,7 +115,14 @@ def load() -> Config:
     )
     if config_file.is_file():
         with config_file.open("rb") as handle:
-            settings.update(tomllib.load(handle))
+            user = tomllib.load(handle)
+        # Lists that protect files only ever grow: what config.toml lists is
+        # added to the defaults, so excluding one more folder there can never
+        # quietly un-exclude the default ones.
+        for key in PROTECTIVE:
+            if key in user:
+                user[key] = list(dict.fromkeys([*DEFAULTS[key], *user[key]]))
+        settings.update(user)
 
     root_setting = os.environ.get("REFS_DROPBOX_ROOT") or settings.get("dropbox_root")
     dropbox_root = Path(root_setting).expanduser().resolve() if root_setting else _find_dropbox_root()
@@ -122,7 +146,15 @@ def load() -> Config:
         ignore_dirs=frozenset(name.lower() for name in settings["ignore_dirs"]),
         no_llm=list(settings["no_llm"]),
         no_rename=list(settings["no_rename"]),
+        auto_process=_choice(settings["auto_process"], "auto_process", {"all", "dump", "none"}),
     )
+
+
+def _choice(value: str, key: str, allowed: set[str]) -> str:
+    """A setting that must be one of a few words; say so clearly if it is not."""
+    if value not in allowed:
+        raise SystemExit(f"config.toml: {key} must be one of {', '.join(sorted(allowed))}, not {value!r}.")
+    return value
 
 
 def contact_email() -> str:

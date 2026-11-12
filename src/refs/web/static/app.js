@@ -755,6 +755,28 @@ if (params.get("q")) {
 applyLayout();
 loadSidebar();
 search();
+
+// --- following the folder watcher -----------------------------------------------------
+
+// The server follows Dropbox (a PDF saved into papers-dump in Finder is read
+// and renamed on its own). Every few seconds, ask whether anything changed and
+// reload the list if so, keeping the selected row. Not while you are typing
+// or editing, so the list never shifts under you; it catches up afterwards.
+let seenGeneration = null;
+async function checkChanges() {
+  if (document.hidden) return;
+  let status;
+  try { status = await get("/api/changes"); } catch { return; }
+  if (seenGeneration === null) { seenGeneration = status.generation; return; }
+  if (status.generation === seenGeneration) return;
+  if (document.activeElement?.matches?.("input, textarea, select")) return;
+  seenGeneration = status.generation;
+  if (status.message) say(status.message, 8000);
+  loadSidebar();
+  search(state.items[state.selected]?.id ?? null);
+}
+setInterval(checkChanges, 5000);
+document.addEventListener("visibilitychange", checkChanges);
 if (params.get("add")) {
   setAdding(true);
   $("q").value = params.get("add").trim();

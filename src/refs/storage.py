@@ -40,7 +40,8 @@ def _normalise(rel: str) -> str:
 
 def walk_pdfs(cfg: Config) -> Iterator[DiskFile]:
     """Yield every PDF under the configured roots, skipping ignored folders."""
-    # Folders never entered: the app's own state folder and excluded paths.
+    # Never entered or read: the app's own state folder and excluded paths
+    # (folders or single files).
     skipped = {str(cfg.absolute(rel)) for rel in [cfg.state_dir, *cfg.exclude_paths]}
 
     for root in cfg.roots:
@@ -60,6 +61,8 @@ def walk_pdfs(cfg: Config) -> Iterator[DiskFile]:
                 if not name.lower().endswith(".pdf") or name.startswith("._"):
                     continue
                 full = os.path.join(folder, name)
+                if full in skipped:                # a single excluded file
+                    continue
                 try:
                     info = os.lstat(full)          # lstat: do not follow symlinks
                 except OSError:
