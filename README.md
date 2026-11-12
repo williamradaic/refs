@@ -116,6 +116,51 @@ never enters `phd/admission` or `phd/move-in` (personal paperwork), figure
 folders, `_versions`, or its own state folder. Online-only Dropbox files are
 listed but not read, because reading them would force a download.
 
+## What refs puts on this Mac
+
+Everything outside this repository, so it can be tracked and removed.
+
+| What | Where | Created by |
+|---|---|---|
+| The `refs` command | `~/.local/bin/refs` (a uv tool, editable install of this repo) | `uv tool install --editable .` |
+| Login service | `~/Library/LaunchAgents/com.williamradaic.refs.plist` | `refs service install` |
+| Service log | `~/Library/Logs/refs.log` | the service |
+| Settings | `~/.config/refs/config.toml` (contact email for registries) | by hand |
+| API key | macOS Keychain, item `refs` | `refs setup-key` |
+| Index (rebuildable) | `~/Library/Application Support/refs/` | `refs scan` |
+| Registry cache | `~/Library/Caches/refs/` | lookups |
+| Library data (synced) | `Dropbox/phd/tools/refs/`: `reads/`, `works/`, `journal.jsonl` | the pipeline |
+| Optional | a `refs.test` line in `/etc/hosts`; Raycast quicklinks; a Chrome "installed app" | by hand |
+
+It listens on `127.0.0.1:8377` only. It never modifies Zotero, and it renames
+files only inside `papers-dump` or when you pass `--apply`.
+
+### New Mac
+
+```sh
+gh repo clone williamradaic/refs ~/phd/tools/refs
+cd ~/phd/tools/refs
+ln -s ~/Library/CloudStorage/Dropbox/phd/tools/refs dropbox   # the synced library data
+uv tool install --editable .
+refs setup-key          # paste the Anthropic API key
+refs scan               # rebuilds the index; papers already read are not paid for again
+refs service install    # run at login
+```
+
+Optional: `contact_email = "..."` in `~/.config/refs/config.toml`; import
+`extras/raycast-quicklinks.json` in Raycast.
+
+### Remove it
+
+```sh
+refs service uninstall
+uv tool uninstall refs
+rm -rf ~/Library/Application\ Support/refs ~/Library/Caches/refs ~/Library/Logs/refs.log ~/.config/refs
+```
+
+Then delete the Keychain item `refs` in Keychain Access. The library data in
+Dropbox and your PDFs are left untouched.
+
 ## Develop
 
 ```sh
