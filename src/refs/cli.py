@@ -126,6 +126,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         "by_kind": dict(conn.execute(
             "SELECT COALESCE(kind,'unknown'), COUNT(*) FROM files "
             "WHERE hash IN (SELECT hash FROM paths) GROUP BY 1 ORDER BY 2 DESC").fetchall()),
+        "by_status": dict(conn.execute(
+            "SELECT COALESCE(status,'not processed'), COUNT(*) FROM files "
+            "WHERE hash IN (SELECT hash FROM paths) GROUP BY 1 ORDER BY 2 DESC").fetchall()),
         "by_area": dict(conn.execute(
             "SELECT area, COUNT(DISTINCT hash) FROM paths GROUP BY 1 ORDER BY 2 DESC").fetchall()),
     }
@@ -142,9 +145,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"Library     {_plural(data['files'], 'distinct file')} in "
           f"{_plural(data['locations'], 'location')} "
           f"({data['duplicated_files']:,} stored in more than one place)")
-    print("\nBy kind (provisional: guessed from names and folders)")
+    print("\nBy kind")
     for kind, count in data["by_kind"].items():
         print(f"  {count:>6,}  {kind}")
+    print("\nBy status")
+    for status, count in data["by_status"].items():
+        print(f"  {count:>6,}  {status}")
     print("\nBy area")
     for area, count in data["by_area"].items():
         print(f"  {count:>6,}  {area}")
@@ -159,7 +165,7 @@ def cmd_find(args: argparse.Namespace) -> int:
         results = index.search(conn, terms, filters, limit=None if args.all else args.limit)
     except ValueError as error:
         print(f"refs: {error}. Filters: course, project, term, area, in, topic, "
-              "section, kind, year, author.", file=sys.stderr)
+              "section, kind, year, author, status, tag.", file=sys.stderr)
         return 2
 
     if args.json:
@@ -174,11 +180,35 @@ def cmd_find(args: argparse.Namespace) -> int:
         print("No matches.")
         return 1
     for item in results:
-        print(f"{_headline(item)}   [{item['kind']}]")
+        label = item["kind"] + (f", {item['status']}" if item["status"] else ", not processed")
+        print(f"{_headline(item)}   [{label}]" + (f"  @{item['citekey']}" if item["citekey"] else ""))
+        if item["venue"] or item["tags"]:
+            print("    " + " · ".join(filter(None, [item["venue"], ", ".join(item["tags"][:6])])))
         for loc in item["locations"]:
             print(f"    {_where(loc)}")
             print(f"      {loc['path']}")
     print(f"\n{_plural(len(results), 'match')}" + ("" if args.all else f" (showing up to {args.limit})"))
+    return 0
+
+
+def cmd_bib(args: argparse.Namespace) -> int:
+    """Print BibTeX entries for the works a query selects."""
+    from . import bib, works
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    terms, filters = _split_query(args.query)
+    all_works = works.load_all(cfg)
+    # Only library works have BibTeX; with search words, keep the best `--limit`.
+    results = [r for r in index.search(conn, terms, filters, limit=None)
+               if r["work_id"] in all_works and "meta" in all_works[r["work_id"]]]
+    if terms:
+        results = results[:args.limit]
+    entries = [bib.entry(all_works[r["work_id"]]) for r in results]
+    if not entries:
+        print("No library works match.", file=sys.stderr)
+        return 1
+    print("\n\n".join(entries))
     return 0
 
 
@@ -242,6 +272,321 @@ def cmd_open(args: argparse.Namespace) -> int:
     return subprocess.run(["open", str(target)]).returncode
 
 
+def cmd_process(args: argparse.Namespace) -> int:
+    """Run the reading + lookup pipeline on the files a query selects."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from . import llm, pipeline
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    terms, filters = _split_query(args.query)
+    if not terms and not filters and not args.all:
+        print("Say which files (e.g. `refs process course:220a kind:paper`), or pass --all.",
+              file=sys.stderr)
+        return 2
+    files = index.search(conn, terms, filters, limit=None)
+    # Each file is paid for once. A file is (re)done when it has no read record,
+    # when an earlier attempt failed part-way, or when asked: --relookup repeats
+    # only the free registry step, --redo starts from scratch.
+    previous = {f["hash"]: pipeline.load_read(cfg, f["hash"]) for f in files}
+
+    def needs_work(f: dict) -> bool:
+        old = previous[f["hash"]]
+        if args.relookup:                 # only files the model has already read
+            return old is not None and bool(old.get("reading"))
+        if old is None or args.redo:
+            return True
+        return any("failed" in issue for issue in old["issues"])
+
+    todo = [f for f in files if needs_work(f)]
+    if args.limit:
+        todo = todo[:args.limit]
+    print(f"{_plural(len(files), 'file')} selected, {len(todo):,} to process.")
+    if not todo:
+        return 0
+
+    api = llm.client()
+    topics = pipeline.known_topics(cfg)
+    totals = {"input_tokens": 0, "output_tokens": 0}
+    statuses: dict[str, int] = {}
+
+    # A few files at a time: most of the wait is the network, not this computer.
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        jobs = {
+            pool.submit(pipeline.process_file, cfg, api, f["hash"], f["locations"][0]["path"],
+                        topics, None if args.redo else previous[f["hash"]]): f
+            for f in todo
+        }
+        for job in as_completed(jobs):
+            read = job.result()
+            statuses[read["status"]] = statuses.get(read["status"], 0) + 1
+            if not read["reused_reading"]:      # a reused reading costs nothing now
+                for key in totals:
+                    totals[key] += read["usage"].get(key, 0)
+            meta = pipeline.final_metadata(read)
+            kind = (read.get("reading") or {}).get("kind") or "?"
+            who = ", ".join(meta["surnames"][:3]) + (" et al." if len(meta["surnames"]) > 3 else "")
+            print(f"  {read['status']:<12} {kind:<11} {who} ({meta['year']}) {meta['title']}"
+                  if meta["title"] else
+                  f"  {read['status']:<12} {kind:<11} {read['path'].rsplit('/', 1)[-1]}")
+            for issue in read["issues"]:
+                print(f"      ! {issue}")
+
+    print("\n" + ", ".join(f"{n} {status}" for status, n in sorted(statuses.items())))
+    print(f"Tokens: {totals['input_tokens']:,} in, {totals['output_tokens']:,} out. "
+          f"Cost at list price: ${llm.cost(totals):.4f} "
+          f"(${llm.cost(totals) / len(todo):.5f} per file).")
+    return 0
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Compare pipeline results with file names that already follow the convention.
+
+    The model never sees file names, so a well-named file is independent ground
+    truth for surname, year and title words.
+    """
+    from . import naming, pipeline
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    terms, filters = _split_query(args.query)
+    files = index.search(conn, terms, filters, limit=None)
+
+    counts: dict[str, int] = {}
+    problems: list[str] = []
+    year_notes: list[str] = []
+    for f in files:
+        read = pipeline.load_read(cfg, f["hash"])
+        name = f["locations"][0]["path"].rsplit("/", 1)[-1]
+        truth = naming.parse_filename(name)
+        if read is None or truth.style != "convention" or not truth.authors:
+            continue
+        counts["checkable"] = counts.get("checkable", 0) + 1
+        counts[f"status: {read['status']}"] = counts.get(f"status: {read['status']}", 0) + 1
+        kind = (read.get("reading") or {}).get("kind")
+        meta = pipeline.final_metadata(read)
+
+        # Surnames: compare on slug pieces, so "Scott Morton" matches "scott-morton".
+        got = {piece for s in meta["surnames"] for piece in naming.slugify(s).split("-")}
+        named = [a for a in truth.authors if a not in {"et", "al"}]
+        # Registries sometimes file "Scott Morton" under "Morton": allow one in four.
+        authors_ok = bool(named) and sum(a in got for a in named) / len(named) >= 0.75
+        # Title: the name holds a shortened title; its longer words should appear.
+        words = [w for w in (truth.title or "").split() if len(w) > 3]
+        have = set(naming.slugify(meta["title"] or "").split("-"))
+        title_ok = not words or sum(w in have for w in words) / len(words) >= 0.6
+        kind_ok = kind in pipeline.LIBRARY_KINDS
+        year_ok = meta["year"] == truth.year
+
+        for label, ok in (("kind", kind_ok), ("authors", authors_ok), ("title", title_ok), ("year", year_ok)):
+            counts[f"{label} ok"] = counts.get(f"{label} ok", 0) + ok
+        if not (kind_ok and authors_ok and title_ok):
+            problems.append(
+                f"  {name}\n      got [{read['status']}, {kind}] {meta['surnames']} "
+                f"({meta['year']}) {meta['title']!r}  issues={read['issues']}")
+        elif not year_ok:
+            year_notes.append(f"  {name}: file name says {truth.year}, record says "
+                              f"{meta['year']} ({meta['venue']})")
+
+    if not counts:
+        print("No processed files with convention-style names in that selection.")
+        return 1
+    total = counts["checkable"]
+    print(f"Checked {total} files whose names follow the convention.\n")
+    for label in sorted(k for k in counts if k.startswith("status")):
+        print(f"  {counts[label]:>3}  {label}")
+    print()
+    for label in ("kind ok", "authors ok", "title ok", "year ok"):
+        print(f"  {counts.get(label, 0):>3}/{total}  {label}")
+    print(f"\nWrong or missing kind, authors or title: {len(problems)}")
+    print("\n".join(problems))
+    print(f"\nYear differs only (often working paper vs published, or the name is off): {len(year_notes)}")
+    print("\n".join(year_notes))
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    """Quick add: a link, identifier or local PDF goes into the dump and the library."""
+    import shutil
+    from pathlib import Path
+
+    from . import bib, capture, llm, pipeline, rename, resolve, storage, works
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    dump = cfg.absolute(cfg.dump)
+    thing, source_url, target = args.thing, None, None
+
+    # 1. Get a PDF into the dump: copy a local file, or download an open copy.
+    local = Path(thing).expanduser()
+    if local.is_file() and local.suffix.lower() == ".pdf":
+        path = dump / local.name
+        if local.resolve().is_relative_to(cfg.dropbox_root):
+            path = local.resolve()                       # already in Dropbox: use it where it is
+        elif not path.exists():
+            shutil.copy2(local, path)
+    else:
+        target = capture.discover(capture.parse(thing))
+        source_url = target.page_url or target.pdf_url
+        path = capture.download(target.pdf_url, dump) if target.pdf_url else None
+
+    # 2. No PDF could be fetched: save the paper itself, to be completed later.
+    if path is None:
+        record, _ = resolve.by_ids(target.ids) if target.ids else (None, None)
+        if record is None:
+            print("Could not identify a paper or find an open PDF from that. "
+                  "Download the PDF yourself and save it into papers-dump.")
+            return 1
+        work = works.create_stub(cfg, record.to_dict(), source_url)
+        print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})")
+        print(f"  @{work['citekey']} . Save the PDF into papers-dump and it will attach itself.")
+        return 0
+
+    # 3. Index the new file, run the pipeline on it, and file it under its work.
+    rel = str(path.relative_to(cfg.dropbox_root))
+    scanner.scan(cfg, conn)
+    row = conn.execute("SELECT hash FROM paths WHERE path=?", (rel,)).fetchone()
+    if row is None:
+        print(f"The file was saved to {rel} but could not be indexed.")
+        return 1
+    read = pipeline.load_read(cfg, row["hash"]) or pipeline.process_file(
+        cfg, llm.client(), row["hash"], rel, pipeline.known_topics(cfg))
+    file_to_work = works.sync(cfg)
+    work = works.load_all(cfg).get(file_to_work.get(row["hash"], ""))
+    if work and source_url and not work["user"].get("source_url"):
+        work["user"]["source_url"] = source_url
+        pipeline.records.write_json(works.works_dir(cfg) / f"{work['id']}.json", work)
+
+    # 4. Inside the dump, a verified paper gets its proper name straight away.
+    if work and rel.startswith(cfg.dump + "/"):
+        downloaded = path.name.startswith("added-")      # the app's own temporary name
+        new_name = rename.proposed_name(work, path.name, allow_unverified=downloaded)
+        rel = (new_name and rename.apply(cfg, rel, new_name, row["hash"])) or rel
+    scanner.scan(cfg, conn)
+
+    meta = pipeline.final_metadata(read)
+    print(f"Added [{read['status']}]: {', '.join(meta['surnames'][:3])} ({meta['year']}) {meta['title']}")
+    print(f"  {rel}" + (f"   @{work['citekey']}" if work else ""))
+    for issue in read["issues"]:
+        print(f"  ! {issue}")
+    return 0
+
+
+def cmd_rename(args: argparse.Namespace) -> int:
+    """Propose (default) or apply canonical file names for the files a query selects."""
+    from pathlib import PurePosixPath
+
+    from . import rename, works
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    if args.undo:
+        for original, was in rename.undo(cfg, args.undo):
+            print(f"restored  {was}  ->  {original}")
+        scanner.scan(cfg, conn)
+        return 0
+
+    terms, filters = _split_query(args.query)
+    if not terms and not filters:
+        print("Say which files, e.g. `refs rename in:dump`.", file=sys.stderr)
+        return 2
+    all_works = works.load_all(cfg)
+    from . import records
+
+    # Collect candidates, with each file's own hash and whether it is a working paper.
+    candidates, skipped = [], 0
+    for item in index.search(conn, terms, filters, limit=None):
+        work = all_works.get(item["work_id"] or "")
+        for loc in item["locations"]:
+            name = PurePosixPath(loc["path"]).name
+            new_name = work and rename.proposed_name(work, name)
+            if not new_name or new_name == name:
+                continue
+            if rename.blocked_reason(cfg, loc["path"]):
+                skipped += 1
+                continue
+            file_hash = conn.execute("SELECT hash FROM paths WHERE path=?", (loc["path"],)).fetchone()[0]
+            reading = (records.load_read(cfg, file_hash) or {}).get("reading") or {}
+            candidates.append((loc["path"], new_name, file_hash, bool(reading.get("is_working_paper"))))
+
+    # Two files in one folder can want the same name. Published versions choose
+    # first; an identical copy is reported, not renamed; a different version of
+    # the same paper gets a "-wp" or "-2" suffix.
+    planned, copies = [], []
+    taken: dict[str, dict[str, str]] = {}          # folder -> {name: hash that owns it}
+    for rel, new_name, file_hash, is_wp in sorted(candidates, key=lambda c: (c[3], c[0])):
+        folder = str(PurePosixPath(rel).parent)
+        names = taken.setdefault(folder, {
+            p.name: "" for p in cfg.absolute(folder).glob("*.pdf")})   # names already on disk
+        if names.get(new_name) == file_hash:
+            copies.append(rel)                     # same content as a file already planned
+            continue
+        final = rename.disambiguate(new_name, set(names), is_wp)
+        names[final] = file_hash
+        planned.append((rel, final))
+
+    done = 0
+    for rel, new_name in planned:
+        if args.apply:
+            done += rename.apply(cfg, rel, new_name) is not None
+        else:
+            print(f"{rel}\n    -> {new_name}")
+    if args.apply:
+        scanner.scan(cfg, conn)
+        print(f"Renamed {done:,} of {len(planned):,} files. Undo with `refs rename --undo {done}`.")
+    else:
+        print(f"\n{_plural(len(planned), 'file')} would be renamed"
+              f"{f', {skipped} protected' if skipped else ''}. Nothing was changed; add --apply to rename.")
+    if copies:
+        print(f"\nIdentical copies left as they are ({len(copies)}); you may want to delete them:")
+        for rel in copies:
+            print(f"  {rel}")
+    return 0
+
+
+def cmd_wanted(args: argparse.Namespace) -> int:
+    """Works saved without a PDF yet."""
+    from . import works
+
+    cfg = config.load()
+    waiting = [w for w in works.load_all(cfg).values() if not w["files"]]
+    for work in sorted(waiting, key=lambda w: w["created"], reverse=True):
+        meta = work["meta"]
+        names = ", ".join(a["family"] for a in (meta.get("authors") or [])[:3])
+        print(f"{names} ({meta.get('year')}) {meta.get('title')}   @{work['citekey']}")
+        if work["user"].get("source_url"):
+            print(f"    {work['user']['source_url']}")
+    print(f"\n{_plural(len(waiting), 'work')} waiting for a PDF.")
+    return 0
+
+
+def cmd_setup_key(args: argparse.Namespace) -> int:
+    """Store the Anthropic API key in the macOS Keychain and check that it works."""
+    import getpass
+
+    import anthropic
+
+    from . import keys, llm
+
+    key = getpass.getpass("Paste your Anthropic API key (it will not be shown): ").strip()
+    if not key.startswith("sk-ant-"):
+        print("That does not look like an Anthropic API key (it should start with sk-ant-).")
+        return 1
+    try:
+        # A free request that only succeeds with a valid key.
+        anthropic.Anthropic(api_key=key).models.retrieve(llm.MODEL)
+    except anthropic.AuthenticationError:
+        print("Anthropic rejected that key. Nothing was saved.")
+        return 1
+    except anthropic.APIConnectionError:
+        print("Could not reach Anthropic to check the key. Nothing was saved; try again.")
+        return 1
+    keys.set_api_key(key)
+    print("Key saved to the macOS Keychain (item \"refs\") and verified.")
+    return 0
+
+
 # --- Entry point -----------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> int:
@@ -266,6 +611,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_find)
 
+    p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:bets`")
+    p.add_argument("query", nargs="+", help="words and key:value filters, as in `find`")
+    p.add_argument("--limit", type=int, default=1, help="how many matches when searching by words")
+    p.set_defaults(run=cmd_bib)
+
     p = sub.add_parser("contexts", help="courses and projects recognised from folders")
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_contexts)
@@ -281,6 +631,36 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("open", help="open the best match")
     p.add_argument("query", nargs="+")
     p.set_defaults(run=cmd_open)
+
+    p = sub.add_parser("add", help="quick add: a URL, DOI, arXiv id, NBER number or PDF file")
+    p.add_argument("thing")
+    p.set_defaults(run=cmd_add)
+
+    p = sub.add_parser("rename", help="propose canonical file names (add --apply to rename)")
+    p.add_argument("query", nargs="*")
+    p.add_argument("--apply", action="store_true", help="actually rename the files")
+    p.add_argument("--undo", type=int, metavar="N", help="reverse the last N renames")
+    p.set_defaults(run=cmd_rename)
+
+    p = sub.add_parser("wanted", help="works saved without a PDF yet")
+    p.set_defaults(run=cmd_wanted)
+
+    p = sub.add_parser("process", help="read and look up the files a query selects (uses the API)")
+    p.add_argument("query", nargs="*", help="words and key:value filters, as in `find`")
+    p.add_argument("--all", action="store_true", help="every indexed file")
+    p.add_argument("--limit", type=int, help="process at most this many files")
+    p.add_argument("--redo", action="store_true", help="re-process files already done")
+    p.add_argument("--relookup", action="store_true",
+                   help="repeat only the registry lookup, reusing the saved reading (free)")
+    p.add_argument("--workers", type=int, default=4)
+    p.set_defaults(run=cmd_process)
+
+    p = sub.add_parser("eval", help="check results against convention-style file names")
+    p.add_argument("query", nargs="*")
+    p.set_defaults(run=cmd_eval)
+
+    p = sub.add_parser("setup-key", help="store the Anthropic API key in the Keychain")
+    p.set_defaults(run=cmd_setup_key)
 
     args = parser.parse_args(argv)
     return args.run(args)

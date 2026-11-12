@@ -89,3 +89,10 @@ def test_look_alikes_are_not_mistaken_for_the_convention():
     assert parse_filename("writeup-2026-02-22.pdf").style == "none"       # a date
     assert parse_filename("econ257-2026-syllabus.pdf").style == "none"    # a course code
     assert not parse_filename("2023-exam.pdf").looks_like_paper
+
+
+def test_elsevier_download_name_yields_old_style_doi():
+    assert parse_filename("1-s2.0-S0304405X98000270-main.pdf").ids == {
+        "doi": "10.1016/s0304-405x(98)00027-0"}
+    assert parse_filename("1-s2.0-0167268180900517-main.pdf").ids == {
+        "doi": "10.1016/0167-2681(80)90051-7"}

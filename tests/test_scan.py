@@ -171,3 +171,36 @@ def test_personal_document_folders_are_never_indexed(lib):
     lib.write(BLP, b"blp content")
     lib.scan()
     assert lib.paths() == {BLP}
+
+
+def test_processed_files_are_searchable_by_registry_metadata(lib):
+    import hashlib
+    import json
+
+    # A badly named file, plus the read record the pipeline would have written.
+    lib.write("papers-dump/1-s2.0-junk-main.pdf", b"bsv content")
+    file_hash = hashlib.sha256(b"bsv content").hexdigest()
+    reads = lib.root / "phd/tools/refs/reads"
+    reads.mkdir(parents=True)
+    (reads / f"{file_hash}.json").write_text(json.dumps({
+        "status": "verified", "issues": [],
+        "reading": {"kind": "paper", "title": "A model of investor sentiment", "year": 1998,
+                    "authors": [], "venue": None, "description": "Investors over- and underreact.",
+                    "fields": ["finance"], "methods": ["theory"], "topics": ["investor sentiment"]},
+        "registry": {"via": "doi", "record": {
+            "title": "A model of investor sentiment", "year": 1998,
+            "venue": "Journal of Financial Economics", "doi": "10.1016/s0304-405x(98)00027-0",
+            "source": "crossref",
+            "authors": [{"given": "Nicholas", "family": "Barberis"},
+                        {"given": "Andrei", "family": "Shleifer"},
+                        {"given": "Robert", "family": "Vishny"}]}},
+    }))
+    lib.scan()
+
+    for query in (["investor", "sentiment"], ["shleifer"], ["bsv"], ["financial", "economics"], ["underreact"]):
+        found = index.search(lib.conn, query)
+        assert len(found) == 1, query
+    item = index.search(lib.conn, [], {"tag": "finance", "status": "verified", "year": "1998"})[0]
+    assert item["authors"] == ["Barberis", "Shleifer", "Vishny"]
+    assert item["kind"] == "paper" and item["doi"].startswith("10.1016/")
+    assert index.search(lib.conn, [], {"status": "unprocessed"}) == []

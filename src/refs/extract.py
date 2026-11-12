@@ -19,10 +19,12 @@ import pymupdf
 # They are harmless here, so keep the output clean.
 pymupdf.TOOLS.mupdf_display_errors(False)
 
-# How much of the document is read. Identifiers and titles are on the opening
-# pages; references further in carry *other* papers' DOIs and must be avoided.
-FIRST_PAGES = 2
-MAX_CHARS = 8000
+# How much of the document is read. The model gets three pages (title, abstract,
+# start of the introduction). Identifiers are taken from the first two only:
+# further in, citations start to carry *other* papers' DOIs.
+FIRST_PAGES = 3
+ID_PAGES = 2
+MAX_CHARS = 10000
 
 # A DOI: "10.", a registrant number, a slash, then anything up to whitespace.
 DOI_RE = re.compile(r"\b(10\.\d{4,9}/[^\s\"<>{}|\\^`]+)", re.IGNORECASE)
@@ -112,6 +114,12 @@ def read_pdf(path: Path) -> PdfInfo:
 
     info.text = clean_text(" ".join(chunks))
     info.has_text = len(info.text) >= 200
-    info.ids = find_ids(info.text)
+    info.ids = find_ids(clean_text(" ".join(chunks[:ID_PAGES])))
     info.fingerprint = fingerprint(info.text)
     return info
+
+
+def first_page_png(path: Path, dpi: int = 110) -> bytes:
+    """Render page 1 as a PNG image, for scans that have no text layer."""
+    with pymupdf.open(path) as doc:
+        return doc[0].get_pixmap(dpi=dpi).tobytes("png")

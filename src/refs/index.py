@@ -16,11 +16,11 @@ import re
 import sqlite3
 from pathlib import PurePosixPath
 
-from . import contexts, naming
+from . import contexts, naming, records, works
 from .config import Config
 
 # Bump when the tables change. An older index is simply dropped and rebuilt.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -30,13 +30,19 @@ CREATE TABLE IF NOT EXISTS files (
     size        INTEGER NOT NULL,
     first_seen  TEXT NOT NULL,
     supersedes  TEXT,               -- hash of the earlier version, if edited in place
-    work_id     TEXT,               -- filled in Phase 2 (link to a library record)
+    work_id     TEXT,               -- the work (paper) this file is a copy or version of
+    citekey     TEXT,
     kind        TEXT,               -- paper, slides, syllabus, problem-set, notes, ...
-    kind_source TEXT,               -- 'path' = provisional guess from names and folders
-    g_title     TEXT,               -- g_* = guesses read from the file name
-    g_authors   TEXT,               -- JSON list of surnames
-    g_year      INTEGER,
-    g_ids       TEXT                -- JSON, e.g. {"nber": "32515"}
+    kind_source TEXT,               -- 'path' = guess from names/folders; 'read' = pipeline
+    g_title     TEXT,               -- title, authors, year: from the read record when the
+    g_authors   TEXT,               --   file has been processed, else guessed from its name
+    g_year      INTEGER,            --   (g_authors is a JSON list of surnames)
+    g_ids       TEXT,               -- JSON, e.g. {"nber": "32515"}
+    status      TEXT,               -- verified, extracted, needs-review, classified, ...
+    venue       TEXT,
+    doi         TEXT,
+    description TEXT,
+    tags        TEXT                -- JSON list
 );
 
 CREATE TABLE IF NOT EXISTS paths (
@@ -66,7 +72,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
-    hash UNINDEXED, title, authors, aliases, filename, context,
+    hash UNINDEXED, title, authors, aliases, filename, context, venue, tags, description,
     tokenize = 'unicode61 remove_diacritics 2'
 );
 """
@@ -166,7 +172,11 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
         )
         by_hash.setdefault(row["hash"], []).append((row["path"], ctx))
 
-    # 2. Per file: the most informative name among its paths, and its kind.
+    # 2. Per file: metadata from its read record if the pipeline has processed it,
+    #    otherwise the most informative file name among its paths.
+    supersedes = dict(conn.execute("SELECT hash, supersedes FROM files").fetchall())
+    file_to_work = works.sync(cfg)          # also writes new or changed work files
+    all_works = works.load_all(cfg)
     conn.execute("DELETE FROM search")
     for file_hash, located in by_hash.items():
         guesses = [(naming.parse_filename(PurePosixPath(p).name), p, ctx) for p, ctx in located]
@@ -178,29 +188,68 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
         for guess, _, _ in guesses:
             ids.update(guess.ids)
 
-        # Prefer the context that carries a topic when judging the kind.
+        # Defaults: guessed from names and folders.
         kind_ctx = next((ctx for _, _, ctx in guesses if ctx.topic), best_ctx)
+        title, authors, year = best.title, best.authors, best.year
+        kind, kind_source = guess_kind(best_path, kind_ctx, best), "path"
+        status = venue = doi = description = None
+        tags: list[str] = []
+
+        # An edited file (annotated, say) has a new hash but is the same document:
+        # fall back to the read record of the version it replaced.
+        read = records.load_read(cfg, file_hash)
+        if read is None and supersedes.get(file_hash):
+            read = records.load_read(cfg, supersedes[file_hash])
+        if read is not None:
+            status = read["status"]
+            if registry := read.get("registry"):       # confidential files: ids only
+                ids.update({"doi": registry["record"]["doi"]} if registry["record"].get("doi") else {})
+            if reading := read.get("reading"):
+                meta = records.final_metadata(read)
+                title = meta["title"] or title
+                authors = meta["surnames"] or authors
+                year = meta["year"] or year
+                venue, doi = meta["venue"], meta["doi"]
+                kind, kind_source = reading["kind"], "read"
+                description = reading.get("description")
+                tags = [*reading.get("fields", []), *reading.get("methods", []), *reading.get("topics", [])]
+
+        # A file that belongs to a work shows the work's metadata: a working
+        # paper filed under its published version is listed as that publication.
+        work_id = file_to_work.get(file_hash) or file_to_work.get(supersedes.get(file_hash) or "")
+        citekey = None
+        if work_id and "meta" in all_works.get(work_id, {}):
+            work = all_works[work_id]
+            meta, citekey = work["meta"], work["citekey"]
+            title, year = meta.get("title") or title, meta.get("year") or year
+            authors = [a["family"] for a in meta.get("authors") or [] if a.get("family")] or authors
+            venue, doi, status = meta.get("venue"), meta.get("doi"), meta.get("status")
+            tags = list(dict.fromkeys([*tags, *work["user"].get("tags", [])]))   # no repeats, order kept
+
         conn.execute(
-            "UPDATE files SET g_title=?, g_authors=?, g_year=?, g_ids=?, "
-            "kind = CASE WHEN kind_source IS NULL OR kind_source='path' THEN ? ELSE kind END, "
-            "kind_source = COALESCE(kind_source, 'path') WHERE hash=?",
-            (best.title, json.dumps(best.authors), best.year, json.dumps(ids),
-             guess_kind(best_path, kind_ctx, best), file_hash),
+            "UPDATE files SET g_title=?, g_authors=?, g_year=?, g_ids=?, kind=?, kind_source=?, "
+            "status=?, venue=?, doi=?, description=?, tags=?, work_id=?, citekey=? WHERE hash=?",
+            (title, json.dumps(authors, ensure_ascii=False), year, json.dumps(ids), kind,
+             kind_source, status, venue, doi, description,
+             json.dumps(tags, ensure_ascii=False), work_id, citekey, file_hash),
         )
 
         # 3. One search row per file. `aliases` holds author initials, so that
         #    "blp" finds Berry-Levinsohn-Pakes.
-        initials = "".join(a[0] for a in best.authors if a) if len(best.authors) >= 2 else ""
+        initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
         conn.execute(
-            "INSERT INTO search (hash, title, authors, aliases, filename, context) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO search (hash, title, authors, aliases, filename, context, venue, tags, "
+            "description) VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 file_hash,
-                best.title or "",
-                " ".join(best.authors),
-                " ".join(filter(None, [initials, *ids.values()])),
+                title or "",
+                " ".join(authors),
+                " ".join(filter(None, [initials, citekey, *ids.values()])),
                 " ".join(PurePosixPath(p).stem for p, _ in located),
                 " ".join(f"{ctx.key} {ctx.topic or ''} {ctx.section or ''}" for _, ctx in located),
+                venue or "",
+                " ".join(tags),
+                description or "",
             ),
         )
 
@@ -210,19 +259,26 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
 # `key:value` filters accepted by search(), mapped to what they compare against.
 FILTER_ALIASES = {"course": "slug", "project": "slug", "in": "context"}
 PATH_FILTERS = {"slug", "term", "area", "context", "topic", "section"}
-FILE_FILTERS = {"kind", "year", "author"}
+FILE_FILTERS = {"kind", "year", "author", "status", "tag"}
 
 
 def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
     """Shape one file and its locations for display or JSON output."""
     return {
         "hash": row["hash"],
+        "work_id": row["work_id"],
+        "citekey": row["citekey"],
         "title": row["g_title"],
         "authors": json.loads(row["g_authors"] or "[]"),
         "year": row["g_year"],
         "ids": json.loads(row["g_ids"] or "{}"),
         "kind": row["kind"],
         "kind_source": row["kind_source"],
+        "status": row["status"],
+        "venue": row["venue"],
+        "doi": row["doi"],
+        "description": row["description"],
+        "tags": json.loads(row["tags"] or "[]"),
         "locations": [
             {
                 "path": loc["path"], "context": loc["context"], "area": loc["area"],
@@ -271,6 +327,10 @@ def search(
                 return False
             if key == "author" and wanted not in (row["g_authors"] or "").lower():
                 return False
+            if key == "status" and (row["status"] or "unprocessed") != wanted:
+                return False
+            if key == "tag" and wanted.replace("-", " ") not in (row["tags"] or "").lower():
+                return False
             if key in PATH_FILTERS:
                 def hit(loc: sqlite3.Row) -> bool:
                     value = (loc[key] or "").lower()
@@ -280,12 +340,29 @@ def search(
                     return False
         return True
 
-    results = [
-        _file_dict(row, locations[row["hash"]])
-        for row in rows
-        if row["hash"] in locations and passes(row, locations[row["hash"]])
-    ]
+    # One result per work: several files of the same paper are merged, and
+    # their locations listed together.
+    results: list[dict] = []
+    seen_works: dict[str, dict] = {}
+    for row in rows:
+        if row["hash"] not in locations or not passes(row, locations[row["hash"]]):
+            continue
+        item = _file_dict(row, locations[row["hash"]])
+        earlier = seen_works.get(item["work_id"]) if item["work_id"] else None
+        if earlier is not None:
+            earlier["locations"] += item["locations"]
+            earlier["hashes"].append(item["hash"])
+            continue
+        item["hashes"] = [item["hash"]]
+        if item["work_id"]:
+            seen_works[item["work_id"]] = item
+        results.append(item)
 
+    if terms:
+        # Papers first: library works rank above slides and other course material
+        # that merely mention the same words. (sort is stable: relevance order
+        # is kept within each group.)
+        results.sort(key=lambda r: r["work_id"] is None)
     if not terms:   # no relevance ranking available: order like the folder tree
         results.sort(key=lambda r: (
             r["locations"][0]["context"] or "",

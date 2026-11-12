@@ -59,6 +59,14 @@ def parse_filename(filename: str) -> NameGuess:
     if m := re.fullmatch(r"(\d{4}\.\d{4,5})(v\d+)?", stem):
         return NameGuess(ids={"arxiv": m.group(1)}, style="id")
 
+    # 1b. Elsevier downloads: "1-s2.0-S0304405X98000270-main" holds the article's
+    #     PII. For older articles the DOI is that PII with punctuation restored:
+    #     10.1016/S0304-405X(98)00027-0. Newer articles use another DOI form, in
+    #     which case the lookup simply finds nothing.
+    if m := re.fullmatch(r"1-s2\.0-(S?)(\d{4})(\d{3}[\dX])(\d{2})(\d{5})([\dX])-main", stem):
+        s_, a, b, yy, item, check_digit = m.groups()
+        return NameGuess(ids={"doi": f"10.1016/{s_}{a}-{b}({yy}){item}-{check_digit}".lower()}, style="id")
+
     # 2. The house convention: surname(s)-year-short-title, lowercase, hyphens.
     if stem == stem.lower() and "-" in stem and " " not in stem:
         tokens = stem.split("-")
