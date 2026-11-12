@@ -133,6 +133,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         "by_area": dict(conn.execute(
             "SELECT area, COUNT(DISTINCT hash) FROM paths GROUP BY 1 ORDER BY 2 DESC").fetchall()),
     }
+    # Citation keys learned from project .bib files (bibkeys.py).
+    from . import bibkeys, works
+    all_works = works.load_all(cfg)
+    data["bib_files"] = [bibkeys.label(cfg, p) for p in bibkeys.bib_paths(cfg)]
+    data["works_with_project_keys"] = sum(1 for w in all_works.values() if w.get("bib_keys"))
     if args.json:
         print(json.dumps(data, indent=2))
         return 0
@@ -155,6 +160,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("\nBy area")
     for area, count in data["by_area"].items():
         print(f"  {count:>6,}  {area}")
+    print(f"\nProject .bib files ({data['works_with_project_keys']:,} works have keys from them)")
+    for name in data["bib_files"]:
+        print(f"  {name}")
     return 0
 
 
@@ -205,11 +213,31 @@ def cmd_bib(args: argparse.Namespace) -> int:
                if r["work_id"] in all_works and "meta" in all_works[r["work_id"]]]
     if terms:
         results = results[:args.limit]
-    entries = [bib.entry(all_works[r["work_id"]]) for r in results]
-    if not entries:
+    # One entry per work, even when several of its files matched.
+    chosen = list({r["work_id"]: all_works[r["work_id"]] for r in results}.values())
+    if not chosen:
         print("No library works match.", file=sys.stderr)
         return 1
-    print("\n\n".join(entries))
+    if not args.append:
+        print("\n\n".join(bib.entry(w) for w in chosen))
+        return 0
+
+    # --append: add to a project's .bib, skipping papers it already holds
+    # under any key (matched by key, DOI or title).
+    from pathlib import Path
+    target = Path(args.append).expanduser()
+    if target.suffix != ".bib":
+        print(f"{target} is not a .bib file.", file=sys.stderr)
+        return 2
+    added, present = bib.append(target, chosen)
+    for work in added:
+        print(f"added    @{work['citekey']}")
+    for work, key in present:
+        note = "" if key == work["citekey"] else f"  (refs calls it @{work['citekey']})"
+        print(f"present  @{key}{note}")
+    print(f"{len(added)} added to {target}, {len(present)} already there.")
+    if added and "overleaf" in target.parts:
+        print("This file is in an Overleaf repository: commit and push it there.")
     return 0
 
 
@@ -473,8 +501,6 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_rename(args: argparse.Namespace) -> int:
     """Propose (default) or apply canonical file names for the files a query selects."""
-    from pathlib import PurePosixPath
-
     from . import rename, works
 
     cfg = config.load()
@@ -490,69 +516,20 @@ def cmd_rename(args: argparse.Namespace) -> int:
         print("Say which files, e.g. `refs rename in:dump`.", file=sys.stderr)
         return 2
     all_works = works.load_all(cfg)
-    from . import records
+    items = index.search(conn, terms, filters, limit=None)
+    proposals, copies, protected = rename.plan(cfg, conn, items, all_works)
 
-    # Collect candidates, with each file's own hash and whether it is a working paper.
-    candidates, skipped = [], 0
-    for item in index.search(conn, terms, filters, limit=None):
-        work = all_works.get(item["work_id"] or "")
-        for loc in item["locations"]:
-            name = PurePosixPath(loc["path"]).name
-            new_name = work and rename.proposed_name(work, name)
-            if not new_name or new_name == name:
-                continue
-            if rename.blocked_reason(cfg, loc["path"]):
-                skipped += 1
-                continue
-            file_hash = conn.execute("SELECT hash FROM paths WHERE path=?", (loc["path"],)).fetchone()[0]
-            reading = (records.load_read(cfg, file_hash) or {}).get("reading") or {}
-            candidates.append((loc["path"], new_name, file_hash, bool(reading.get("is_working_paper"))))
-
-    # Two files in one folder can want the same name. Published versions choose
-    # first; an identical copy is reported, not renamed; a different version of
-    # the same paper gets a "-wp" or "-2" suffix.
-    planned, copies = [], []
-    taken: dict[str, dict[str, str]] = {}          # folder -> {name: hash that owns it}
-    for rel, new_name, file_hash, is_wp in sorted(candidates, key=lambda c: (c[3], c[0])):
-        folder = str(PurePosixPath(rel).parent)
-        names = taken.setdefault(folder, {
-            p.name: "" for p in cfg.absolute(folder).glob("*.pdf")})   # names already on disk
-        if names.get(new_name) == file_hash:
-            copies.append(rel)                     # same content as a file already planned
-            continue
-        # The file's own current name is not "taken": renaming frees it. (Counting
-        # it turned "x-wp.pdf", next to the published "x.pdf", into "x-2.pdf".)
-        current = PurePosixPath(rel).name
-        others = {n for n, owner in names.items() if not (n == current and owner in ("", file_hash))}
-        final = rename.disambiguate(new_name, others, is_wp)
-        if final == current:
-            continue                               # already has the right name
-        names[final] = file_hash
-        planned.append((rel, final, file_hash))
-
-    done = 0
-    file_to_work = {h: w for w in all_works.values() for h in w["files"]}
-    for rel, new_name, file_hash in planned:
-        if not args.apply:
-            print(f"{rel}\n    -> {new_name}")
-            continue
-        if rename.apply(cfg, rel, new_name, file_hash) is None:
-            continue
-        done += 1
-        # Keep the old name on the work: your descriptive names stay searchable.
-        work = file_to_work.get(file_hash)
-        if work is not None:
-            former = work["user"].setdefault("former_names", [])
-            old_name = PurePosixPath(rel).name
-            if old_name not in former:
-                former.append(old_name)
-                records.write_json(works.works_dir(cfg) / f"{work['id']}.json", work)
     if args.apply:
+        done = rename.apply_many(cfg, proposals)
         scanner.scan(cfg, conn)
-        print(f"Renamed {done:,} of {len(planned):,} files. Undo with `refs rename --undo {done}`.")
+        print(f"Renamed {len(done):,} of {len(proposals):,} files. "
+              f"Undo with `refs rename --undo {len(done)}`.")
     else:
-        print(f"\n{_plural(len(planned), 'file')} would be renamed"
-              f"{f', {skipped} protected' if skipped else ''}. Nothing was changed; add --apply to rename.")
+        for proposal in proposals:
+            print(f"{proposal.path}\n    -> {proposal.new_name}")
+        print(f"\n{_plural(len(proposals), 'file')} would be renamed"
+              f"{f', {len(protected)} protected' if protected else ''}. "
+              "Nothing was changed; add --apply to rename.")
     if copies:
         print(f"\nIdentical copies left as they are ({len(copies)}); you may want to delete them:")
         for rel in copies:
@@ -739,6 +716,9 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:bets`")
     p.add_argument("query", nargs="+", help="words and key:value filters, as in `find`")
     p.add_argument("--limit", type=int, default=1, help="how many matches when searching by words")
+    p.add_argument("--append", metavar="FILE.bib",
+                   help="add the entries to this .bib file instead of printing them "
+                        "(papers already in it, under any key, are skipped)")
     p.set_defaults(run=cmd_bib)
 
     p = sub.add_parser("contexts", help="courses and projects recognised from folders")

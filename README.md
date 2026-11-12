@@ -4,11 +4,12 @@ A folder-aware reference manager that sits on top of Dropbox. PDFs stay where
 they are, in course and research folders; `refs` indexes them, recognises which
 course or project each one belongs to, and follows renames, moves and copies.
 
-Status: **Phases 1–3 of 4 built**: engine, metadata pipeline, works, quick
-add, rename with undo, BibTeX, the web UI, live folder watching and launch at
-login. Still open from Phase 3: the bookmarklet and first-page thumbnails.
-Next: Phase 4 (filing out of the dump, rename approval in the UI, project
-`.bib` files). The full plan is in `local/admin/plan.md`.
+Status: **Phases 1–4 built**: engine, metadata pipeline, works, quick add and
+bookmarklet, live folder watching, launch at login, the web UI with a Review
+queue (records, renames, copies), "file to…", BibTeX with `--append`, keys
+learned from project `.bib` files, and an agent skill. Dropped: first-page
+thumbnails and a Raycast "add the front tab" command (the bookmarklet covers
+it). What remains is the plan's "Later" list, in `local/admin/plan.md`.
 
 ## Use
 
@@ -31,6 +32,7 @@ refs eval course:220a          # compare results with convention-style file name
 refs add w32515                # quick add: NBER number, arXiv id, DOI, URL or a PDF file
 refs wanted                    # works saved without a PDF yet
 refs bib blp                   # BibTeX for the best match (or `refs bib project:bets`)
+refs bib blp --append overleaf/references.bib   # add it unless the file already has it
 refs rename in:dump            # propose canonical names; add --apply to rename
 refs rename --undo 3           # reverse the last 3 renames
 
@@ -43,9 +45,38 @@ The web interface is keyboard-driven (`j`/`k` to move, `/` to search, `?` for
 all keys) and lives in `src/refs/web/`: `app.py` is the local server and JSON
 API, `static/` holds the page (plain HTML, CSS and JavaScript, no build step).
 
+Review, in the sidebar:
+
+| View | What you do there |
+|---|---|
+| needs review | correct a record, fetch it by DOI, or accept it |
+| renames | every file not named `surname-year-short-title.pdf`, grouped by folder; tick files (or a folder) and rename them; undo is offered right after. Protected folders (canvas-sync, overleaf, Git repositories) never appear |
+| copies | the same PDF in several places: move a copy to the macOS Trash (never the last one), or "keep all" to say the copies are on purpose (remembered in `review.json`) |
+
+**File to…** (`F`, or the link under each file) moves a PDF into another folder,
+typically out of `papers-dump` into a course or project. It is the only way refs
+moves a file; the move is journaled, so `refs rename --undo 1` reverses it.
+
+**Bookmarklet**: open `http://refs.localhost:8377/bookmarklet` and drag
+"+ refs" to the bookmarks bar. On a paper's page it opens refs with the link
+filled in; Enter adds it.
+
+**Project keys.** refs reads your project `.bib` files (read only) and
+remembers the key each one uses for a library paper, so `refs find o2006optimal`
+finds O'Donoghue and Rabin (2006) even though refs calls it
+`odonoghue2006optimal`. The detail panel lists these keys with their file, and
+`refs status` lists the files read. Which files: `bib_files` in `config.py`
+(the research, RA and project repositories, and `phd/research` in Dropbox; not
+course or TA folders); override it in `config.toml`. Matching is by DOI, or by
+exactly the same title; keys are recomputed on every scan.
+
+**`--append`** never adds a paper the `.bib` already holds under any key
+(matched by key, DOI or title); it lists those with the key the file uses. For
+a `.bib` inside `overleaf/`, pull first and commit and push afterwards.
+
 Filters for `find`: `course:` / `project:` (folder slug), `term:`, `area:`,
 `in:` (context contains), `topic:`, `section:`, `kind:`, `year:`, `author:`,
-`status:` (verified, extracted, needs-review, classified, unprocessed), `tag:`.
+`status:` (any status in the table below, or unprocessed), `tag:`.
 Add `--json` to `find`, `status`, `contexts`, `dupes` or `scan` for machine-readable
 output; this is how coding agents query the library.
 
@@ -58,7 +89,7 @@ steps as `refs add`):
 
 | Where the new PDF is | What happens |
 |---|---|
-| `papers-dump` (saved from a browser, Finder, Dropbox on the phone) | read, filed under its work, renamed if verified; a notification says what arrived |
+| `papers-dump` (saved from a browser, Finder, Dropbox on the phone) | read, filed under its work, renamed if verified or confirmed; a notification says what arrived |
 | anywhere else under the roots | read and filed; never renamed |
 | moved, renamed, copied or annotated | recognised from the scan; nothing is read again |
 | still downloading (no `%%EOF` yet) | left until the download finishes |
@@ -119,6 +150,9 @@ The rule: the model never authors a bibliographic fact.
 | needs-review | something does not add up |
 | classified | not a library item (slides, problem set, ...) |
 | confidential | in a no-LLM folder (`phd/referee`); printed identifiers only |
+| confirmed | you accepted or corrected the record in the web page; renamed like verified |
+| imported | came from Zotero and has not been read by the pipeline |
+| no-file | a work saved without a PDF (`refs wanted`); the PDF attaches when it arrives |
 
 Known gap: many pre-2000 articles (old *AER* issues on JSTOR, for instance) have
 no usable registry record and end as extracted or needs-review.
@@ -157,11 +191,12 @@ Everything outside this repository, so it can be tracked and removed.
 | The `refs` command | `~/.local/bin/refs` (a uv tool, editable install of this repo) | `uv tool install --editable .` |
 | Login service | `~/Library/LaunchAgents/com.williamradaic.refs.plist` | `refs service install` |
 | Service log (incl. what the watcher did) | `~/Library/Logs/refs.log` | the service |
-| Settings | `~/.config/refs/config.toml` (contact email for registries) | by hand |
+| Settings | `~/.config/refs/config.toml` (contact email, extra exclusions, `auto_process`) | by hand |
 | API key | macOS Keychain, item `refs` | `refs setup-key` |
 | Index (rebuildable) | `~/Library/Application Support/refs/` | `refs scan` |
 | Registry cache | `~/Library/Caches/refs/` | lookups |
-| Library data (synced) | `Dropbox/phd/tools/refs/`: `reads/`, `works/`, `journal.jsonl` | the pipeline |
+| Library data (synced) | `Dropbox/phd/tools/refs/`: `reads/`, `works/`, `journal.jsonl`, `review.json` | the pipeline |
+| Agent skill | `~/.claude/skills/refs` and `~/.codex/skills/refs`, links to `extras/agent-skill/refs` | by hand (see New Mac) |
 | Optional | a `refs.test` line in `/etc/hosts`; Raycast quicklinks; a Chrome "installed app" | by hand |
 
 It listens on `127.0.0.1:8377` only. It never modifies Zotero, and it renames
@@ -177,6 +212,8 @@ uv tool install --editable .
 refs setup-key          # paste the Anthropic API key
 refs scan               # rebuilds the index; papers already read are not paid for again
 refs service install    # run at login
+ln -s ~/phd/tools/refs/extras/agent-skill/refs ~/.claude/skills/refs   # agent skill
+ln -s ~/phd/tools/refs/extras/agent-skill/refs ~/.codex/skills/refs
 ```
 
 Optional: `contact_email = "..."` in `~/.config/refs/config.toml`; import
@@ -188,6 +225,7 @@ Optional: `contact_email = "..."` in `~/.config/refs/config.toml`; import
 refs service uninstall
 uv tool uninstall refs
 rm -rf ~/Library/Application\ Support/refs ~/Library/Caches/refs ~/Library/Logs/refs.log ~/.config/refs
+rm ~/.claude/skills/refs ~/.codex/skills/refs
 ```
 
 Then delete the Keychain item `refs` in Keychain Access. The library data in
@@ -204,6 +242,10 @@ uv tool install --editable . --force   # (re)install the `refs` command
 The `refs` command runs from its own environment. Code changes reach it
 through the editable install (`refs service restart` to load them), but a new
 dependency in `pyproject.toml` needs the `uv tool install` line again first.
+
+The agent skill (`extras/agent-skill/refs/SKILL.md`) tells Claude Code and
+Codex how to use `refs find --json`, `refs bib` and `refs add`, and what to
+leave to you. Edit it there; the links pick up changes.
 
 `scripts/measure_identifiers.py` reports how many papers carry an identifier a
 registry can resolve (about a third, as of the first run).

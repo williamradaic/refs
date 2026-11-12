@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>refs bookmarklet</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+  <style>
+    body { display: block; overflow: auto; }
+    .page { max-width: 70ch; margin: 3em auto; padding: 0 16px; line-height: 1.6; }
+    .page h1 { font-size: 15px; }
+    .page p, .page ol { color: var(--dim); }
+    .grab { display: inline-block; margin: 1em 0; padding: 4px 1.5ch; border: 1px solid var(--accent);
+            color: var(--accent); font-weight: 700; cursor: grab; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>refs bookmarklet</h1>
+    <p>Drag this to your bookmarks bar:</p>
+    <a class="grab" id="grab" href="#">+ refs</a>
+    <ol>
+      <li>On a paper's page (NBER, arXiv, a journal, an author's site, or a PDF open in the browser), click <b>+ refs</b> in the bookmarks bar.</li>
+      <li>A small refs window opens with the page's address in the add bar. Press Enter.</li>
+      <li>refs finds the paper, downloads the PDF when it is openly available, and saves it in papers-dump. A paywalled paper is saved without a PDF; it attaches itself when you download it into papers-dump later.</li>
+    </ol>
+    <p><a href="/">back to refs</a></p>
+  </div>
+  <script>
+    // Built from this page's own address, so it points at whichever name you
+    // use for refs (refs.localhost, 127.0.0.1, refs.test). The bookmarklet
+    // only opens refs with the link filled in; nothing is added until you
+    // press Enter there.
+    const code = `(()=>{window.open('${location.origin}/?add='+encodeURIComponent(location.href),` +
+      `'refs-add','width=1100,height=720')})()`;
+    document.getElementById("grab").href = "javascript:" + code;
+    document.getElementById("grab").addEventListener("click", (event) => {
+      event.preventDefault();
+      alert("Drag this to the bookmarks bar instead of clicking it.");
+    });
+  </script>
+</body>
+</html>

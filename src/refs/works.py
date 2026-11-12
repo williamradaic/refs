@@ -211,7 +211,11 @@ def sync(cfg: Config) -> dict[str, str]:
         work["tags"] = [*reading.get("fields", []), *reading.get("methods", []),
                         *reading.get("topics", [])]
 
-    # 3. Write only the files that changed (keeps Dropbox quiet).
+    # 3. Keys that project .bib files use for these works (bibkeys.py).
+    from . import bibkeys
+    bibkeys.learn(cfg, works)
+
+    # 4. Write only the files that changed (keeps Dropbox quiet).
     for wid, work in works.items():
         if before.get(wid) != json.dumps(work, sort_keys=True):
             records.write_json(works_dir(cfg) / f"{wid}.json", work)

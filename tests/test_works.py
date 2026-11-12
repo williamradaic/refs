@@ -182,3 +182,38 @@ def test_importer_joins_existing_work_and_is_idempotent(cfg):
     created = next(w for w in all_works.values() if w["id"] != existing)
     assert created["meta"]["status"] == "imported" and created["meta"]["venue"] is None
     assert created["files"] == []
+
+
+def test_keys_from_project_bib_files_become_search_keys(cfg, tmp_path, monkeypatch):
+    from refs import index, scan
+    write_read(cfg, "aaa", title="Automobile Prices in Market Equilibrium", family="Berry",
+               year=1995, doi="10.2307/2171802", venue="Econometrica")
+    write_read(cfg, "ccc", title="Measuring Market Power", family="Nevo", year=2001,
+               doi=None, venue="Econometrica")
+    project = cfg.dropbox_root / "phd/research/bets/paper"
+    project.mkdir(parents=True)
+    (project / "references.bib").write_text(
+        "@article{BLP95, title={Automobile prices}, doi={10.2307/2171802}}\n"   # by DOI
+        "@article{Nevo:01, title = {{Measuring} market power}}\n"               # by title
+        "@article{Unknown2020, title={Something else}}\n")
+    settings = tmp_path / "config.toml"
+    settings.write_text('bib_files = ["phd/research/**/*.bib"]\n')
+    monkeypatch.setenv("REFS_CONFIG", str(settings))
+    cfg = config.load()
+
+    by_file = works.sync(cfg)
+    all_works = works.load_all(cfg)
+    assert all_works[by_file["aaa"]]["bib_keys"] == {"BLP95": "Dropbox/phd/research/bets/paper/references.bib"}
+    assert list(all_works[by_file["ccc"]]["bib_keys"]) == ["Nevo:01"]
+
+    # The keys are searchable (these works have no PDF on disk, so they are
+    # indexed as works without files).
+    conn = index.connect(cfg)
+    scan.scan(cfg, conn)
+    assert [r["work_id"] for r in index.search(conn, ["BLP95"], {})] == [by_file["aaa"]]
+    assert [r["work_id"] for r in index.search(conn, ["Nevo:01"], {})] == [by_file["ccc"]]
+
+    # A key removed from the file is forgotten on the next sync.
+    (project / "references.bib").write_text("")
+    works.sync(cfg)
+    assert "bib_keys" not in works.load_all(cfg)[by_file["aaa"]]

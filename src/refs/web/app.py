@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import bib, config, index, records, resolve, venues, works
+from .. import bib, config, index, ingest, organize, records, rename, resolve, venues, works
 from .. import scan as scanner
 from ..cli import _split_query
 
@@ -60,6 +60,16 @@ def create_app(watch: bool = False) -> FastAPI:
         if client not in {"127.0.0.1", "::1", "testclient"}:
             return PlainTextResponse("refs only answers this computer.", status_code=403)
         return await call_next(request)
+
+    # The page's own files change with every update of refs: tell the browser
+    # to check for a newer version each time (an unchanged file costs a 304).
+    @app.middleware("http")
+    async def revalidate(request, call_next):
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/") \
+                or request.url.path == "/bookmarklet":
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     # 2. Only under its own names. This stops a web page elsewhere from pointing
     #    a domain it controls at 127.0.0.1 and talking to refs through the browser.
@@ -178,6 +188,11 @@ def create_app(watch: bool = False) -> FastAPI:
     def home() -> FileResponse:
         return FileResponse(STATIC / "index.html")
 
+    @app.get("/bookmarklet")
+    def bookmarklet() -> FileResponse:
+        """A page with the "+ refs" bookmarklet to drag to the bookmarks bar."""
+        return FileResponse(STATIC / "bookmarklet.html")
+
     # --- reading the library --------------------------------------------------------
 
     @app.get("/api/search")
@@ -224,6 +239,9 @@ def create_app(watch: bool = False) -> FastAPI:
                 "unread": sum(user(i).get("read_status") == "unread" for i in library),
                 "review": sum(i["status"] == "needs-review" for i in library),
                 "wanted": sum(not w["files"] for w in all_works.values()),
+                "renames": len(rename.plan(cfg, conn, index.search(conn, [], {}, limit=None),
+                                           all_works)[0]),
+                "copies": len(organize.copies(cfg, conn)),
                 "unprocessed": conn.execute(
                     "SELECT COUNT(*) FROM files WHERE status IS NULL "
                     "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
@@ -310,6 +328,99 @@ def create_app(watch: bool = False) -> FastAPI:
         found["user"]["override_source"] = f"{record.source}, DOI given by you"
         found["user"]["confirmed"] = True
         return save_work(found)
+
+    # --- review: renames, identical copies, filing -------------------------------------
+
+    def rename_plan() -> tuple[list, list, list]:
+        conn = index.connect(cfg)
+        return rename.plan(cfg, conn, index.search(conn, [], {}, limit=None), works.load_all(cfg))
+
+    def refused(error: organize.Refused) -> HTTPException:
+        return HTTPException(409, str(error))
+
+    @app.get("/api/renames")
+    def renames() -> dict:
+        """Every file whose name differs from the house convention, outside
+        protected folders. Nothing is renamed until you approve it."""
+        proposals, copies, protected = rename_plan()
+        all_works = works.load_all(cfg)
+
+        def shape_proposal(proposal) -> dict:
+            meta = (all_works.get(proposal.work_id) or {}).get("meta") or {}
+            return {"path": proposal.path, "new_name": proposal.new_name,
+                    "folder": str(Path(proposal.path).parent), "work_id": proposal.work_id,
+                    "title": meta.get("title"), "year": meta.get("year"),
+                    "authors": [a["family"] for a in meta.get("authors") or [] if a.get("family")]}
+        return {"proposals": [shape_proposal(p) for p in proposals],
+                "protected": len(protected), "copies": copies}
+
+    @app.post("/api/renames/apply")
+    def apply_renames(paths: list[str] = Body(embed=True),
+                      x_refs: str | None = Header(default=None)) -> dict:
+        """Rename the chosen files. The plan is recomputed here, so the page
+        can only approve names refs itself proposes."""
+        guard(x_refs)
+        wanted = set(paths)
+        with ingest.exclusive(cfg):
+            proposals = [p for p in rename_plan()[0] if p.path in wanted]
+            done = rename.apply_many(cfg, proposals)
+            scanner.scan(cfg, index.connect(cfg))
+        return {"done": len(done)}
+
+    @app.post("/api/undo")
+    def undo(count: int = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
+        """Reverse the last `count` renames or moves (the journal is shared with the CLI)."""
+        guard(x_refs)
+        with ingest.exclusive(cfg):
+            restored = rename.undo(cfg, max(0, min(count, 500)))
+            scanner.scan(cfg, index.connect(cfg))
+        return {"restored": len(restored)}
+
+    @app.get("/api/copies")
+    def copies() -> dict:
+        found = organize.copies(cfg, index.connect(cfg))
+        all_works = works.load_all(cfg)
+        return {"items": [shape(item, all_works) | {"hash": item["hash"]} for item in found]}
+
+    @app.post("/api/copies/keep")
+    def keep(file_hash: str = Body(embed=True, alias="hash"),
+             x_refs: str | None = Header(default=None)) -> dict:
+        """These copies are on purpose: take them out of the Review queue."""
+        guard(x_refs)
+        organize.keep_copies(cfg, file_hash)
+        return {"ok": True}
+
+    @app.post("/api/trash")
+    def trash(path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
+        """Move one copy to the macOS Trash (never the last copy)."""
+        guard(x_refs)
+        with ingest.exclusive(cfg):
+            conn = index.connect(cfg)
+            try:
+                organize.trash(cfg, conn, path)
+            except organize.Refused as error:
+                raise refused(error)
+            scanner.scan(cfg, conn)
+        return {"ok": True}
+
+    @app.get("/api/folders")
+    def folders() -> dict:
+        """Where a PDF can be filed (for the "file to…" picker)."""
+        return {"folders": organize.destinations(cfg, index.connect(cfg))}
+
+    @app.post("/api/move")
+    def move(path: str = Body(embed=True), folder: str = Body(embed=True),
+             x_refs: str | None = Header(default=None)) -> dict:
+        """File a PDF into another folder. Undo with the rename journal."""
+        guard(x_refs)
+        with ingest.exclusive(cfg):
+            conn = index.connect(cfg)
+            try:
+                new_path = organize.move(cfg, conn, path, folder)
+            except organize.Refused as error:
+                raise refused(error)
+            scanner.scan(cfg, conn)
+        return {"path": new_path}
 
     @app.post("/api/open")
     def open_file(path: str = Body(embed=True), reveal: bool = Body(default=False, embed=True),

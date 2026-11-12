@@ -3,13 +3,15 @@
 
 const state = {
   query: "",          // what is typed in the search bar
-  view: "all",        // sidebar preset: all | unread | review | wanted
+  view: "all",        // sidebar preset: all | unread | review | wanted | renames | copies
   context: null,      // selected course or project key, e.g. "coursework/2026-fall/220a"
   tag: null,          // selected field tag
   scope: "library",   // "library" = papers only, "all" = course material too
   items: [],          // current search results
   selected: 0,        // index of the highlighted row
   adding: false,      // true while the bar is in "add a paper" mode
+  picked: new Set(),  // renames view: paths ticked for renaming
+  lastBatch: 0,       // how many renames the last "rename selected" did (for undo)
 };
 
 const $ = (id) => document.getElementById(id);
@@ -102,8 +104,12 @@ async function loadSidebar() {
   let html = `<div class="label">Library</div>`;
   html += nav("all papers", data.presets.all, `data-view="all"`);
   html += nav("unread", data.presets.unread, `data-view="unread"`);
-  html += nav("needs review", data.presets.review, `data-view="review"`);
   html += nav("no pdf yet", data.presets.wanted, `data-view="wanted"`);
+  // Things that want a decision from you.
+  html += `<div class="label">Review</div>`;
+  html += nav("needs review", data.presets.review, `data-view="review"`);
+  html += nav("renames", data.presets.renames, `data-view="renames"`);
+  html += nav("copies", data.presets.copies, `data-view="copies"`);
   // PDFs that are on disk but were never read (an interrupted add, or a file
   // that arrived through Finder). Shown only when there are some.
   if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
@@ -169,7 +175,14 @@ function authorsShort(names) {
   return names.length > 3 ? `${names[0]} et al.` : names.join(", ");
 }
 
+// Every load of the list gets a number; an answer that arrives after a newer
+// load started is dropped, so a slow search never overwrites the view you
+// switched to in the meantime.
+let listToken = 0;
+
 async function search(keepId = null) {
+  const token = ++listToken;
+  if (REVIEW_VIEWS[state.view] && !state.context && !state.tag) return REVIEW_VIEWS[state.view](token);
   // The sidebar selection becomes ordinary filters in front of the typed query.
   const parts = [];
   if (state.context) parts.push(state.context === "dump" ? "area:dump" : `in:${state.context}`);
@@ -177,6 +190,7 @@ async function search(keepId = null) {
   if (state.query) parts.push(state.query);
   const url = `/api/search?q=${encodeURIComponent(parts.join(" "))}&view=${state.view}&scope=${state.scope}`;
   const data = await get(url);
+  if (token !== listToken) return;
   state.raw = data.items;                 // the server's order, kept for "no sort"
   if (data.error) say(data.error);
   sortItems();
@@ -405,6 +419,10 @@ async function renderDetail() {
   html += `<dt>status</dt><dd><span class="st ${status}">${GLYPH[status] ?? "·"}</span> ${esc(status)}${
     meta.source ? ` <span class="badge">· ${esc(meta.source === "pdf" ? "read from the pdf" : "from " + meta.source)}</span>` : ""}</dd>`;
   if (item.citekey) html += `<dt>citekey</dt><dd>${esc(item.citekey)}</dd>`;
+  // Keys the project .bib files use for this paper (learned by refs).
+  for (const [key, file] of Object.entries(work?.bib_keys ?? {})) {
+    html += `<dt>also</dt><dd>${esc(key)} <span class="badge">· ${esc(file.replace(/^~\/phd\/|^Dropbox\/phd\//, ""))}</span></dd>`;
+  }
   if (meta.doi) html += `<dt>doi</dt><dd><a href="https://doi.org/${esc(meta.doi)}" target="_blank" rel="noreferrer">${esc(meta.doi)}</a></dd>`;
   html += `<dt>kind</dt><dd>${esc(item.kind)}</dd>`;
   if (item.read_status) html += `<dt>read</dt><dd>${esc(item.read_status)}</dd>`;
@@ -446,7 +464,8 @@ async function renderDetail() {
         <a class="act" href="/file?path=${encodeURIComponent(loc.path)}" target="_blank">open</a>
         <button class="act" data-open="${esc(loc.path)}">preview.app</button>
         <button class="act" data-reveal="${esc(loc.path)}">finder</button>
-      </div></div>`;
+        <button class="act" data-fileto="${esc(loc.path)}">file to…</button>
+      </div><div class="picker" data-for="${esc(loc.path)}"></div></div>`;
   }
 
   if (work?.user?.former_names?.length) {
@@ -534,6 +553,8 @@ $("detail").addEventListener("click", (event) => {
   }
   else if (el.dataset.open) post("/api/open", { path: el.dataset.open });
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
+  else if (el.dataset.fileto) openPicker(el.dataset.fileto);
+  else if (el.dataset.folder) fileTo(el.closest(".picker").dataset.for, el.dataset.folder);
   else if (el.dataset.act === "edit") showEditor();
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
   else if (el.dataset.act === "confirm") changeWork("confirm", {}, "accepted as is");
@@ -677,6 +698,186 @@ window.addEventListener("drop", async (event) => {
   }
 });
 
+// --- review: proposed renames ----------------------------------------------------------
+
+// Each file whose name differs from the house convention (outside protected
+// folders such as canvas-sync, overleaf and Git repositories). Nothing is
+// renamed until you tick it and press "rename selected".
+async function showRenames(token) {
+  const data = await get("/api/renames");
+  if (token !== listToken) return;
+  state.items = [];
+  const props = data.proposals;
+  const known = new Set(props.map((p) => p.path));
+  for (const path of [...state.picked]) if (!known.has(path)) state.picked.delete(path);
+  $("count").textContent = `${props.length} renames`;
+
+  let html = `<div class="bar">
+    <button class="act" data-pick="all">select all</button>
+    <button class="act" data-pick="none">select none</button>
+    <button class="act" data-apply="1">rename selected (<span id="npicked">${state.picked.size}</span>)</button>
+    ${state.lastBatch ? `<button class="act" data-undo="${state.lastBatch}">undo the last ${state.lastBatch}</button>` : ""}
+  </div>`;
+  if (!props.length) html += `<div class="empty">every file already has its proper name.</div>`;
+  let folder = null;
+  for (const p of props) {
+    if (p.folder !== folder) {
+      folder = p.folder;
+      html += `<div class="topic folder"><span>${esc(folder)}</span>
+        <button class="act" data-pick-folder="${esc(folder)}">select folder</button></div>`;
+    }
+    const who = `${authorsShort(p.authors)} (${p.year ?? "n.d."}) ${p.title ?? ""}`;
+    html += `<label class="prop"><input type="checkbox" data-path="${esc(p.path)}"${state.picked.has(p.path) ? " checked" : ""}>
+      <span class="old" title="${esc(p.path.split("/").pop())}">${esc(p.path.split("/").pop())}</span>
+      <span class="new" title="${esc(p.new_name)}">→ ${esc(p.new_name)}</span>
+      <span class="who">${esc(who)}</span></label>`;
+  }
+  $("list").innerHTML = html;
+  $("detail").innerHTML = `<div class="label">Renames</div>
+    <p>Names built from the verified record: <code>surname-year-short-title.pdf</code>.
+    Files stay in their folders. Your old names stay searchable.</p>
+    <p class="where" style="margin-top:8px">${data.protected} more are in folders refs never renames
+    (canvas-sync, overleaf, Git repositories).</p>
+    <p class="where" style="margin-top:8px">Folders shared with coauthors (e.g. research/bets) are
+    renamed for them too, through Dropbox.</p>`;
+}
+
+async function applyRenames() {
+  const paths = [...state.picked];
+  if (!paths.length) { say("tick the files to rename first"); return; }
+  say(`renaming ${paths.length} …`, 0);
+  const result = await post("/api/renames/apply", { paths });
+  state.picked.clear();
+  state.lastBatch = result.done ?? 0;
+  say(`renamed ${result.done} files`);
+  loadSidebar(); search();
+}
+
+async function undoBatch(count) {
+  const result = await post("/api/undo", { count });
+  state.lastBatch = 0;
+  say(`restored ${result.restored} names`);
+  loadSidebar(); search();
+}
+
+// --- review: identical copies -------------------------------------------------------------
+
+// The same PDF in more than one place. Often on purpose (a reading for a course
+// and for a project); otherwise trash the extra copy. The last copy cannot be trashed.
+async function showCopies(token) {
+  const data = await get("/api/copies");
+  if (token !== listToken) return;
+  state.items = [];
+  $("count").textContent = `${data.items.length} sets of copies`;
+  let html = data.items.length ? "" : `<div class="empty">no file is stored twice.</div>`;
+  for (const item of data.items) {
+    const name = item.title ?? item.locations[0].path.split("/").pop();
+    const who = item.authors?.length ? `${authorsShort(item.authors)} (${item.year ?? "n.d."}) ` : "";
+    html += `<div class="copyset"><div class="topic"><span>${esc(who + name)}</span>
+      <button class="act" data-keep="${esc(item.hash)}">keep all</button></div>`;
+    for (const loc of item.locations) {
+      html += `<div class="copy"><span class="path">${esc(loc.path)}</span>
+        <span class="acts"><button class="act" data-reveal="${esc(loc.path)}">finder</button>
+        <button class="act" data-trash="${esc(loc.path)}">trash</button></span></div>`;
+    }
+    html += `</div>`;
+  }
+  $("list").innerHTML = html;
+  $("detail").innerHTML = `<div class="label">Copies</div>
+    <p>The same PDF, byte for byte, stored in more than one place.</p>
+    <p class="where" style="margin-top:8px"><b>trash</b> moves that copy to the macOS Trash
+    (drag it back to restore). <b>keep all</b> says the copies are on purpose and takes the
+    set out of this list.</p>`;
+}
+
+const REVIEW_VIEWS = { renames: showRenames, copies: showCopies };
+
+$("list").addEventListener("change", (event) => {
+  const path = event.target.dataset?.path;
+  if (!path) return;
+  event.target.checked ? state.picked.add(path) : state.picked.delete(path);
+  $("npicked").textContent = state.picked.size;
+});
+
+$("list").addEventListener("click", async (event) => {
+  const el = event.target.closest("button");
+  if (!el) return;
+  const boxes = [...$("list").querySelectorAll("input[data-path]")];
+  const tick = (filter, on) => boxes.filter(filter).forEach((box) => {
+    box.checked = on; on ? state.picked.add(box.dataset.path) : state.picked.delete(box.dataset.path);
+  });
+  if (el.dataset.pick === "all") tick(() => true, true);
+  else if (el.dataset.pick === "none") tick(() => true, false);
+  else if (el.dataset.pickFolder) {
+    const folder = el.dataset.pickFolder;
+    const inFolder = (box) => box.dataset.path.slice(0, box.dataset.path.lastIndexOf("/")) === folder;
+    tick(inFolder, !boxes.filter(inFolder).every((box) => box.checked));   // toggles the folder
+  }
+  else if (el.dataset.apply) await applyRenames();
+  else if (el.dataset.undo) await undoBatch(Number(el.dataset.undo));
+  else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
+  else if (el.dataset.keep) {
+    await post("/api/copies/keep", { hash: el.dataset.keep });
+    say("kept: these copies are on purpose");
+    loadSidebar(); search();
+  }
+  else if (el.dataset.trash) {
+    if (!confirm(`Move this copy to the Trash?\n\n${el.dataset.trash}`)) return;
+    const response = await fetch("/api/trash", { method: "POST",
+      headers: { "Content-Type": "application/json", "X-Refs": "1" },
+      body: JSON.stringify({ path: el.dataset.trash }) });
+    say(response.ok ? "moved to the Trash" : (await response.json()).detail);
+    loadSidebar(); search();
+  }
+  const counter = $("npicked");
+  if (counter) counter.textContent = state.picked.size;
+});
+
+// --- file to… --------------------------------------------------------------------------------
+
+// A filter box over every folder refs knows (where PDFs already are, and the
+// folders above them). Type words of the path, then Enter or click.
+let folderList = null;
+async function openPicker(path) {
+  const box = [...$("detail").querySelectorAll(".picker")].find((el) => el.dataset.for === path);
+  if (!box) return;
+  // The box takes the keyboard at once, before the folder list has loaded:
+  // otherwise quick typing would land on the page's single-key shortcuts.
+  box.innerHTML = `<input class="pick" placeholder="type to find a folder, e.g. 220a readings demand" spellcheck="false" autocomplete="off">
+    <div class="choices"><div class="where">loading folders …</div></div>`;
+  const input = box.querySelector("input");
+  input.focus();
+  folderList ??= (await get("/api/folders")).folders;
+  const draw = () => {
+    const words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+    const hits = folderList.filter((f) => words.every((w) => f.toLowerCase().includes(w))).slice(0, 14);
+    box.querySelector(".choices").innerHTML = hits.map((f) =>
+      `<div class="choice" data-folder="${esc(f)}">${esc(f.replace(/^phd\//, ""))}</div>`).join("")
+      || `<div class="where">no folder matches</div>`;
+  };
+  input.addEventListener("input", draw);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      const first = box.querySelector(".choice");
+      if (first) fileTo(path, first.dataset.folder);
+    }
+  });
+  draw();
+  input.focus();
+}
+
+async function fileTo(path, folder) {
+  const response = await fetch("/api/move", { method: "POST",
+    headers: { "Content-Type": "application/json", "X-Refs": "1" },
+    body: JSON.stringify({ path, folder }) });
+  const result = await response.json();
+  if (!response.ok) { say(result.detail ?? "could not move it"); return; }
+  folderList = null;                          // the new location may add a folder
+  say(`filed into ${folder}. undo: refs rename --undo`, 9000);
+  loadSidebar();
+  search(state.items[state.selected]?.id ?? null);
+}
+
 // --- keyboard ---------------------------------------------------------------------------
 
 const HELP = `keys
@@ -687,6 +888,7 @@ const HELP = `keys
   enter  or  o         open the pdf in a new tab
   p                    open in Preview
   f                    show in Finder
+  F                    file to… (move the PDF into a course or project folder)
   y                    copy citekey
   b                    copy BibTeX
   r                    toggle read / unread
@@ -694,6 +896,13 @@ const HELP = `keys
   m                    show course material too
   R                    rescan Dropbox
   t                    light / dark
+
+review (sidebar)
+
+  renames              tick files, then "rename selected"; undo is offered after
+  copies               the same PDF in several places: trash a copy or keep all
+
+bookmarklet            open /bookmarklet and drag "+ refs" to the bookmarks bar
 
 search filters
 
@@ -703,7 +912,10 @@ search filters
 document.addEventListener("keydown", async (event) => {
   if ($("help").open) { $("help").close(); return; }
   if (event.target.matches?.("input, textarea, select")) {
-    if (event.key === "Escape" && event.target !== $("q")) $("editor").innerHTML = "";
+    if (event.key === "Escape" && event.target !== $("q")) {
+      $("editor") && ($("editor").innerHTML = "");
+      event.target.closest(".picker")?.replaceChildren();
+    }
     return;                                   // typing in a field: no shortcuts
   }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -717,6 +929,7 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "Enter" || key === "o") act("open");
   else if (key === "p") act("preview");
   else if (key === "f") act("reveal");
+  else if (key === "F") { event.preventDefault(); const p = state.items[state.selected]?.locations[0]?.path; if (p) openPicker(p); }
   else if (key === "y") act("citekey");
   else if (key === "b") act("bibtex");
   else if (key === "r") act("read");

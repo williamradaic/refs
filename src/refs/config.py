@@ -50,6 +50,18 @@ DEFAULTS: dict = {
     # "dump" = only those saved into the dump, "none" = keep the index current
     # but leave reading to `refs process`. Renaming happens only in the dump.
     "auto_process": "all",
+    # Project .bib files whose citation keys refs learns (bibkeys.py), so a
+    # paper cited as `BLP95` in a project is found by that key too. Read only.
+    # "~/..." or "/..." = a path on this Mac; anything else = inside Dropbox.
+    # `**` = any depth. Course and TA folders are left out on purpose: their
+    # .bib files are someone else's keys.
+    "bib_files": [
+        "~/phd/research/*/overleaf/**/*.bib",
+        "~/phd/research/*/*.bib",
+        "~/phd/ra/*/overleaf/**/*.bib",
+        "~/phd/projects/*/overleaf/**/*.bib",
+        "phd/research/**/*.bib",
+    ],
     # Optional. Crossref and OpenAlex allow more requests per second to clients
     # that identify themselves with an email. Empty = send none.
     "contact_email": "",
@@ -74,6 +86,7 @@ class Config:
     no_llm: list[str] = field(default_factory=list)
     no_rename: list[str] = field(default_factory=list)
     auto_process: str = "all"
+    bib_files: list[str] = field(default_factory=list)
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -146,6 +159,7 @@ def load() -> Config:
         ignore_dirs=frozenset(name.lower() for name in settings["ignore_dirs"]),
         no_llm=list(settings["no_llm"]),
         no_rename=list(settings["no_rename"]),
+        bib_files=list(settings["bib_files"]),
         auto_process=_choice(settings["auto_process"], "auto_process", {"all", "dump", "none"}),
     )
 

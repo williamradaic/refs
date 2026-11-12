@@ -227,7 +227,8 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
             venue, doi, status = meta.get("venue"), meta.get("doi"), meta.get("status")
             tags = list(dict.fromkeys([*tags, *work["user"].get("tags", []),
                                        *work["user"].get("collections", [])]))   # no repeats, order kept
-            ids.update({f"alias{n}": a for n, a in enumerate(work.get("aliases", []))})
+            ids.update({f"alias{n}": a for n, a in enumerate(
+                [*work.get("aliases", []), *work.get("bib_keys", {})])})
             former_names = work["user"].get("former_names", [])
 
         conn.execute(
@@ -283,7 +284,8 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
             "INSERT INTO search (hash, title, authors, aliases, filename, context, venue, tags, "
             "description) VALUES (?,?,?,?,?,?,?,?,?)",
             (f"work:{work_id}", meta.get("title") or "", " ".join(authors),
-             " ".join(filter(None, [initials, work["citekey"], *work.get("aliases", [])])),
+             " ".join(filter(None, [initials, work["citekey"], *work.get("aliases", []),
+                                    *work.get("bib_keys", {})])),
              "", "", meta.get("venue") or "", " ".join(tags), work.get("description") or ""),
         )
 

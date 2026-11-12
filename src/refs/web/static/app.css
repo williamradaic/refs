@@ -250,3 +250,24 @@ header .act { white-space: nowrap; }
 .menu div:hover { background: var(--sel); }
 .menu .off { color: var(--dim); }
 .row .da { color: var(--dim); }
+
+/* --- review views and the "file to…" picker --- */
+.bar { position: sticky; top: 0; z-index: 1; display: flex; gap: 0 2ch; padding: 4px 2ch;
+       background: var(--bg); border-bottom: 1px solid var(--line); }
+.topic.folder .act, .copyset .topic .act { margin-left: 1ch; }
+.prop { display: grid; grid-template-columns: 3ch minmax(0, 2fr) minmax(0, 3fr); column-gap: 1ch;
+        padding: 1px 2ch; cursor: pointer; }
+.prop:hover { background: color-mix(in srgb, var(--sel) 55%, transparent); }
+.prop input { margin: 0; accent-color: var(--accent); }
+.prop .old { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prop .new { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prop .who { grid-column: 2 / 4; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy { display: flex; justify-content: space-between; gap: 2ch; padding: 1px 2ch 1px 4ch; }
+.copy .path { overflow-wrap: anywhere; }
+.copy .acts { flex-wrap: nowrap; }
+.picker .pick { width: 100%; margin-top: 4px; font: inherit; color: var(--fg); background: transparent;
+                border: 0; border-bottom: 1px solid var(--line); outline: 0; padding: 2px 0; }
+.picker .pick:focus { border-bottom-color: var(--accent); }
+.picker .choice { color: var(--link); cursor: pointer; overflow-wrap: anywhere; }
+.picker .choice:hover { text-decoration: underline; }
+#detail code { color: var(--fg); }

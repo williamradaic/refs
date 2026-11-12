@@ -5,16 +5,21 @@ Rules (from the plan):
   * in place only: a rename never moves a file to another folder;
   * never inside folders other tools manage (canvas-sync, overleaf) or a Git repo;
   * every rename is appended to <state>/journal.jsonl and can be reversed.
+
+`plan()` decides what a set of files should be called; the command line
+(`refs rename`) and the web page's Review > renames both use it.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-from . import naming
+from . import naming, records, works
 from .config import Config
 
 
@@ -97,13 +102,18 @@ def apply(cfg: Config, rel: str, new_name: str, file_hash: str | None = None) ->
         return None
     os.rename(old, new)
     new_rel = str(PurePosixPath(rel).with_name(new_name))
-    journal_path(cfg).parent.mkdir(parents=True, exist_ok=True)
-    with journal_path(cfg).open("a") as journal:
-        journal.write(json.dumps({
-            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "from": rel, "to": new_rel, "hash": file_hash,
-        }, ensure_ascii=False) + "\n")
+    journal(cfg, rel, new_rel, file_hash)
     return new_rel
+
+
+def journal(cfg: Config, rel: str, new_rel: str, file_hash: str | None, action: str = "rename") -> None:
+    """Record one rename or move, so `undo` can reverse it."""
+    journal_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    with journal_path(cfg).open("a") as handle:
+        handle.write(json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "from": rel, "to": new_rel, "hash": file_hash, "action": action,
+        }, ensure_ascii=False) + "\n")
 
 
 def undo(cfg: Config, count: int = 1) -> list[tuple[str, str]]:
@@ -120,3 +130,82 @@ def undo(cfg: Config, count: int = 1) -> list[tuple[str, str]]:
             restored.append((entry["from"], entry["to"]))
     journal_path(cfg).write_text("".join(line + "\n" for line in lines))
     return restored
+
+
+# --- Planning renames for many files ------------------------------------------------
+
+@dataclass
+class Proposal:
+    path: str           # Dropbox-relative path now
+    new_name: str       # the name it would get (same folder)
+    file_hash: str
+    work_id: str
+
+
+def plan(cfg: Config, conn: sqlite3.Connection, items: list[dict],
+         all_works: dict[str, dict]) -> tuple[list[Proposal], list[str], list[tuple[str, str]]]:
+    """What the files of these search results should be called.
+
+    Returns (proposals, identical copies that would collide, [(path, why protected)]).
+    Two files in one folder can want the same name: published versions choose
+    first; an identical copy is reported, not renamed; a different version of
+    the same paper gets a "-wp" or "-2" suffix.
+    """
+    candidates, protected = [], []
+    for item in items:
+        work = all_works.get(item["work_id"] or "")
+        for loc in item["locations"]:
+            name = PurePosixPath(loc["path"]).name
+            new_name = work and proposed_name(work, name)
+            if not new_name or new_name == name:
+                continue
+            if reason := blocked_reason(cfg, loc["path"]):
+                protected.append((loc["path"], reason))
+                continue
+            file_hash = conn.execute("SELECT hash FROM paths WHERE path=?", (loc["path"],)).fetchone()[0]
+            reading = (records.load_read(cfg, file_hash) or {}).get("reading") or {}
+            candidates.append((loc["path"], new_name, file_hash, bool(reading.get("is_working_paper")),
+                               work["id"]))
+
+    proposals, copies = [], []
+    taken: dict[str, dict[str, str]] = {}          # folder -> {name: hash that owns it}
+    for rel, new_name, file_hash, is_wp, work_id in sorted(candidates, key=lambda c: (c[3], c[0])):
+        folder = str(PurePosixPath(rel).parent)
+        names = taken.setdefault(folder, {
+            p.name: "" for p in cfg.absolute(folder).glob("*.pdf")})   # names already on disk
+        if names.get(new_name) == file_hash:
+            copies.append(rel)                     # same content as a file already planned
+            continue
+        # The file's own current name is not "taken": renaming frees it. (Counting
+        # it turned "x-wp.pdf", next to the published "x.pdf", into "x-2.pdf".)
+        current = PurePosixPath(rel).name
+        others = {n for n, owner in names.items() if not (n == current and owner in ("", file_hash))}
+        final = disambiguate(new_name, others, is_wp)
+        if final == current:
+            continue                               # already has the right name
+        names[final] = file_hash
+        proposals.append(Proposal(rel, final, file_hash, work_id))
+    return proposals, copies, protected
+
+
+def apply_many(cfg: Config, proposals: list[Proposal]) -> list[tuple[str, str]]:
+    """Carry out proposals. Returns (old path, new path) for each one done.
+
+    The old name is kept on the work ("former names"), so descriptive names
+    you gave files stay searchable.
+    """
+    all_works = works.load_all(cfg)
+    done = []
+    for proposal in proposals:
+        new_rel = apply(cfg, proposal.path, proposal.new_name, proposal.file_hash)
+        if new_rel is None:
+            continue
+        done.append((proposal.path, new_rel))
+        work = all_works.get(proposal.work_id)
+        if work is not None:
+            former = work["user"].setdefault("former_names", [])
+            old_name = PurePosixPath(proposal.path).name
+            if old_name not in former:
+                former.append(old_name)
+                records.write_json(works.works_dir(cfg) / f"{work['id']}.json", work)
+    return done
