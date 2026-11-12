@@ -653,6 +653,16 @@ def cmd_zotero_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_service(args: argparse.Namespace) -> int:
+    """Install, remove or check the background service that runs refs at login."""
+    from . import service
+
+    actions = {"install": service.install, "uninstall": service.uninstall,
+               "restart": service.restart, "status": service.status}
+    print(actions[args.action]())
+    return 0
+
+
 def cmd_setup_key(args: argparse.Namespace) -> int:
     """Store the Anthropic API key in the macOS Keychain and check that it works."""
     import getpass
@@ -762,6 +772,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=8377)
     p.add_argument("--open", action="store_true", help="open it in the browser")
     p.set_defaults(run=cmd_serve)
+
+    p = sub.add_parser("service", help="run refs in the background, starting at login")
+    p.add_argument("action", choices=["install", "uninstall", "restart", "status"])
+    p.set_defaults(run=cmd_service)
 
     p = sub.add_parser("setup-key", help="store the Anthropic API key in the Keychain")
     p.set_defaults(run=cmd_setup_key)

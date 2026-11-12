@@ -49,6 +49,8 @@ output; this is how coding agents query the library.
 
 ## Launching
 
+- At login: `refs service install` keeps refs running in the background
+  (`status`, `restart` after code changes, `uninstall` to remove).
 - Address: `http://refs.localhost:8377` (any `.localhost` name points at this Mac).
   `/?q=blp` opens with a search; `/?add=<link>` opens the add bar filled in.
 - Raycast: run **Import Quicklinks** and choose `extras/raycast-quicklinks.json`
