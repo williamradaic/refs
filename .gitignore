@@ -1,0 +1,15 @@
+# Personal and externally synced folders (see the project folder convention).
+overleaf/
+local/
+/dropbox
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store

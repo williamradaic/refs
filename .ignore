@@ -1,0 +1,4 @@
+# Include project context in file discovery; Git ignores remain unchanged.
+!local/
+!dropbox
+!overleaf/

@@ -1,0 +1,28 @@
+[project]
+name = "refs"
+version = "0.1.0"
+description = "A folder-aware reference manager that sits on top of Dropbox."
+readme = "README.md"
+requires-python = ">=3.12"
+# Phase 1 (scanner, index, command line) uses only the Python standard library.
+# Later phases add: pymupdf, watchdog, fastapi, uvicorn, jinja2, httpx, anthropic,
+# rapidfuzz, bibtexparser.
+dependencies = [
+    "httpx>=0.28.1",
+    "pymupdf>=2.1",
+    "rapidfuzz>=3.14.6",
+]
+
+[project.scripts]
+# Installs the `refs` command, which runs main() in src/refs/cli.py.
+refs = "refs.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
