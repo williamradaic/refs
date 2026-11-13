@@ -33,7 +33,7 @@ from typing import Callable
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from . import index, ingest
+from . import index, ingest, notes
 from . import scan as scanner
 from .config import Config
 
@@ -88,6 +88,9 @@ class Watcher:
         # Folders whose changes never matter: the app's own records (written
         # by every pass, so watching them would loop) and excluded paths.
         self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths]]
+        # Reading notes (in the Obsidian vault, outside Dropbox): an edited note
+        # changes what search finds, so it too starts a pass.
+        self._notes = str(notes.folder(cfg))
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._first_event = self._last_event = 0.0
@@ -103,6 +106,9 @@ class Watcher:
 
     def relevant(self, path: str, is_directory: bool) -> bool:
         """Could a change at this path change the index?"""
+        if path.startswith(self._notes + os.sep):
+            name = os.path.basename(path)
+            return not is_directory and name.endswith(".md") and not name.startswith(".")
         if any(path == skip or path.startswith(skip + os.sep) for skip in self._skip):
             return False
         parts = PurePosixPath(path).parts
@@ -143,6 +149,8 @@ class Watcher:
             top = self.cfg.absolute(root)
             if top.is_dir():
                 self._observer.schedule(handler, str(top), recursive=True)
+        if os.path.isdir(self._notes):
+            self._observer.schedule(handler, self._notes, recursive=False)
         self._observer.daemon = True
         self._observer.start()
         _log(f"watching {', '.join(self.cfg.roots)} (reading new PDFs: {self.cfg.auto_process})")

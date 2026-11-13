@@ -70,6 +70,17 @@ DEFAULTS: dict = {
     # ("~/..."), not in Dropbox; the folder is relative to the vault.
     "obsidian_vault": "~/wr-vault",
     "obsidian_folder": "phd/refs",
+    # Semantic search (embed.py): the local model that turns each paper's text
+    # into a vector. Changing it re-embeds the library at the next scan (about
+    # a minute). "BAAI/bge-base-en-v1.5" is the larger, somewhat better option.
+    "embedding_model": "BAAI/bge-small-en-v1.5",
+    # Asking Haiku (ask.py) to rank candidates for a search that reads like a
+    # description ("IO paper on ice cream"). "auto" = only when the local
+    # results look unsure, or when the query starts with "?"; "never" = never.
+    "ask": "auto",
+    # Dollars per calendar month that asking may spend (about $0.0005 a question).
+    # Once reached, searches stay local until the next month.
+    "ask_monthly_cap": 1.0,
 }
 
 
@@ -94,6 +105,9 @@ class Config:
     bib_files: list[str] = field(default_factory=list)
     obsidian_vault: Path = Path.home() / "wr-vault"
     obsidian_folder: str = "phd/refs"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    ask: str = "auto"
+    ask_monthly_cap: float = 1.0
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -170,6 +184,9 @@ def load() -> Config:
         obsidian_vault=Path(settings["obsidian_vault"]).expanduser(),
         obsidian_folder=str(settings["obsidian_folder"]).strip("/"),
         auto_process=_choice(settings["auto_process"], "auto_process", {"all", "dump", "none"}),
+        embedding_model=str(settings["embedding_model"]),
+        ask=_choice(settings["ask"], "ask", {"auto", "never"}),
+        ask_monthly_cap=float(settings["ask_monthly_cap"]),
     )
 
 

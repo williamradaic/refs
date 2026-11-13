@@ -180,7 +180,10 @@ function authorsShort(names) {
 // switched to in the meantime.
 let listToken = 0;
 
-async function search(keepId = null) {
+// `ask`: "off" while typing (local search only, instant); "auto" on Enter, which
+// lets the server ask Haiku when the query reads like a description and the
+// local results look unsure, or when it starts with "?".
+async function search(keepId = null, ask = "off") {
   const token = ++listToken;
   if (REVIEW_VIEWS[state.view] && !state.context && !state.tag) return REVIEW_VIEWS[state.view](token);
   // The sidebar selection becomes ordinary filters in front of the typed query.
@@ -188,11 +191,20 @@ async function search(keepId = null) {
   if (state.context) parts.push(state.context === "dump" ? "area:dump" : `in:${state.context}`);
   if (state.tag) parts.push(`tag:${state.tag.replace(/\s+/g, "-")}`);
   if (state.query) parts.push(state.query);
-  const url = `/api/search?q=${encodeURIComponent(parts.join(" "))}&view=${state.view}&scope=${state.scope}`;
+  // The typed query goes first, so a leading "?" (always ask Haiku) stays leading.
+  if (state.query) parts.unshift(parts.pop());
+  const url = `/api/search?q=${encodeURIComponent(parts.join(" "))}&view=${state.view}` +
+    `&scope=${state.scope}&ask=${ask}`;
+  // Asking Haiku takes a few seconds: say so if the answer is slow to come.
+  const waiting = ask !== "off" && setTimeout(() => say("asking Haiku …", 0), 400);
   const data = await get(url);
+  clearTimeout(waiting);
   if (token !== listToken) return;
   state.raw = data.items;                 // the server's order, kept for "no sort"
+  state.asked = Boolean(data.asked);      // Haiku chose this order: keep it unsorted
   if (data.error) say(data.error);
+  else if (data.message) say(`✦ ${data.message}`, 9000);
+  else if (ask !== "off") say("");
   sortItems();
   const kept = keepId ? state.items.findIndex((i) => i.id === keepId) : -1;
   state.selected = Math.max(0, kept);
@@ -202,7 +214,7 @@ async function search(keepId = null) {
 
 function sortItems() {
   state.items = [...(state.raw ?? [])];
-  const chosen = layout.sort;
+  const chosen = state.asked ? null : layout.sort;
   if (chosen) {
     const key = COLUMNS[chosen.col].sort, direction = chosen.dir === "desc" ? -1 : 1;
     state.items.sort((a, b) => {
@@ -411,7 +423,8 @@ async function renderDetail() {
   const where = [item.venue, item.year, issue, meta.pages].filter(Boolean).join(" · ");
   const status = item.status ?? "classified";
 
-  let html = `<h1>${esc(item.title ?? "untitled")}</h1>`;
+  let html = item.why ? `<p class="why">✦ ${esc(item.why)}</p>` : "";
+  html += `<h1>${esc(item.title ?? "untitled")}</h1>`;
   if (authors) html += `<p class="who">${esc(authors)}</p>`;
   if (where) html += `<p class="where">${esc(where)}</p>`;
 
@@ -716,7 +729,12 @@ $("q").addEventListener("keydown", async (event) => {
     $("q").blur();
   }
   if (event.key === "Enter") {
-    if (!state.adding) { $("q").blur(); return; }
+    if (!state.adding) {
+      clearTimeout(typing);
+      $("q").blur();
+      if (state.query) search(null, "auto");
+      return;
+    }
     const thing = $("q").value.trim();
     if (!thing) return;
     setAdding(false); $("q").blur();

@@ -6,7 +6,9 @@ rebuilt with `refs scan`. Tables:
   files   one row per distinct PDF *content* (keyed by SHA-256 hash)
   paths   one row per location on disk; several paths can share one hash
   events  a log of what each scan noticed (added, moved, modified, ...)
-  search  full-text index over titles, authors, file names and contexts
+  search  full-text index over titles, authors, file names, contexts and notes
+  vectors one vector per item (and per piece of its note) for semantic search;
+          see embed.py
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import re
 import sqlite3
 from pathlib import PurePosixPath
 
-from . import contexts, naming, records, works
+from . import contexts, embed, naming, notes, query, records, works
 from .config import Config
 
 # Bump when the tables change. An older index is simply dropped and rebuilt.
@@ -72,7 +74,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
-    hash UNINDEXED, title, authors, aliases, filename, context, venue, tags, description,
+    hash UNINDEXED, title, authors, aliases, filename, context, venue, tags, description, notes,
     tokenize = 'unicode61 remove_diacritics 2'
 );
 """
@@ -96,10 +98,21 @@ def connect(cfg: Config) -> sqlite3.Connection:
             for table in ("search", "events", "paths", "files", "meta"):
                 conn.execute(f"DROP TABLE IF EXISTS {table}")
 
+    # The search table gained a `notes` column. Only that table is rebuilt (from
+    # the rows already in the index), not the whole index: a full rebuild
+    # would mean reading every PDF in Dropbox again.
+    old_search = [r["name"] for r in conn.execute("PRAGMA table_info(search)")]
+    rebuild_search = bool(old_search) and "notes" not in old_search
+    if rebuild_search:
+        conn.execute("DROP TABLE search")
+
     conn.executescript(SCHEMA)
+    embed.ensure_schema(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
     )
+    if rebuild_search:
+        refresh_derived(cfg, conn)
     conn.commit()
     return conn
 
@@ -177,6 +190,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
     supersedes = dict(conn.execute("SELECT hash, supersedes FROM files").fetchall())
     file_to_work = works.sync(cfg)          # also writes new or changed work files
     all_works = works.load_all(cfg)
+    note_text = notes.bodies(cfg)           # your reading notes, by citekey
     conn.execute("DELETE FROM search")
     for file_hash, located in by_hash.items():
         guesses = [(naming.parse_filename(PurePosixPath(p).name), p, ctx) for p, ctx in located]
@@ -244,7 +258,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
         initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
         conn.execute(
             "INSERT INTO search (hash, title, authors, aliases, filename, context, venue, tags, "
-            "description) VALUES (?,?,?,?,?,?,?,?,?)",
+            "description, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 file_hash,
                 title or "",
@@ -256,6 +270,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
                 venue or "",
                 " ".join(tags),
                 description or "",
+                note_text.get(citekey or "", ""),
             ),
         )
 
@@ -282,11 +297,12 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
         initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
         conn.execute(
             "INSERT INTO search (hash, title, authors, aliases, filename, context, venue, tags, "
-            "description) VALUES (?,?,?,?,?,?,?,?,?)",
+            "description, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (f"work:{work_id}", meta.get("title") or "", " ".join(authors),
              " ".join(filter(None, [initials, work["citekey"], *work.get("aliases", []),
                                     *work.get("bib_keys", {})])),
-             "", "", meta.get("venue") or "", " ".join(tags), work.get("description") or ""),
+             "", "", meta.get("venue") or "", " ".join(tags), work.get("description") or "",
+             note_text.get(work["citekey"], "")),
         )
 
 
@@ -326,32 +342,110 @@ def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
     }
 
 
+# --- Semantic ranking settings (embed.py) ---------------------------------------
+# Only items at least this similar to the query count as semantic matches, and
+# only those within SEMANTIC_BAND of the best one: a query that matches one
+# paper well should not drag in fifty that match it vaguely. Calibrated on the
+# real library with bge-small-en-v1.5; another model needs new values.
+SEMANTIC_FLOOR = 0.60
+SEMANTIC_BAND = 0.12
+SEMANTIC_DEPTH = 60          # never more semantic matches than this
+RRF_K = 60                   # reciprocal rank fusion: score = sum of 1 / (K + rank)
+
+
+def surnames(conn: sqlite3.Connection) -> set[str]:
+    """Every author surname in the library, lowercase (to tell names from words)."""
+    names: set[str] = set()
+    for row in conn.execute("SELECT g_authors FROM files WHERE g_authors IS NOT NULL"):
+        names.update(n.lower() for n in json.loads(row["g_authors"]) if n)
+    return names
+
+
+def _match_expression(terms: list[str], any_word: bool = False) -> str:
+    """The FTS5 query for the words: each quoted (so punctuation is harmless) and
+    prefix-matched; a known abbreviation also matches its expansion ("IO" finds
+    "industrial organization")."""
+    parts = []
+    for term in terms:
+        word = '"' + term.replace('"', '""') + '"*'
+        if full := query.abbreviation(term):
+            word = f'({word} OR "{full}")'
+        parts.append(word)
+    return (" OR " if any_word else " AND ").join(parts)
+
+
 def search(
     conn: sqlite3.Connection, terms: list[str], filters: dict[str, str] | None = None,
-    limit: int | None = 50,
+    limit: int | None = 50, *, semantic: bool = False, wide: bool = False,
+    report: dict | None = None,
 ) -> list[dict]:
     """Find files by free text and/or `key:value` filters.
 
     Free-text words must all match (prefix match, so "demand est" works).
     A file passes a path filter if *any* of its locations satisfies it.
+
+    semantic=True also ranks items by meaning (embed.py) and merges the two
+    rankings, so "IO paper on ice cream" finds a paper whose summary speaks of
+    frozen-dessert demand. It is used for searches people type (`find`, the
+    web page); commands that act on what they select (`process`, `rename`)
+    keep the exact keyword match.
+    wide=True builds a shortlist for ask.py instead: any one word may match,
+    and semantic matches are not cut off by similarity.
+    report, if given, receives how sure the ranking is: keyword_hits,
+    top_similarity and margin (best similarity minus the fifth best).
     """
     filters = {FILTER_ALIASES.get(k, k): v.lower() for k, v in (filters or {}).items()}
     unknown = set(filters) - PATH_FILTERS - FILE_FILTERS
     if unknown:
         raise ValueError(f"unknown filter(s): {', '.join(sorted(unknown))}")
+    terms = [t for t in terms if t.strip()]
+    if report is not None:
+        report.update(keyword_hits=0, top_similarity=None, margin=None, semantic_used=False)
 
     # Candidate files, best text match first (or all files when there is no text).
     if terms:
-        # Each word is quoted (so punctuation is harmless) and prefix-matched.
-        match = " AND ".join('"' + t.replace('"', '""') + '"*' for t in terms)
         rows = conn.execute(
             "SELECT f.* FROM search JOIN files f ON f.hash = search.hash "
             # Column weights (hash, title, authors, aliases, filename, context,
-            # venue, tags, description): a hit on initials or citekey counts most,
-            # a word buried in the description least.
+            # venue, tags, description, notes): a hit on initials or citekey
+            # counts most, a word buried in the description least.
             "WHERE search MATCH ? "
-            "ORDER BY bm25(search, 0, 5.0, 5.0, 10.0, 2.0, 1.0, 1.0, 2.0, 0.5)", (match,),
+            "ORDER BY bm25(search, 0, 5.0, 5.0, 10.0, 2.0, 1.0, 1.0, 2.0, 0.5, 1.0)",
+            # A wide search leaves out describing words ("paper", "on"), which
+            # would otherwise match nearly everything once any word may match.
+            (_match_expression([t for t in terms if t.lower() not in query.FILLER] or terms,
+                               any_word=wide) if wide else _match_expression(terms),),
         ).fetchall()
+        if report is not None:
+            report["keyword_hits"] = len(rows)
+
+        # Meaning, for queries of several words or ones the words alone miss;
+        # never for a query of names and identifiers only ("blp", "chetty
+        # looney", a citekey): that is a lookup, and similarity means nothing.
+        # The model gets the words as typed. Spelling out "IO" here would make
+        # the field outweigh the topic ("IO paper on ice cream" then finds IO
+        # syllabi); the keyword side already matches the expansion.
+        lookup_only = all(query.is_lookup(t, surnames(conn)) for t in terms)
+        if semantic and not lookup_only and (wide or len(terms) >= 2 or not rows):
+            ranked = embed.rank(conn, " ".join(terms))
+            if ranked:
+                top = ranked[0][1]
+                if report is not None:
+                    report.update(semantic_used=True, top_similarity=round(top, 4),
+                                  margin=round(top - ranked[min(4, len(ranked) - 1)][1], 4))
+                if not wide:
+                    ranked = [(u, s) for u, s in ranked
+                              if s >= max(SEMANTIC_FLOOR, top - SEMANTIC_BAND)]
+                ranked = ranked[:SEMANTIC_DEPTH]
+                # Reciprocal rank fusion: each list contributes 1 / (K + rank).
+                # A keyword hit gets a hair more, so a tie goes to the exact match.
+                score: dict[str, float] = {}
+                for position, row in enumerate(rows):
+                    score.setdefault(embed.unit_of(row), 1 / (RRF_K + position) + 1e-6)
+                for position, (unit, _) in enumerate(ranked):
+                    score[unit] = score.get(unit, 0.0) + 1 / (RRF_K + position)
+                rows = [r for r in conn.execute("SELECT * FROM files") if embed.unit_of(r) in score]
+                rows.sort(key=lambda r: -score[embed.unit_of(r)])
     else:
         rows = conn.execute("SELECT * FROM files").fetchall()
 

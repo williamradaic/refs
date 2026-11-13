@@ -22,8 +22,11 @@ refs find berry levinsohn pakes --json --limit 3
 refs find course:220a kind:paper --json --all
 ```
 
-Words match title, authors, author initials ("blp"), citekeys, file names, tags
-and descriptions, as prefixes. Filters: `course:` / `project:` (folder slug, e.g.
+Words match title, authors, author initials ("blp"), citekeys, file names, tags,
+descriptions and William's reading notes, as prefixes. A query of several words
+is also matched by meaning (a local embedding model, free), so a description
+works: `refs find paper on misperceived nonlinear tax schedules --json`. Field
+abbreviations such as `IO`, `PF`, `RDD` match their spelled-out tags. Filters: `course:` / `project:` (folder slug, e.g.
 `220a`, `bets`), `term:` (`2026-fall`), `area:` (`coursework`, `research`,
 `dump`, ...), `in:` (context contains), `topic:`, `kind:` (`paper`, `book`,
 `chapter`, `slides`, `syllabus`, `notes`, `problem-set`, ...), `year:`,
@@ -40,6 +43,12 @@ matches the PDF) and `confirmed` (William checked it) are reliable; `extracted`
 is the model's transcription of the first page (fine for drafts and job market
 papers, but say so when it matters); `needs-review` means something did not add
 up, so double-check before citing.
+
+`refs find --json` never calls a model. When a description finds nothing
+convincing, `refs ask <description> --json` has Claude Haiku rank a shortlist of
+about 40 local candidates (about $0.0005 a question; answers are cached and
+capped at $1 a month). Its results carry a `why` field; an empty list means
+Haiku judged that nothing in the library fits. Use it sparingly, after `find`.
 
 Other read-only commands:
 

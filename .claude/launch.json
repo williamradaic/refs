@@ -4,8 +4,27 @@
     {
       "name": "refs",
       "runtimeExecutable": "uv",
-      "runtimeArgs": ["run", "refs", "serve", "--port", "8377"],
+      "runtimeArgs": [
+        "run",
+        "refs",
+        "serve",
+        "--port",
+        "8377"
+      ],
       "port": 8377
+    },
+    {
+      "name": "refs-dev",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "refs",
+        "serve",
+        "--port",
+        "8378",
+        "--no-watch"
+      ],
+      "port": 8378
     }
   ]
 }

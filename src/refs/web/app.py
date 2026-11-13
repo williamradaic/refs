@@ -25,6 +25,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .. import bib, config, index, ingest, notes, organize, records, rename, resolve, venues, works
+from .. import ask as asking
 from .. import scan as scanner
 from ..cli import _split_query
 
@@ -196,28 +197,35 @@ def create_app(watch: bool = False) -> FastAPI:
     # --- reading the library --------------------------------------------------------
 
     @app.get("/api/search")
-    def search(q: str = "", view: str = "all", scope: str = "library") -> dict:
+    def search(q: str = "", view: str = "all", scope: str = "library", ask: str = "off") -> dict:
         """`q` uses the same syntax as `refs find`. `view` is a sidebar preset;
-        `scope=all` also lists course material, not just library works."""
+        `scope=all` also lists course material, not just library works.
+        `ask`: "off" while typing (local only); "auto" when Enter is pressed,
+        which asks Haiku if the query reads like a description and the local
+        results look unsure, or if it starts with "?" (ask.py)."""
         conn = index.connect(cfg)
         all_works = works.load_all(cfg)
         if view == "wanted":
             items = [stub_item(w) for w in all_works.values() if not w["files"]]
             return {"items": items}
-        terms, filters = _split_query(q.split())
+        words, forced = asking.strip_force(q.split())
+        terms, filters = _split_query(words)
         if view == "review":
             filters["status"] = "needs-review"
         if view == "unprocessed":                  # PDFs on disk that were never read
             filters["status"], scope = "unprocessed", "all"
+        mode = "off" if ask == "off" else ("force" if forced else "auto")
+        if view == "unread":                       # Haiku ranks only what this view shows
+            keep = lambda i: bool(i["work_id"]) and (all_works.get(i["work_id"]) or {}).get(  # noqa: E731
+                "user", {}).get("read_status") == "unread"
+        else:
+            keep = lambda i: scope == "all" or bool(i["work_id"])  # noqa: E731
         try:
-            found = index.search(conn, terms, filters, limit=None)
+            outcome = asking.search(cfg, conn, terms, filters, mode=mode, keep=keep)
         except ValueError as error:
             return {"items": [], "error": str(error)}
-        items = [shape(item, all_works) for item in found
-                 if scope == "all" or item["work_id"]]
-        if view == "unread":
-            items = [i for i in items if i["read_status"] == "unread"]
-        return {"items": items[:800]}
+        items = [shape(item, all_works) | {"why": item.get("why")} for item in outcome.results]
+        return {"items": items[:800], "asked": outcome.asked, "message": outcome.message}
 
     @app.get("/api/sidebar")
     def sidebar() -> dict:

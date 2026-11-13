@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
-from . import index, storage
+from . import embed, index, storage
 from .config import Config
 
 
@@ -40,6 +40,8 @@ class ScanReport:
     removed: list[str] = field(default_factory=list)
     online_only: list[str] = field(default_factory=list)  # not downloaded; skipped
     seconds: float = 0.0
+    embedded: int = 0                                     # texts given new vectors
+    embed_error: str | None = None                        # why embedding failed, if it did
 
     @property
     def changes(self) -> int:
@@ -201,6 +203,16 @@ def scan(cfg: Config, conn: sqlite3.Connection,
     index.refresh_derived(cfg, conn)
     conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_scan', ?)", (now,))
     conn.commit()
+
+    # --- Vectors for semantic search: only what is new or changed -------------
+    # A failure here (say, no network for the first model download) must not
+    # spoil the scan: keyword search works without vectors.
+    try:
+        report.embedded = embed.refresh(cfg, conn)
+        conn.commit()
+    except Exception as error:                       # noqa: BLE001
+        conn.rollback()
+        report.embed_error = f"{type(error).__name__}: {error}"
 
     report.seconds = time.monotonic() - started
     return report

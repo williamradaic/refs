@@ -68,6 +68,29 @@ def read(cfg: Config, work: dict) -> dict:
     }
 
 
+def bodies(cfg: Config) -> dict[str, str]:
+    """The text of every note, by citekey (front matter left out), for searching.
+
+    Hidden files (the temporary file of a save in progress) are skipped. A
+    vault that is missing or unreadable simply yields no notes.
+    """
+    found: dict[str, str] = {}
+    try:
+        paths = sorted(folder(cfg).glob("*.md"))
+    except OSError:
+        return found
+    for path in paths:
+        if path.name.startswith("."):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if body := _split(text)[1].strip():
+            found[path.stem] = body
+    return found
+
+
 def _front_matter(work: dict) -> str:
     """Properties for a new note. Values are written as JSON, which is valid YAML."""
     meta = work.get("meta") or {}

@@ -16,8 +16,10 @@ it). What remains is the plan's "Later" list, in `local/admin/plan.md`.
 ```sh
 refs scan                      # bring the index in line with Dropbox
 refs status                    # what the library holds
-refs find blp                  # search titles, authors, initials, file names
+refs find blp                  # search titles, authors, initials, file names, notes
 refs find course:220a kind:paper topic:demand
+refs find IO paper on ice cream   # a description works too (matched by meaning)
+refs ask demand for frozen desserts   # let Haiku pick from ~40 candidates (~$0.0005)
 refs contexts                  # courses and projects recognised from folders
 refs dupes                     # files stored in more than one place
 refs open blp                  # open the best match
@@ -63,7 +65,9 @@ text below. It saves a moment after you stop typing, on `⌘S`, and when you
 leave the box (`esc`). If the file changed in Obsidian since the panel loaded
 it, the save is refused rather than overwriting; the panel says so and offers
 Obsidian's version. Keep the file name: refs finds the note by citekey, so a
-renamed note is a new, empty one to refs. Settings: `obsidian_vault` and
+renamed note is a new, empty one to refs. Notes are searched like everything
+else (by word and by meaning); an edit made in Obsidian is picked up a few
+seconds later while refs runs. Settings: `obsidian_vault` and
 `obsidian_folder` in `config.toml`.
 
 **File to…** (`F`, or the link under each file) moves a PDF into another folder,
@@ -86,6 +90,29 @@ exactly the same title; keys are recomputed on every scan.
 **`--append`** never adds a paper the `.bib` already holds under any key
 (matched by key, DOI or title); it lists those with the key the file uses. For
 a `.bib` inside `overleaf/`, pull first and commit and push afterwards.
+
+**Search** combines two rankings (`index.search`, `embed.py`, `ask.py`):
+
+| | What it does | Cost |
+|---|---|---|
+| words | every word must appear (as a prefix) in the title, authors, initials, citekeys, file names, tags, summary or your note; `IO`, `PF`, `RDD`, … also match the spelled-out field | free, instant |
+| meaning | for queries of two or more words: a small model on this Mac (`BAAI/bge-small-en-v1.5` through fastembed) compares the query with each paper's title, tags, summary and note, so "frozen desserts" finds an ice-cream paper. Names and identifiers alone ("chetty 2009", "blp") skip this step | free, ~10 ms |
+| Haiku | ranks a shortlist of ~40 local candidates and says why each fits | ~$0.0005 a question |
+
+The two free rankings are merged (reciprocal rank fusion), so exact matches
+stay on top. Haiku is asked only when a query reads like a description **and**
+the local result looks unsure (no paper contains every word, and the best
+match by meaning is weak or no clear winner stands out): in the web page when
+you press Enter (typing stays local), and in `refs find` at the terminal. A
+query starting with `?`, or `refs ask`, always asks; `--local` and `--json`
+never ask on their own. Haiku sees titles, authors, tags and summaries of the
+candidates, never your notes or anything from `no_llm` folders. Answers are
+cached by query, and the month's spending is capped (`ask_monthly_cap`,
+default $1; then search stays local). Settings in `config.toml`: `ask =
+"never"` turns automatic asking off; `embedding_model` changes the model
+(`"BAAI/bge-base-en-v1.5"` is larger and somewhat better), and the next scan
+re-embeds everything (about 30 seconds). The similarity cut-offs in
+`index.py` and `ask.py` were set on this library with the small model.
 
 Filters for `find`: `course:` / `project:` (folder slug), `term:`, `area:`,
 `in:` (context contains), `topic:`, `section:`, `kind:`, `year:`, `author:`,
@@ -175,7 +202,8 @@ no usable registry record and end as extracted or needs-review.
 | What | Where |
 |---|---|
 | Code | `~/phd/tools/refs` (this repo) |
-| Index (rebuildable cache) | `~/Library/Application Support/refs/index.db` |
+| Index (rebuildable cache), incl. search vectors and Haiku answers with their cost | `~/Library/Application Support/refs/index.db` |
+| Embedding model (64 MB, downloaded once) | `~/Library/Caches/refs/fastembed/` |
 | Works, one per paper (citekey, your read status and tags) | `Dropbox/phd/tools/refs/works/` |
 | Reading notes, one per paper | `~/wr-vault/phd/refs/<citekey>.md` (Obsidian Sync) |
 | Rename journal | `Dropbox/phd/tools/refs/journal.jsonl` |
@@ -208,7 +236,7 @@ Everything outside this repository, so it can be tracked and removed.
 | Settings | `~/.config/refs/config.toml` (contact email, extra exclusions, `auto_process`) | by hand |
 | API key | macOS Keychain, item `refs` | `refs setup-key` |
 | Index (rebuildable) | `~/Library/Application Support/refs/` | `refs scan` |
-| Registry cache | `~/Library/Caches/refs/` | lookups |
+| Registry cache, embedding model | `~/Library/Caches/refs/` | lookups, the first scan |
 | Library data (synced) | `Dropbox/phd/tools/refs/`: `reads/`, `works/`, `journal.jsonl`, `review.json` | the pipeline |
 | Reading notes | `~/wr-vault/phd/refs/` | the notes box in the web page |
 | Agent skill | `~/.claude/skills/refs` and `~/.codex/skills/refs`, links to `extras/agent-skill/refs` | by hand (see New Mac) |

@@ -3,6 +3,7 @@
     refs scan                 bring the index in line with Dropbox
     refs status               what the library holds
     refs find blp             search; add filters like course:220a kind:paper
+    refs ask "IO paper on ice cream"   let Haiku rank the candidates (about $0.0005)
     refs contexts             the courses and projects the app has recognised
     refs dupes                files stored in more than one place
     refs open blp             open the best match in the default PDF viewer
@@ -107,6 +108,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
             print(f"  ... and {len(items) - len(shown):,} more (use -v to list all)")
     if not report.changes and not report.online_only:
         print("Nothing changed.")
+    if report.embedded:
+        print(f"Semantic search: embedded {_plural(report.embedded, 'new or changed text')}.")
+    if report.embed_error:
+        print(f"Semantic search not updated ({report.embed_error}); keyword search is unaffected.",
+              file=sys.stderr)
     return 0
 
 
@@ -167,15 +173,24 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_find(args: argparse.Namespace) -> int:
+    from . import ask
+
     cfg = config.load()
     conn = index.connect(cfg)
-    terms, filters = _split_query(args.query)
+    words, forced = ask.strip_force(args.query)
+    terms, filters = _split_query(words)
+    # Haiku is asked automatically only for a person at the terminal: --json
+    # (scripts, coding agents) and --local never ask unless the query starts
+    # with "?", and `refs ask` always does.
+    mode = ("force" if forced or getattr(args, "force", False)
+            else "off" if args.json or args.local else "auto")
     try:
-        results = index.search(conn, terms, filters, limit=None if args.all else args.limit)
+        outcome = ask.search(cfg, conn, terms, filters, mode=mode)
     except ValueError as error:
         print(f"refs: {error}. Filters: course, project, term, area, in, topic, "
               "section, kind, year, author, status, tag.", file=sys.stderr)
         return 2
+    results = outcome.results if args.all else outcome.results[:args.limit]
 
     if args.json:
         # Absolute paths included so a script can open the file directly.
@@ -183,21 +198,33 @@ def cmd_find(args: argparse.Namespace) -> int:
             for loc in item["locations"]:
                 loc["absolute_path"] = str(cfg.absolute(loc["path"]))
         print(json.dumps(results, indent=2, ensure_ascii=False))
+        if outcome.message:
+            print(f"refs: {outcome.message}", file=sys.stderr)
         return 0
 
     if not results:
-        print("No matches.")
+        print(f"No matches{f' ({outcome.message})' if outcome.message else ''}.")
         return 1
     for item in results:
         label = item["kind"] + (f", {item['status']}" if item["status"] else ", not processed")
         print(f"{_headline(item)}   [{label}]" + (f"  @{item['citekey']}" if item["citekey"] else ""))
+        if item.get("why"):
+            print(f"    ✦ {item['why']}")
         if item["venue"] or item["tags"]:
             print("    " + " · ".join(filter(None, [item["venue"], ", ".join(item["tags"][:6])])))
         for loc in item["locations"]:
             print(f"    {_where(loc)}")
             print(f"      {loc['path']}")
     print(f"\n{_plural(len(results), 'match')}" + ("" if args.all else f" (showing up to {args.limit})"))
+    if outcome.message:
+        print(f"✦ {outcome.message}")
     return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """`refs ask ...` is `refs find ...` that always asks Haiku."""
+    args.force, args.local = True, False
+    return cmd_find(args)
 
 
 def cmd_bib(args: argparse.Namespace) -> int:
@@ -209,7 +236,7 @@ def cmd_bib(args: argparse.Namespace) -> int:
     terms, filters = _split_query(args.query)
     all_works = works.load_all(cfg)
     # Only library works have BibTeX; with search words, keep the best `--limit`.
-    results = [r for r in index.search(conn, terms, filters, limit=None)
+    results = [r for r in index.search(conn, terms, filters, limit=None, semantic=True)
                if r["work_id"] in all_works and "meta" in all_works[r["work_id"]]]
     if terms:
         results = results[:args.limit]
@@ -277,7 +304,7 @@ def _best_match(args: argparse.Namespace) -> tuple[config.Config, dict | None]:
     cfg = config.load()
     conn = index.connect(cfg)
     terms, filters = _split_query(args.query)
-    results = index.search(conn, terms, filters, limit=1)
+    results = index.search(conn, terms, filters, limit=1, semantic=True)
     return cfg, (results[0] if results else None)
 
 
@@ -711,7 +738,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--all", action="store_true", help="no limit")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--local", action="store_true",
+                   help="never ask Haiku (it is asked only when a query reads like a "
+                        "description and the local results look unsure)")
     p.set_defaults(run=cmd_find)
+
+    p = sub.add_parser("ask", help='let Haiku rank the candidates, e.g. `refs ask IO paper on ice cream`')
+    p.add_argument("query", nargs="+", help="a description, plus key:value filters if you like")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--all", action="store_true", help="no limit")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_ask)
 
     p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:bets`")
     p.add_argument("query", nargs="+", help="words and key:value filters, as in `find`")
