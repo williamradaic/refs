@@ -185,6 +185,19 @@ pre.bib {
 .badge { color: var(--dim); }
 .notes { white-space: pre-wrap; color: var(--dim); }
 
+/* The reading note: a plain box that grows with its text (field-sizing), up
+   to most of the pane, then scrolls. */
+textarea.note {
+  display: block; width: 100%; box-sizing: border-box;
+  field-sizing: content; min-height: 5lh; max-height: 60vh; resize: vertical;
+  font: inherit; color: var(--fg); background: none;
+  border: 1px solid var(--line); border-radius: 0; padding: 6px 1ch; outline: 0;
+}
+textarea.note:focus { border-color: var(--accent); }
+textarea.note::placeholder { color: var(--faint); }
+.note-bar { margin-top: 4px; align-items: baseline; }
+.note-bar .badge { overflow-wrap: anywhere; }
+
 /* The edit form: labels in a narrow column, fields as underlined inputs. */
 .edit { margin-top: 8px; padding: 8px 0 4px; border-top: 1px solid var(--line); }
 .edit label { display: grid; grid-template-columns: 9ch 1fr; column-gap: 1ch; align-items: baseline; }

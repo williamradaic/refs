@@ -397,11 +397,11 @@ async function renderDetail() {
   const token = ++detailToken;        // ignore a slow answer for a row we already left
 
   // Full metadata (first names, volume, pages, BibTeX) exists only for works.
-  let work = null, bibtex = "";
+  let work = null, bibtex = "", noteData = null;
   if (item.work_id) {
     const data = await get(`/api/work/${item.work_id}`);
     if (token !== detailToken) return;
-    work = data.work; bibtex = data.bibtex;
+    work = data.work; bibtex = data.bibtex; noteData = data.note;
   }
   const meta = work?.meta ?? {};
   const authors = meta.authors?.length
@@ -440,7 +440,8 @@ async function renderDetail() {
         ? `<button class="act" data-act="revert">undo my edits</button>` : ""}
     </div><div id="editor"></div>`;
   }
-  if (work?.user?.notes) html += `<div class="label">Notes</div><p class="notes">${esc(work.user.notes)}</p>`;
+  if (work && noteData) html += noteHtml(work, noteData);
+  if (work?.user?.notes) html += `<div class="label">From Zotero</div><p class="notes">${esc(work.user.notes)}</p>`;
 
   // A work with several PDFs keeps the description of its best one.
   const about = work?.description ?? item.description;
@@ -483,7 +484,97 @@ async function renderDetail() {
   $("detail").innerHTML = html;
   $("detail").dataset.bibtex = bibtex;
   currentWork = work;
+  if (work && noteData) {
+    noteSaved[work.id] = { version: noteData.version, body: noteData.body };
+    noteConflict.delete(work.id);    // freshly read: saves can go ahead again
+  }
 }
+
+// --- reading notes --------------------------------------------------------------------
+// The note is a Markdown file in the Obsidian vault (notes.py), so it is also
+// there in Obsidian and on the phone. The box saves a moment after you stop
+// typing, when you leave it, and on ⌘S. Every save names the version of the
+// file it started from; if the file changed in Obsidian meanwhile, the server
+// refuses and the box keeps your text until you choose what to do.
+
+const noteSaved = {};               // work id → { version, body } last read or written
+const noteConflict = new Set();     // work ids whose last save was refused (changed in Obsidian)
+let noteQueue = Promise.resolve();  // one save at a time, so versions follow in order
+let noteTimer = null;
+
+function noteHtml(work, data) {
+  if (!data.available) {
+    return `<div class="label">Notes</div><p class="where">No Obsidian vault found. Set
+      <code>obsidian_vault</code> in ~/.config/refs/config.toml.</p>`;
+  }
+  return `<div class="label">Notes</div>
+    <textarea id="note" class="note" data-work="${esc(work.id)}" spellcheck="true"
+      placeholder="Notes on this paper (Markdown). Saved to Obsidian as ${esc(data.file)}">${esc(data.body)}</textarea>
+    <div class="acts note-bar">
+      <a class="act" href="${esc(data.uri)}">open in obsidian</a>
+      <span id="notestate" class="badge">${data.exists ? esc(data.file) : ""}</span>
+    </div>`;
+}
+
+function noteState(text) { const el = $("notestate"); if (el) el.innerHTML = text; }
+
+function saveNote() {
+  const box = $("note");
+  clearTimeout(noteTimer);
+  if (!box) return noteQueue;
+  // Read the text now: by the time the save runs, the box may show another paper.
+  const workId = box.dataset.work, body = box.value;
+  noteQueue = noteQueue.then(() => sendNote(workId, body)).catch(() => {});
+  return noteQueue;
+}
+
+async function sendNote(workId, body) {
+  const saved = noteSaved[workId];
+  // After a refusal, retrying cannot succeed: leave the message (and its
+  // button) in place until the note is read again.
+  if (!saved || saved.body === body || noteConflict.has(workId)) return;
+  const here = () => $("note")?.dataset.work === workId;
+  if (here()) noteState("saving …");
+  const response = await fetch(`/api/work/${workId}/note`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Refs": "1" },
+    body: JSON.stringify({ body, version: saved.version }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    if (response.status === 409) {
+      noteConflict.add(workId);
+      if (here()) noteState(`changed in Obsidian, not saved. <button class="act" data-act="note-reload">discard mine, load Obsidian's</button>`);
+    } else say(data.detail ?? "the note was not saved", 8000);
+    return;
+  }
+  noteSaved[workId] = { version: data.note.version, body };
+  if (here()) noteState(`saved · ${esc(data.note.file)}`);
+}
+
+// Save while typing (after a pause), and when leaving the box.
+$("detail").addEventListener("input", (event) => {
+  if (event.target.id !== "note" || noteConflict.has(event.target.dataset.work)) return;
+  noteState("editing");
+  clearTimeout(noteTimer);
+  noteTimer = setTimeout(saveNote, 1200);
+});
+$("detail").addEventListener("focusout", (event) => { if (event.target.id === "note") saveNote(); });
+
+// Coming back from Obsidian: show what was written there, unless the box has
+// unsaved text of its own.
+window.addEventListener("focus", async () => {
+  const box = $("note");
+  if (!box || document.activeElement === box) return;
+  const workId = box.dataset.work;
+  if (box.value !== noteSaved[workId]?.body) return;
+  const data = await get(`/api/work/${workId}`);
+  if ($("note") !== box || box.value !== noteSaved[workId]?.body) return;
+  if (data.note.version !== noteSaved[workId].version) {
+    box.value = data.note.body;
+    noteSaved[workId] = { version: data.note.version, body: data.note.body };
+    noteState(`updated from Obsidian · ${esc(data.note.file)}`);
+  }
+});
 
 let currentWork = null;
 
@@ -557,6 +648,7 @@ $("detail").addEventListener("click", (event) => {
   else if (el.dataset.folder) fileTo(el.closest(".picker").dataset.for, el.dataset.folder);
   else if (el.dataset.act === "edit") showEditor();
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
+  else if (el.dataset.act === "note-reload") renderDetail();
   else if (el.dataset.act === "confirm") changeWork("confirm", {}, "accepted as is");
   else if (el.dataset.act === "revert") changeWork("edit", { fields: {} }, "back to the automatic record");
   else if (el.dataset.act === "fetch-doi") {
@@ -892,6 +984,7 @@ const HELP = `keys
   y                    copy citekey
   b                    copy BibTeX
   r                    toggle read / unread
+  n                    write a note (saved to Obsidian; esc leaves the box)
   a                    add a paper (URL, DOI, arXiv id, NBER number)
   m                    show course material too
   R                    rescan Dropbox
@@ -911,6 +1004,13 @@ search filters
 
 document.addEventListener("keydown", async (event) => {
   if ($("help").open) { $("help").close(); return; }
+  if (event.target.id === "note") {
+    if (event.key === "Escape") event.target.blur();          // blurring saves
+    else if ((event.metaKey || event.ctrlKey) && (event.key === "s" || event.key === "Enter")) {
+      event.preventDefault(); saveNote();
+    }
+    return;
+  }
   if (event.target.matches?.("input, textarea, select")) {
     if (event.key === "Escape" && event.target !== $("q")) {
       $("editor") && ($("editor").innerHTML = "");
@@ -933,6 +1033,7 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "y") act("citekey");
   else if (key === "b") act("bibtex");
   else if (key === "r") act("read");
+  else if (key === "n" && $("note")) { event.preventDefault(); $("note").focus(); }
   else if (key === "m") {
     state.scope = state.scope === "all" ? "library" : "all";
     say(state.scope === "all" ? "showing course material too" : "papers only");

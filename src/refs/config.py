@@ -65,6 +65,11 @@ DEFAULTS: dict = {
     # Optional. Crossref and OpenAlex allow more requests per second to clients
     # that identify themselves with an email. Empty = send none.
     "contact_email": "",
+    # Reading notes (notes.py): one Markdown file per paper, named by citekey,
+    # in this folder of this Obsidian vault. The vault is a path on this Mac
+    # ("~/..."), not in Dropbox; the folder is relative to the vault.
+    "obsidian_vault": "~/wr-vault",
+    "obsidian_folder": "phd/refs",
 }
 
 
@@ -87,6 +92,8 @@ class Config:
     no_rename: list[str] = field(default_factory=list)
     auto_process: str = "all"
     bib_files: list[str] = field(default_factory=list)
+    obsidian_vault: Path = Path.home() / "wr-vault"
+    obsidian_folder: str = "phd/refs"
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -160,6 +167,8 @@ def load() -> Config:
         no_llm=list(settings["no_llm"]),
         no_rename=list(settings["no_rename"]),
         bib_files=list(settings["bib_files"]),
+        obsidian_vault=Path(settings["obsidian_vault"]).expanduser(),
+        obsidian_folder=str(settings["obsidian_folder"]).strip("/"),
         auto_process=_choice(settings["auto_process"], "auto_process", {"all", "dump", "none"}),
     )
 

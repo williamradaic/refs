@@ -53,6 +53,19 @@ Review, in the sidebar:
 | renames | every file not named `surname-year-short-title.pdf`, grouped by folder; tick files (or a folder) and rename them; undo is offered right after. Protected folders (canvas-sync, overleaf, Git repositories) never appear |
 | copies | the same PDF in several places: move a copy to the macOS Trash (never the last one), or "keep all" to say the copies are on purpose (remembered in `review.json`) |
 
+**Notes** (`n`, or click the box in the right panel): your reading notes on a
+paper. Each note is a Markdown file in the Obsidian vault,
+`~/wr-vault/phd/refs/<citekey>.md`, so it is in Obsidian (and on the phone)
+too, and `[[citekey]]` links to it from any other note. refs writes the
+properties (title, authors, year, doi, citekey, an author-year alias) when it
+creates the file and never changes them afterwards; the panel edits only the
+text below. It saves a moment after you stop typing, on `⌘S`, and when you
+leave the box (`esc`). If the file changed in Obsidian since the panel loaded
+it, the save is refused rather than overwriting; the panel says so and offers
+Obsidian's version. Keep the file name: refs finds the note by citekey, so a
+renamed note is a new, empty one to refs. Settings: `obsidian_vault` and
+`obsidian_folder` in `config.toml`.
+
 **File to…** (`F`, or the link under each file) moves a PDF into another folder,
 typically out of `papers-dump` into a course or project. It is the only way refs
 moves a file; the move is journaled, so `refs rename --undo 1` reverses it.
@@ -164,6 +177,7 @@ no usable registry record and end as extracted or needs-review.
 | Code | `~/phd/tools/refs` (this repo) |
 | Index (rebuildable cache) | `~/Library/Application Support/refs/index.db` |
 | Works, one per paper (citekey, your read status and tags) | `Dropbox/phd/tools/refs/works/` |
+| Reading notes, one per paper | `~/wr-vault/phd/refs/<citekey>.md` (Obsidian Sync) |
 | Rename journal | `Dropbox/phd/tools/refs/journal.jsonl` |
 | Read records, one per file | `Dropbox/phd/tools/refs/reads/`, reachable here as `dropbox/reads/` |
 | API key | macOS Keychain, item `refs` |
@@ -196,6 +210,7 @@ Everything outside this repository, so it can be tracked and removed.
 | Index (rebuildable) | `~/Library/Application Support/refs/` | `refs scan` |
 | Registry cache | `~/Library/Caches/refs/` | lookups |
 | Library data (synced) | `Dropbox/phd/tools/refs/`: `reads/`, `works/`, `journal.jsonl`, `review.json` | the pipeline |
+| Reading notes | `~/wr-vault/phd/refs/` | the notes box in the web page |
 | Agent skill | `~/.claude/skills/refs` and `~/.codex/skills/refs`, links to `extras/agent-skill/refs` | by hand (see New Mac) |
 | Optional | a `refs.test` line in `/etc/hosts`; Raycast quicklinks; a Chrome "installed app" | by hand |
 

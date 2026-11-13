@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import bib, config, index, ingest, organize, records, rename, resolve, venues, works
+from .. import bib, config, index, ingest, notes, organize, records, rename, resolve, venues, works
 from .. import scan as scanner
 from ..cli import _split_query
 
@@ -255,7 +255,7 @@ def create_app(watch: bool = False) -> FastAPI:
         found = works.load_all(cfg).get(work_id)
         if found is None or "meta" not in found:
             raise HTTPException(404)
-        return {"work": found, "bibtex": bib.entry(found)}
+        return {"work": found, "bibtex": bib.entry(found), "note": notes.read(cfg, found)}
 
     @app.get("/file")
     def file(path: str) -> FileResponse:
@@ -278,6 +278,22 @@ def create_app(watch: bool = False) -> FastAPI:
         found["user"]["read_status"] = status
         records.write_json(works.works_dir(cfg) / f"{work_id}.json", found)
         return {"read_status": status}
+
+    @app.post("/api/work/{work_id}/note")
+    def save_note(work_id: str, body: str = Body(embed=True), version: str = Body(embed=True),
+                  x_refs: str | None = Header(default=None)) -> dict:
+        """Save your reading note (a Markdown file in the Obsidian vault).
+        409 if the file changed since the page loaded it (edited in Obsidian)."""
+        guard(x_refs)
+        found = works.load_all(cfg).get(work_id)
+        if found is None:
+            raise HTTPException(404)
+        try:
+            return {"note": notes.write(cfg, found, body, version)}
+        except notes.Conflict:
+            raise HTTPException(409, "the note changed in Obsidian since this page loaded it")
+        except FileNotFoundError as error:
+            raise HTTPException(404, str(error))
 
     def save_work(found: dict) -> dict:
         """Write a work, re-derive its metadata, and refresh the index."""
