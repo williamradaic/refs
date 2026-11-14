@@ -74,14 +74,14 @@ seconds later while refs runs. Settings: `obsidian_vault` and
 `obsidian_folder` in `config.toml`.
 
 **Queue** (`q`, or the button under BibTeX): papers you mean to read next.
-Queued papers carry an accent-coloured ▸ in the list's first column, and
+Queued papers carry an accent-coloured ▸ in the list's first column (it
+takes the place of ◐ or ●), and
 "queue" in the sidebar lists them in the order you queued them. In the add
 bar, shift+Enter adds a paper and queues it. A paper leaves the queue when it
 is read: when you mark it (`r`), or when your markup shows you read it. The
 queue time is stored in the work file (`user.queued`), so it syncs.
 
-**Read status** is unread, reading (◐ in the first column) or read (the row is
-greyed out). You set it with `r`; otherwise refs works it out from your own
+**Read status** is unread, reading (◐ in the first column) or read (●). You set it with `r`; otherwise refs works it out from your own
 markup in the PDF (`src/refs/reading.py`):
 
 | Your highlights, underlines, notes or ink | Status |
@@ -216,16 +216,19 @@ The rule: the model never authors a bibliographic fact.
    is then chosen by year (published article vs working paper vs reprint).
 4. `pipeline.py` assigns a status and saves one record per file hash:
 
-| Status | Meaning |
-|---|---|
-| verified | a registry record agrees with what is printed |
-| extracted | no registry record; metadata is the model's transcription |
-| needs-review | something does not add up |
-| classified | not a library item (slides, problem set, ...) |
-| confidential | in a no-LLM folder (`phd/referee`); printed identifiers only |
-| confirmed | you accepted or corrected the record in the web page; renamed like verified |
-| imported | came from Zotero and has not been read by the pipeline |
-| no-file | a work saved without a PDF (`refs wanted`); the PDF attaches when it arrives |
+| Status | In the list | Meaning |
+|---|---|---|
+| verified | ■ | a registry record agrees with what is printed |
+| extracted | ◧ | no registry record; metadata is the model's transcription |
+| needs-review | ! | something does not add up |
+| classified | · | not a library item (slides, problem set, ...) |
+| confidential | · | in a no-LLM folder (`phd/referee`); printed identifiers only |
+| confirmed | ▣ | you accepted or corrected the record in the web page; renamed like verified |
+| imported | ◆ | came from Zotero and has not been read by the pipeline |
+| no-file | □ | a work saved without a PDF (`refs wanted`); the PDF attaches when it arrives |
+
+Status marks are squares; the circles in the column before them are your
+reading (◐ started, ● read).
 
 Known gap: many pre-2000 articles (old *AER* issues on JSTOR, for instance) have
 no usable registry record and end as extracted or needs-review.

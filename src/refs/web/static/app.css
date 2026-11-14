@@ -145,7 +145,6 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
 .row .au { color: var(--fg); }
 .row .yr { color: var(--dim); }
 .row .ve, .row .ab { color: var(--dim); }
-.row.read .au, .row.read .ti { color: var(--dim); }
 .topic {
   display: flex; gap: 1ch; align-items: center;
   padding: 10px 2ch 2px 1ch; color: var(--accent); font-size: 12px;
@@ -160,9 +159,10 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
 .st.needs-review, .st.no-file { color: var(--bad); }
 .st.classified { color: var(--faint); }
 
-/* Reading column: ▸ queued (the accent), ◐ started (dim). */
+/* Reading column: ▸ queued (the accent), ◐ started (dim), ● read (full text colour). */
 .rd { text-align: center; color: var(--dim); }
 .rd.q { color: var(--accent); }
+.rd.done { color: var(--fg); }
 
 /* --- detail ------------------------------------------------------------------------ */
 #detail h1 { font-size: 15px; line-height: 1.45; font-weight: 700; margin: 4px 0 6px; text-wrap: balance; }

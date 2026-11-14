@@ -17,8 +17,10 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const esc = (text) => String(text ?? "").replace(/[&<>"]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const GLYPH = { verified: "●", confirmed: "✓", imported: "◆", extracted: "◐",
-  "needs-review": "!", "no-file": "○", classified: "·" };
+// Record status: squares (filled = confirmed by a registry, framed = by you,
+// half = transcribed only, empty = no PDF). Circles belong to your reading.
+const GLYPH = { verified: "■", confirmed: "▣", imported: "◆", extracted: "◧",
+  "needs-review": "!", "no-file": "□", classified: "·" };
 
 // --- columns ---------------------------------------------------------------------
 // Each column knows its header label, default width (in characters; null = takes
@@ -26,14 +28,17 @@ const GLYPH = { verified: "●", confirmed: "✓", imported: "◆", extracted: "
 const last = "￿";      // sorts after every real string: empty values go to the end
 const READ_RANK = { read: 1, reading: 2, unread: 3 };
 const COLUMNS = {
-  // Your reading: ▸ on the queue, ◐ started (marked "reading", by you or from
-  // your markup). Read papers are greyed out instead of marked.
+  // Your reading: ▸ on the queue, ◐ started, ● read (set by you or detected
+  // from your markup). Circles, so they never look like the status column's
+  // squares. The queue mark wins: a paper queued to re-read shows ▸.
   rd:      { label: "",        width: 1,  fixed: true, align: "center",
              sort: (i) => (i.queued ? "0" + i.queued : READ_RANK[i.read_status] ?? 9),
              cell: (i) => {
-               const started = i.read_status === "reading";
-               if (i.queued) return `<span class="rd q" title="queued${started ? ", started" : ""}">▸</span>`;
-               if (started) return `<span class="rd" title="started${i.read_source === "detected" ? " (from your markup)" : ""}">◐</span>`;
+               const status = i.read_status;
+               const how = i.read_source === "detected" ? " (from your markup)" : "";
+               if (i.queued) return `<span class="rd q" title="queued${status !== "unread" ? `, ${status}` : ""}">▸</span>`;
+               if (status === "reading") return `<span class="rd" title="started${how}">◐</span>`;
+               if (status === "read") return `<span class="rd done" title="read${how}">●</span>`;
                return `<span class="rd"></span>`; } },
   st:      { label: "",        width: 1,  fixed: true, align: "center", sort: (i) => i.status ?? last,
              cell: (i) => { const st = i.status ?? "classified";
@@ -281,7 +286,7 @@ function renderList() {
       const number = loc.topic_order != null ? String(loc.topic_order).padStart(2, "0") + " " : "";
       html += `<div class="topic">${esc(number + (loc.topic ?? loc.section ?? "unfiled"))}</div>`;
     }
-    const cls = ["row", i === state.selected ? "sel" : "", item.read_status === "read" ? "read" : ""].join(" ");
+    const cls = ["row", i === state.selected ? "sel" : ""].join(" ");
     html += `<div class="${cls}" data-i="${i}">` + visibleColumns().map((id) => {
       const column = COLUMNS[id];
       return column.cell ? column.cell(item)
@@ -1065,8 +1070,8 @@ search filters
 reading
 
   your highlights and notes in a PDF count: marks on 30% of its pages (at
-  least 5) make it read, marks on 2 or more pages make it started (◐). What
-  you set with r always wins.`;
+  least 5) make it read (●), marks on 2 or more pages make it started (◐).
+  What you set with r always wins. ▸ = on the queue.`;
 
 document.addEventListener("keydown", async (event) => {
   if ($("help").open) { $("help").close(); return; }
