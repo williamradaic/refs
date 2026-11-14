@@ -108,7 +108,7 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
 .row, .head {
   display: grid;
   grid-template-columns: var(--cols);        /* set from the saved column layout */
-  gap: 1ch; padding: 1px 2ch;
+  gap: 1ch; padding: 1px 2ch 1px 1ch;     /* 1ch on the left: the glyph columns come first */
   border-left: 2px solid transparent;
 }
 /* Column headers: stay at the top while the list scrolls.
@@ -148,10 +148,10 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
 .row.read .au, .row.read .ti { color: var(--dim); }
 .topic {
   display: flex; gap: 1ch; align-items: center;
-  padding: 10px 2ch 2px; color: var(--accent); font-size: 12px;
+  padding: 10px 2ch 2px 1ch; color: var(--accent); font-size: 12px;
 }
 .topic::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
-.empty { padding: 3em 2ch; color: var(--dim); }
+.empty { padding: 3em 2ch 3em 1ch; color: var(--dim); }
 
 /* Status glyphs. Shape carries the meaning as well as colour. */
 .st { text-align: center; }
@@ -159,6 +159,10 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
 .st.extracted { color: var(--warn); }
 .st.needs-review, .st.no-file { color: var(--bad); }
 .st.classified { color: var(--faint); }
+
+/* Reading column: ▸ queued (the accent), ◐ started (dim). */
+.rd { text-align: center; color: var(--dim); }
+.rd.q { color: var(--accent); }
 
 /* --- detail ------------------------------------------------------------------------ */
 #detail h1 { font-size: 15px; line-height: 1.45; font-weight: 700; margin: 4px 0 6px; text-wrap: balance; }

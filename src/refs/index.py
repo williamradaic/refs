@@ -18,7 +18,7 @@ import re
 import sqlite3
 from pathlib import PurePosixPath
 
-from . import contexts, embed, naming, notes, query, records, works
+from . import contexts, embed, naming, notes, query, reading, records, works
 from .config import Config
 
 # Bump when the tables change. An older index is simply dropped and rebuilt.
@@ -44,7 +44,12 @@ CREATE TABLE IF NOT EXISTS files (
     venue       TEXT,
     doi         TEXT,
     description TEXT,
-    tags        TEXT                -- JSON list
+    tags        TEXT,               -- JSON list
+    pages       INTEGER,            -- your markup (reading.py): page count, pages that
+    marked_pages INTEGER,           --   carry your marks, and the marks; NULL = not
+    marks       INTEGER,            --   counted yet. Counted once per content.
+    read_status TEXT,               -- the work's read status and queue time, copied
+    queued      TEXT                --   from its work file for the read:/queued: filters
 );
 
 CREATE TABLE IF NOT EXISTS paths (
@@ -107,6 +112,12 @@ def connect(cfg: Config) -> sqlite3.Connection:
         conn.execute("DROP TABLE search")
 
     conn.executescript(SCHEMA)
+    # Columns added since schema 3 are added in place, for the same reason:
+    # `files` holds every hash, and rebuilding it would mean hashing every PDF.
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(files)")}
+    for column, kind in ADDED_COLUMNS:
+        if column not in have:
+            conn.execute(f"ALTER TABLE files ADD COLUMN {column} {kind}")
     embed.ensure_schema(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
@@ -115,6 +126,73 @@ def connect(cfg: Config) -> sqlite3.Connection:
         refresh_derived(cfg, conn)
     conn.commit()
     return conn
+
+
+# Columns of `files` newer than the table itself (added by connect()).
+ADDED_COLUMNS = [("pages", "INTEGER"), ("marked_pages", "INTEGER"), ("marks", "INTEGER"),
+                 ("read_status", "TEXT"), ("queued", "TEXT")]
+
+
+def count_marks(cfg: Config, conn: sqlite3.Connection, local_paths: dict[str, str]) -> int:
+    """Count your markup in every file not counted yet (reading.py).
+
+    `local_paths` maps a Dropbox-relative path to its hash, for files that are
+    on this Mac (counting an online-only file would force a download). A file
+    is counted once: annotating it changes its content, so it comes back as a
+    new hash. Returns how many files were counted.
+    """
+    todo = {h for (h,) in conn.execute("SELECT hash FROM files WHERE marked_pages IS NULL")}
+    authors = {name.strip().lower() for name in cfg.annotation_authors}
+    counted = 0
+    for rel, file_hash in local_paths.items():
+        if file_hash not in todo:
+            continue
+        todo.discard(file_hash)                  # one path per content is enough
+        pages, marked, marks = reading.count_marks(cfg.absolute(rel), authors)
+        conn.execute("UPDATE files SET pages=?, marked_pages=?, marks=? WHERE hash=?",
+                     (pages, marked, marks, file_hash))
+        counted += 1
+    return counted
+
+
+def _ancestors(file_hash: str, supersedes: dict[str, str | None]) -> list[str]:
+    """This content and the versions it replaced, newest first. Annotating a
+    PDF in several sittings makes a chain: each save supersedes the last."""
+    chain, seen = [file_hash], {file_hash}
+    while (older := supersedes.get(chain[-1])) and older not in seen:
+        chain.append(older)
+        seen.add(older)
+    return chain
+
+
+def _detect_reading(cfg: Config, conn: sqlite3.Connection, all_works: dict) -> list[dict]:
+    """Update each work's detected read status from its files' markup, and copy
+    read status and queue time into `files` for the filters. Returns the works
+    that just became read by detection and so left the queue."""
+    best: dict[str, tuple[int, int, int]] = {}
+    for row in conn.execute(
+            "SELECT work_id, pages, marked_pages, marks FROM files WHERE work_id IS NOT NULL "
+            "AND marked_pages IS NOT NULL AND hash IN (SELECT hash FROM paths)"):
+        evidence = (row["pages"], row["marked_pages"], row["marks"])
+        current = best.get(row["work_id"])
+        rank = lambda e: (reading.RANK.get(reading.detect(e[0], e[1]), -1), e[1])  # noqa: E731
+        if current is None or rank(evidence) > rank(current):
+            best[row["work_id"]] = evidence
+
+    finished = []
+    for work_id, work in all_works.items():
+        if work_id not in best:
+            continue
+        before = json.dumps(work, sort_keys=True)
+        if reading.apply_detection(work, best[work_id]):
+            finished.append(work)
+        if json.dumps(work, sort_keys=True) != before:     # write only what changed
+            records.write_json(works.works_dir(cfg) / f"{work_id}.json", work)
+
+    for work_id, work in all_works.items():
+        conn.execute("UPDATE files SET read_status=?, queued=? WHERE work_id=?",
+                     (reading.effective(work)[0], work["user"].get("queued"), work_id))
+    return finished
 
 
 # --- Provisional document kind ------------------------------------------------
@@ -165,12 +243,13 @@ def guess_kind(rel: str, ctx: contexts.Context, guess: naming.NameGuess) -> str:
 _STYLE_RANK = {"convention": 0, "jstor": 1, "loose": 2, "id": 3, "none": 4}
 
 
-def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
+def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
     """Recompute everything that follows from paths alone.
 
     Run after every scan. Contexts, name guesses, provisional kinds and the
     search index are all functions of the current paths, so they are rebuilt
     wholesale. With a few thousand files this takes well under a second.
+    Returns the works that left the queue because they were detected as read.
     """
     by_hash: dict[str, list[tuple[str, contexts.Context]]] = {}
 
@@ -210,27 +289,26 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
         tags: list[str] = []
 
         # An edited file (annotated, say) has a new hash but is the same document:
-        # fall back to the read record of the version it replaced.
-        read = records.load_read(cfg, file_hash)
-        if read is None and supersedes.get(file_hash):
-            read = records.load_read(cfg, supersedes[file_hash])
+        # fall back to the read record of the versions it replaced.
+        versions = _ancestors(file_hash, supersedes)
+        read = next((r for h in versions if (r := records.load_read(cfg, h)) is not None), None)
         if read is not None:
             status = read["status"]
             if registry := read.get("registry"):       # confidential files: ids only
                 ids.update({"doi": registry["record"]["doi"]} if registry["record"].get("doi") else {})
-            if reading := read.get("reading"):
+            if printed := read.get("reading"):
                 meta = records.final_metadata(read)
                 title = meta["title"] or title
                 authors = meta["surnames"] or authors
                 year = meta["year"] or year
                 venue, doi = meta["venue"], meta["doi"]
-                kind, kind_source = reading["kind"], "read"
-                description = reading.get("description")
-                tags = [*reading.get("fields", []), *reading.get("methods", []), *reading.get("topics", [])]
+                kind, kind_source = printed["kind"], "read"
+                description = printed.get("description")
+                tags = [*printed.get("fields", []), *printed.get("methods", []), *printed.get("topics", [])]
 
         # A file that belongs to a work shows the work's metadata: a working
         # paper filed under its published version is listed as that publication.
-        work_id = file_to_work.get(file_hash) or file_to_work.get(supersedes.get(file_hash) or "")
+        work_id = next((file_to_work[h] for h in versions if h in file_to_work), None)
         citekey = None
         former_names: list[str] = []
         if work_id and "meta" in all_works.get(work_id, {}):
@@ -274,7 +352,10 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
             ),
         )
 
-    # 4. Works with no PDF on disk (quick-added without a file, or imported from
+    # 4. Read status: detected from your markup, laid under what you set.
+    finished = _detect_reading(cfg, conn, all_works)
+
+    # 5. Works with no PDF on disk (quick-added without a file, or imported from
     #    Zotero) get a stand-in row, so they can be found like any other.
     conn.execute("DELETE FROM files WHERE hash LIKE 'work:%'")
     with_files = {file_to_work[h] for h in by_hash if h in file_to_work}
@@ -287,12 +368,12 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
                                    *user.get("collections", [])]))
         conn.execute(
             "INSERT INTO files (hash, size, first_seen, work_id, citekey, kind, kind_source, "
-            "g_title, g_authors, g_year, g_ids, status, venue, doi, description, tags) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "g_title, g_authors, g_year, g_ids, status, venue, doi, description, tags, "
+            "read_status, queued) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (f"work:{work_id}", 0, work["created"], work_id, work["citekey"], meta.get("kind"),
              "work", meta.get("title"), json.dumps(authors, ensure_ascii=False), meta.get("year"),
              "{}", "no-file", meta.get("venue"), meta.get("doi"), work.get("description"),
-             json.dumps(tags, ensure_ascii=False)),
+             json.dumps(tags, ensure_ascii=False), reading.effective(work)[0], user.get("queued")),
         )
         initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
         conn.execute(
@@ -304,6 +385,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
              "", "", meta.get("venue") or "", " ".join(tags), work.get("description") or "",
              note_text.get(work["citekey"], "")),
         )
+    return finished
 
 
 # --- Queries --------------------------------------------------------------------
@@ -311,7 +393,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> None:
 # `key:value` filters accepted by search(), mapped to what they compare against.
 FILTER_ALIASES = {"course": "slug", "project": "slug", "in": "context"}
 PATH_FILTERS = {"slug", "term", "area", "context", "topic", "section"}
-FILE_FILTERS = {"kind", "year", "author", "status", "tag"}
+FILE_FILTERS = {"kind", "year", "author", "status", "tag", "read", "queued"}
 
 
 def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
@@ -331,6 +413,8 @@ def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
         "doi": row["doi"],
         "description": row["description"],
         "tags": json.loads(row["tags"] or "[]"),
+        "read_status": row["read_status"],
+        "queued": row["queued"],
         "locations": [
             {
                 "path": loc["path"], "context": loc["context"], "area": loc["area"],
@@ -464,6 +548,10 @@ def search(
             if key == "status" and (row["status"] or "unprocessed") != wanted:
                 return False
             if key == "tag" and wanted.replace("-", " ") not in (row["tags"] or "").lower():
+                return False
+            if key == "read" and (row["read_status"] or "") != wanted:
+                return False
+            if key == "queued" and bool(row["queued"]) != (wanted in {"yes", "true", "1"}):
                 return False
             if key in PATH_FILTERS:
                 def hit(loc: sqlite3.Row) -> bool:

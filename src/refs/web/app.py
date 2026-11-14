@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import bib, config, index, ingest, notes, organize, records, rename, resolve, venues, works
+from .. import bib, config, index, ingest, notes, organize, reading, records, rename, resolve, venues, works
 from .. import ask as asking
 from .. import scan as scanner
 from ..cli import _split_query
@@ -83,13 +83,14 @@ def create_app(watch: bool = False) -> FastAPI:
     # and the page asks how the job is doing until it finishes.
     jobs: dict[str, dict] = {}
 
-    def start_add(thing: str, label: str) -> dict:
+    def start_add(thing: str, label: str, queue: bool = False) -> dict:
         job_id = secrets.token_hex(4)
         jobs[job_id] = {"state": "running", "label": label, "message": "", "started": time.time()}
 
         def run() -> None:
             try:
-                done = subprocess.run([sys.executable, "-m", "refs.cli", "add", thing],
+                done = subprocess.run([sys.executable, "-m", "refs.cli", "add", thing,
+                                       *(["--queue"] if queue else [])],
                                       capture_output=True, text=True, timeout=1800)
                 jobs[job_id].update(state="done" if done.returncode == 0 else "failed",
                                     message=(done.stdout or done.stderr).strip())
@@ -166,8 +167,15 @@ def create_app(watch: bool = False) -> FastAPI:
             "venue": item["venue"], "kind": item["kind"], "status": item["status"],
             "tags": item["tags"], "description": item["description"],
             "locations": item["locations"],
-            "read_status": (work or {}).get("user", {}).get("read_status"),
+            **read_fields(work),
         }
+
+    def read_fields(work: dict | None) -> dict:
+        """Read status (yours, else detected from your markup) and queue time."""
+        if not work:
+            return {"read_status": None, "read_source": None, "queued": None}
+        status, source = reading.effective(work)
+        return {"read_status": status, "read_source": source, "queued": work["user"].get("queued")}
 
     def stub_item(work: dict) -> dict:
         """A work saved without a PDF, shaped like a search result."""
@@ -180,7 +188,7 @@ def create_app(watch: bool = False) -> FastAPI:
             "authors": [a["family"] for a in meta.get("authors") or [] if a.get("family")],
             "kind": meta.get("kind"), "status": "no-file", "tags": work.get("tags") or [],
             "description": work.get("description"), "locations": [],
-            "read_status": work["user"].get("read_status"),
+            **read_fields(work),
         }
 
     # --- pages -------------------------------------------------------------------
@@ -208,6 +216,7 @@ def create_app(watch: bool = False) -> FastAPI:
         if view == "wanted":
             items = [stub_item(w) for w in all_works.values() if not w["files"]]
             return {"items": items}
+        user = lambda i: (all_works.get(i["work_id"] or "") or {}).get("user", {})  # noqa: E731
         words, forced = asking.strip_force(q.split())
         terms, filters = _split_query(words)
         if view == "review":
@@ -215,9 +224,12 @@ def create_app(watch: bool = False) -> FastAPI:
         if view == "unprocessed":                  # PDFs on disk that were never read
             filters["status"], scope = "unprocessed", "all"
         mode = "off" if ask == "off" else ("force" if forced else "auto")
-        if view == "unread":                       # Haiku ranks only what this view shows
-            keep = lambda i: bool(i["work_id"]) and (all_works.get(i["work_id"]) or {}).get(  # noqa: E731
-                "user", {}).get("read_status") == "unread"
+        # Haiku ranks only what the view shows.
+        if view in reading.RANK:                   # unread, reading, read
+            keep = lambda i: bool(i["work_id"]) and i["work_id"] in all_works and (  # noqa: E731
+                reading.effective(all_works[i["work_id"]])[0] == view)
+        elif view == "queue":
+            keep = lambda i: bool(user(i).get("queued"))  # noqa: E731
         else:
             keep = lambda i: scope == "all" or bool(i["work_id"])  # noqa: E731
         try:
@@ -225,6 +237,8 @@ def create_app(watch: bool = False) -> FastAPI:
         except ValueError as error:
             return {"items": [], "error": str(error)}
         items = [shape(item, all_works) | {"why": item.get("why")} for item in outcome.results]
+        if view == "queue" and not terms:          # the queue's own order: first queued first
+            items.sort(key=lambda i: i["queued"] or "")
         return {"items": items[:800], "asked": outcome.asked, "message": outcome.message}
 
     @app.get("/api/sidebar")
@@ -244,7 +258,13 @@ def create_app(watch: bool = False) -> FastAPI:
         return {
             "presets": {
                 "all": len(library),
-                "unread": sum(user(i).get("read_status") == "unread" for i in library),
+                # Works by read status (yours, else detected): unread, reading, read.
+                **{status: sum(i["work_id"] in all_works
+                               and reading.effective(all_works[i["work_id"]])[0] == status
+                               for i in library) for status in reading.RANK},
+                # Queued works, with or without a PDF.
+                "queue": sum(bool(w["user"].get("queued")) for w in all_works.values()
+                             if "meta" in w),
                 "review": sum(i["status"] == "needs-review" for i in library),
                 "wanted": sum(not w["files"] for w in all_works.values()),
                 "renames": len(rename.plan(cfg, conn, index.search(conn, [], {}, limit=None),
@@ -281,11 +301,31 @@ def create_app(watch: bool = False) -> FastAPI:
                  x_refs: str | None = Header(default=None)) -> dict:
         guard(x_refs)
         found = works.load_all(cfg).get(work_id)
-        if found is None or status not in {"unread", "reading", "read"}:
+        if found is None or status not in reading.RANK:
             raise HTTPException(400)
-        found["user"]["read_status"] = status
-        records.write_json(works.works_dir(cfg) / f"{work_id}.json", found)
-        return {"read_status": status}
+        reading.set_status(found, status)          # reading it also takes it off the queue
+        return save_reading(found)
+
+    @app.post("/api/work/{work_id}/queue")
+    def set_queue(work_id: str, on: bool = Body(embed=True),
+                  x_refs: str | None = Header(default=None)) -> dict:
+        """Put a work on the reading queue, or take it off."""
+        guard(x_refs)
+        found = works.load_all(cfg).get(work_id)
+        if found is None:
+            raise HTTPException(404)
+        reading.set_queued(found, on)
+        return save_reading(found)
+
+    def save_reading(found: dict) -> dict:
+        """Write a work's read status or queue change, and copy it into the
+        index so `read:` and `queued:` searches see it (no rescan needed)."""
+        records.write_json(works.works_dir(cfg) / f"{found['id']}.json", found)
+        conn = index.connect(cfg)
+        conn.execute("UPDATE files SET read_status=?, queued=? WHERE work_id=?",
+                     (reading.effective(found)[0], found["user"].get("queued"), found["id"]))
+        conn.commit()
+        return read_fields(found)
 
     @app.post("/api/work/{work_id}/note")
     def save_note(work_id: str, body: str = Body(embed=True), version: str = Body(embed=True),
@@ -464,11 +504,13 @@ def create_app(watch: bool = False) -> FastAPI:
         return {"seen": report.seen, "changes": report.changes}
 
     @app.post("/api/add")
-    def add(thing: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
+    def add(thing: str = Body(embed=True), queue: bool = Body(default=False, embed=True),
+            x_refs: str | None = Header(default=None)) -> dict:
         """Quick add. Runs the same code as `refs add`, as a separate process,
-        because it can take a while (download, model, registry)."""
+        because it can take a while (download, model, registry). `queue` also
+        puts the paper on the reading queue."""
         guard(x_refs)
-        return start_add(thing, thing)
+        return start_add(thing, thing, queue)
 
     @app.post("/api/identify")
     def identify(path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:

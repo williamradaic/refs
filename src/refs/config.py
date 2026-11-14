@@ -81,6 +81,15 @@ DEFAULTS: dict = {
     # Dollars per calendar month that asking may spend (about $0.0005 a question).
     # Once reached, searches stay local until the next month.
     "ask_monthly_cap": 1.0,
+    # Annotation authors that mean you (reading.py). Your highlights and notes
+    # in a PDF mark it as being read or read; marks by anyone else (an
+    # instructor's highlights on a course reading) are not counted. Preview
+    # writes your macOS name, the iPad apps the device name; "" counts marks
+    # saved with no author. Compared without regard to case.
+    "annotation_authors": [
+        "William Radaic", "William", "William Radaic Peron",
+        "iPad Pro 11-inch (3rd generation)", "",
+    ],
 }
 
 
@@ -108,6 +117,7 @@ class Config:
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     ask: str = "auto"
     ask_monthly_cap: float = 1.0
+    annotation_authors: list[str] = field(default_factory=list)
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -187,6 +197,7 @@ def load() -> Config:
         embedding_model=str(settings["embedding_model"]),
         ask=_choice(settings["ask"], "ask", {"auto", "never"}),
         ask_monthly_cap=float(settings["ask_monthly_cap"]),
+        annotation_authors=[str(name) for name in settings["annotation_authors"]],
     )
 
 

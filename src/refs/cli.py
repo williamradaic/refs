@@ -188,7 +188,7 @@ def cmd_find(args: argparse.Namespace) -> int:
         outcome = ask.search(cfg, conn, terms, filters, mode=mode)
     except ValueError as error:
         print(f"refs: {error}. Filters: course, project, term, area, in, topic, "
-              "section, kind, year, author, status, tag.", file=sys.stderr)
+              "section, kind, year, author, status, tag, read, queued.", file=sys.stderr)
         return 2
     results = outcome.results if args.all else outcome.results[:args.limit]
 
@@ -207,6 +207,10 @@ def cmd_find(args: argparse.Namespace) -> int:
         return 1
     for item in results:
         label = item["kind"] + (f", {item['status']}" if item["status"] else ", not processed")
+        if item.get("read_status") and item["read_status"] != "unread":
+            label += f", {item['read_status']}"
+        if item.get("queued"):
+            label += ", queued"
         print(f"{_headline(item)}   [{label}]" + (f"  @{item['citekey']}" if item["citekey"] else ""))
         if item.get("why"):
             print(f"    ✦ {item['why']}")
@@ -499,7 +503,10 @@ def cmd_add(args: argparse.Namespace) -> int:
                   "Download the PDF yourself and save it into papers-dump.")
             return 1
         work = works.create_stub(cfg, record.to_dict(), source_url)
-        print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})")
+        if args.queue:
+            _queue(cfg, work)
+        print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})"
+              + ("  [queued]" if args.queue else ""))
         print(f"  @{work['citekey']} . Save the PDF into papers-dump and it will attach itself.")
         return 0
 
@@ -519,10 +526,65 @@ def cmd_add(args: argparse.Namespace) -> int:
         print(f"Saved to {item.rel}, but not read: {item.skipped}.")
         return 1
 
-    print(f"Added {ingest.headline(item)}")
+    if args.queue and item.work:
+        _queue(cfg, item.work)
+    print(f"Added {ingest.headline(item)}" + ("  [queued]" if args.queue and item.work else ""))
     print(f"  {item.rel}" + (f"   @{item.work['citekey']}" if item.work else ""))
     for issue in item.read["issues"]:
         print(f"  ! {issue}")
+    return 0
+
+
+def _queue(cfg, work: dict, on: bool = True) -> None:
+    """Put a work on the reading queue (or take it off), in its file and the index."""
+    from . import reading, records, works
+
+    reading.set_queued(work, on)
+    records.write_json(works.works_dir(cfg) / f"{work['id']}.json", work)
+    conn = index.connect(cfg)
+    conn.execute("UPDATE files SET queued=? WHERE work_id=?", (work["user"].get("queued"), work["id"]))
+    conn.commit()
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """`refs queue`: list the reading queue. `refs queue blp`: queue the best
+    match. `refs queue --remove blp`: take it off."""
+    from . import reading, works
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    all_works = works.load_all(cfg)
+    if args.query:
+        terms, filters = _split_query(args.query)
+        found = [r for r in index.search(conn, terms, filters, limit=None, semantic=True)
+                 if r["work_id"] in all_works and "meta" in all_works[r["work_id"]]]
+        if not found:
+            print("No matching paper.", file=sys.stderr)
+            return 1
+        work = all_works[found[0]["work_id"]]
+        _queue(cfg, work, on=not args.remove)
+        print(("Off the queue: " if args.remove else "Queued: ") + _headline(found[0])
+              + f"  @{work['citekey']}")
+        return 0
+
+    queued = sorted((w for w in all_works.values() if w["user"].get("queued") and "meta" in w),
+                    key=lambda w: w["user"]["queued"])
+    if args.json:
+        print(json.dumps([{"work_id": w["id"], "citekey": w["citekey"], "title": w["meta"].get("title"),
+                           "year": w["meta"].get("year"), "queued": w["user"]["queued"],
+                           "read_status": reading.effective(w)[0]} for w in queued],
+                         indent=2, ensure_ascii=False))
+        return 0
+    if not queued:
+        print("The queue is empty. Add a paper with `refs queue <search>` or `refs add <link> --queue`.")
+        return 0
+    for n, w in enumerate(queued, 1):
+        meta = w["meta"]
+        who = ", ".join(a.get("family", "") for a in (meta.get("authors") or [])[:3])
+        status = reading.effective(w)[0]
+        print(f"{n:>3}. {who} ({meta.get('year') or 'n.d.'}) {meta.get('title') or ''}"
+              f"{f'   [{status}]' if status != 'unread' else ''}   @{w['citekey']}")
+        print(f"     queued {w['user']['queued'][:10]}" + ("" if w["files"] else " · no pdf yet"))
     return 0
 
 
@@ -776,7 +838,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("add", help="quick add: a URL, DOI, arXiv id, NBER number or PDF file")
     p.add_argument("thing")
+    p.add_argument("--queue", action="store_true", help="also put it on the reading queue")
     p.set_defaults(run=cmd_add)
+
+    p = sub.add_parser("queue", help="the reading queue: list it, or `refs queue blp` to queue a paper")
+    p.add_argument("query", nargs="*", help="words and key:value filters; the best match is queued")
+    p.add_argument("--remove", action="store_true", help="take the match off the queue instead")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_queue)
 
     p = sub.add_parser("rename", help="propose canonical file names (add --apply to rename)")
     p.add_argument("query", nargs="*")

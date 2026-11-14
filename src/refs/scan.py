@@ -42,6 +42,8 @@ class ScanReport:
     seconds: float = 0.0
     embedded: int = 0                                     # texts given new vectors
     embed_error: str | None = None                        # why embedding failed, if it did
+    marks_counted: int = 0                                # files whose markup was counted
+    finished: list[str] = field(default_factory=list)     # detected as read: left the queue
 
     @property
     def changes(self) -> int:
@@ -199,8 +201,14 @@ def scan(cfg: Config, conn: sqlite3.Connection,
         _log(conn, now, "removed", p, known[p]["hash"])
         report.removed.append(p)
 
-    # --- Recompute contexts, name guesses, kinds and the search index --------
-    index.refresh_derived(cfg, conn)
+    # --- Your markup in files not counted yet (reading.py) --------------------
+    local = {rel: row["hash"] for row in conn.execute("SELECT path, hash FROM paths")
+             if (rel := row["path"]) in disk and not disk[rel].online_only}
+    report.marks_counted = index.count_marks(cfg, conn, local)
+
+    # --- Recompute contexts, name guesses, kinds, read status and search -----
+    report.finished = [f"{w['citekey']}: {w['meta'].get('title') or ''}"
+                       for w in index.refresh_derived(cfg, conn)]
     conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_scan', ?)", (now,))
     conn.commit()
 

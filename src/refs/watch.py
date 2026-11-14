@@ -231,9 +231,15 @@ class Watcher:
             _log(f"{item.rel if not item.renamed_from else item.renamed_from}: {line}")
             for issue in item.issues:
                 _log(f"    ! {issue}")
-        if report.changes or any(item.read is not None for item in results):
+        for line in report.finished:
+            _log(f"read (from your markup), off the queue: {line}")
+        if report.changes or report.finished or any(item.read is not None for item in results):
             self.generation += 1
             self.last_message = self._message(results) or (f"library updated: {summary}" if summary else "")
+            if report.finished:              # detected as read while queued: say so
+                done = report.finished[0].split(": ", 1)[-1] if len(report.finished) == 1 \
+                    else f"{len(report.finished)} papers"
+                self.last_message = f"read {done}: off the queue"
 
         # Notifications: every paper that came in through the dump, and problems.
         for item in results:

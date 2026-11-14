@@ -3,7 +3,7 @@
 
 const state = {
   query: "",          // what is typed in the search bar
-  view: "all",        // sidebar preset: all | unread | review | wanted | renames | copies
+  view: "all",        // sidebar preset: all | queue | unread | reading | read | review | wanted | renames | copies
   context: null,      // selected course or project key, e.g. "coursework/2026-fall/220a"
   tag: null,          // selected field tag
   scope: "library",   // "library" = papers only, "all" = course material too
@@ -24,8 +24,18 @@ const GLYPH = { verified: "●", confirmed: "✓", imported: "◆", extracted: "
 // Each column knows its header label, default width (in characters; null = takes
 // the remaining space), how to sort, and what to show.
 const last = "￿";      // sorts after every real string: empty values go to the end
+const READ_RANK = { read: 1, reading: 2, unread: 3 };
 const COLUMNS = {
-  st:      { label: "",        width: 2,  align: "center", sort: (i) => i.status ?? last,
+  // Your reading: ▸ on the queue, ◐ started (marked "reading", by you or from
+  // your markup). Read papers are greyed out instead of marked.
+  rd:      { label: "",        width: 1,  fixed: true, align: "center",
+             sort: (i) => (i.queued ? "0" + i.queued : READ_RANK[i.read_status] ?? 9),
+             cell: (i) => {
+               const started = i.read_status === "reading";
+               if (i.queued) return `<span class="rd q" title="queued${started ? ", started" : ""}">▸</span>`;
+               if (started) return `<span class="rd" title="started${i.read_source === "detected" ? " (from your markup)" : ""}">◐</span>`;
+               return `<span class="rd"></span>`; } },
+  st:      { label: "",        width: 1,  fixed: true, align: "center", sort: (i) => i.status ?? last,
              cell: (i) => { const st = i.status ?? "classified";
                return `<span class="st ${st}" title="${st}">${GLYPH[st] ?? "·"}</span>`; } },
   authors: { label: "authors", width: 20, cls: "au", sort: (i) => (i.authors?.[0] ?? last).toLowerCase(),
@@ -43,8 +53,8 @@ const COLUMNS = {
   modified: { label: "modified", width: 10, cls: "da", sort: (i) => i.modified ?? "",
              text: (i) => i.modified ?? "" },
 };
-COLUMNS.st.name = "status"; COLUMNS.abbr.name = "journal abbreviation";
-const DEFAULT_LAYOUT = { order: ["st", "authors", "year", "title", "abbr", "venue", "added", "modified"],
+COLUMNS.st.name = "status"; COLUMNS.abbr.name = "journal abbreviation"; COLUMNS.rd.name = "queue / reading";
+const DEFAULT_LAYOUT = { order: ["rd", "st", "authors", "year", "title", "abbr", "venue", "added", "modified"],
   hidden: [], widths: {}, sort: null, side: null, detail: null };
 
 // Column order, widths, sort and pane sizes are remembered in this browser.
@@ -52,10 +62,15 @@ function loadLayout() {
   try {
     const saved = JSON.parse(localStorage.getItem("refs-layout"));
     if (saved?.order) {
-      // Keep the saved order, drop columns that no longer exist, and append
-      // any column added to the app since the layout was saved.
+      // Keep the saved order, drop columns that no longer exist, and put any
+      // column added to the app since the layout was saved where it goes by
+      // default: right after the column it follows there (or first).
       const order = saved.order.filter((id) => id in COLUMNS);
-      for (const id of DEFAULT_LAYOUT.order) if (!order.includes(id)) order.push(id);
+      DEFAULT_LAYOUT.order.forEach((id, at) => {
+        if (order.includes(id)) return;
+        const before = DEFAULT_LAYOUT.order.slice(0, at).reverse().find((x) => order.includes(x));
+        order.splice(before ? order.indexOf(before) + 1 : 0, 0, id);
+      });
       return { ...DEFAULT_LAYOUT, ...saved, order, hidden: saved.hidden ?? [] };
     }
   } catch {}
@@ -67,7 +82,9 @@ function saveLayout() {
 function applyLayout() {
   const root = document.documentElement.style;
   root.setProperty("--cols", visibleColumns().map((id) => COLUMNS[id].width === null
-    ? "minmax(14ch, 1fr)" : `${layout.widths[id] ?? COLUMNS[id].width}ch`).join(" "));
+    ? "minmax(14ch, 1fr)"
+    // A fixed column ignores any width saved for it earlier.
+    : `${COLUMNS[id].fixed ? COLUMNS[id].width : layout.widths[id] ?? COLUMNS[id].width}ch`).join(" "));
   if (layout.side) root.setProperty("--side-w", `${layout.side}px`);
   if (layout.detail) root.setProperty("--detail-w", `${layout.detail}px`);
 }
@@ -103,7 +120,10 @@ async function loadSidebar() {
 
   let html = `<div class="label">Library</div>`;
   html += nav("all papers", data.presets.all, `data-view="all"`);
+  html += nav("queue", data.presets.queue, `data-view="queue"`);
   html += nav("unread", data.presets.unread, `data-view="unread"`);
+  html += nav("reading", data.presets.reading, `data-view="reading"`);
+  html += nav("read", data.presets.read, `data-view="read"`);
   html += nav("no pdf yet", data.presets.wanted, `data-view="wanted"`);
   // Things that want a decision from you.
   html += `<div class="label">Review</div>`;
@@ -232,7 +252,8 @@ function renderHead() {
   return `<div class="head">` + visibleColumns().map((id) => {
     const column = COLUMNS[id];
     const arrow = layout.sort?.col === id ? (layout.sort.dir === "desc" ? "▼" : "▲") : "";
-    const grip = column.width === null ? "" : `<b class="grip" data-col="${id}"></b>`;
+    // No resize handle on the column that takes the rest, nor on one-glyph columns.
+    const grip = column.width === null || column.fixed ? "" : `<b class="grip" data-col="${id}"></b>`;
     // The label sits on the same edge as the column's contents; the sort arrow
     // goes on the inner side, so the label itself stays flush with the data.
     const label = `<span class="hl">${esc(column.label)}</span>`;
@@ -367,7 +388,7 @@ for (const divider of document.querySelectorAll(".split")) {
 window.addEventListener("pointermove", (event) => {
   if (resizing) {
     const delta = (event.clientX - resizing.startX) / charWidth;
-    layout.widths[resizing.id] = Math.max(2, Math.round(resizing.startWidth + delta));
+    layout.widths[resizing.id] = Math.max(1, Math.round(resizing.startWidth + delta));
     applyLayout();
   } else if (splitting) {
     const box = document.querySelector("main").getBoundingClientRect();
@@ -438,7 +459,13 @@ async function renderDetail() {
   }
   if (meta.doi) html += `<dt>doi</dt><dd><a href="https://doi.org/${esc(meta.doi)}" target="_blank" rel="noreferrer">${esc(meta.doi)}</a></dd>`;
   html += `<dt>kind</dt><dd>${esc(item.kind)}</dd>`;
-  if (item.read_status) html += `<dt>read</dt><dd>${esc(item.read_status)}</dd>`;
+  if (item.read_status) {
+    const auto = work?.read_auto;
+    const how = item.read_source === "detected" && auto
+      ? ` <span class="badge">· from your markup on ${auto.pages}/${auto.of} pages</span>` : "";
+    html += `<dt>read</dt><dd>${esc(item.read_status)}${how}</dd>`;
+  }
+  if (item.queued) html += `<dt>queue</dt><dd><span class="rd q">▸</span> since ${esc(item.queued.slice(0, 10))}</dd>`;
   if (item.added) html += `<dt>added</dt><dd>${esc(item.added)}</dd>`;
   if (item.modified) html += `<dt>modified</dt><dd>${esc(item.modified)}</dd>`;
   html += `</dl>`;
@@ -492,6 +519,7 @@ async function renderDetail() {
       <button class="act" data-act="citekey">copy citekey</button>
       <button class="act" data-act="bibtex">copy bibtex</button>
       <button class="act" data-act="read">${item.read_status === "read" ? "mark unread" : "mark read"}</button>
+      <button class="act" data-act="queue">${item.queued ? "off the queue" : "queue"}</button>
     </div>`;
   }
   $("detail").innerHTML = html;
@@ -693,12 +721,23 @@ async function act(name) {
     await navigator.clipboard.writeText($("detail").dataset.bibtex);
     say(`copied bibtex for ${item.citekey}`);
   }
-  if (name === "read" && item.work_id) {
-    const next = item.read_status === "read" ? "unread" : "read";
-    await post(`/api/work/${item.work_id}/read`, { status: next });
-    item.read_status = next;
+  if ((name === "read" || name === "queue") && item.work_id) {
+    const done = name === "read"
+      ? await post(`/api/work/${item.work_id}/read`, { status: item.read_status === "read" ? "unread" : "read" })
+      : await post(`/api/work/${item.work_id}/queue`, { on: !item.queued });
+    if (done.detail) { say(done.detail); return; }
+    const leftQueue = item.queued && !done.queued;
+    Object.assign(item, done);                 // read_status, read_source, queued
+    if (name === "queue") say(done.queued ? `queued ${item.citekey}` : `${item.citekey} off the queue`);
+    else if (leftQueue) say(`read ${item.citekey}: off the queue`);
+    loadSidebar();
+    // In the queue view a paper that left the queue leaves the list.
+    if ((state.view === "queue" && leftQueue)
+        || (["unread", "reading", "read"].includes(state.view) && item.read_status !== state.view)) {
+      search(); return;
+    }
     const keep = state.selected;
-    renderList(); select(keep, false); loadSidebar();
+    renderList(); select(keep, false);
   }
 }
 
@@ -709,7 +748,7 @@ function setAdding(on) {
   $("prompt").textContent = on ? "+" : "/";
   $("q").value = on ? "" : state.query;
   $("q").placeholder = on
-    ? "add a paper: paste a URL, DOI, arXiv id or NBER number, then Enter"
+    ? "add a paper: paste a URL, DOI, arXiv id or NBER number, then Enter (shift+Enter: add and queue)"
     : "search   author:saez   course:220a   tag:theory   year:2019";
   if (on) $("q").focus();
 }
@@ -737,9 +776,10 @@ $("q").addEventListener("keydown", async (event) => {
     }
     const thing = $("q").value.trim();
     if (!thing) return;
+    const queue = event.shiftKey;
     setAdding(false); $("q").blur();
-    say(`adding ${thing} …`, 0);
-    follow(post("/api/add", { thing }), thing);
+    say(`adding ${thing}${queue ? " to the queue" : ""} …`, 0);
+    follow(post("/api/add", { thing, queue }), thing);
   }
   if (event.key === "ArrowDown") { event.preventDefault(); $("q").blur(); }
 });
@@ -1002,8 +1042,9 @@ const HELP = `keys
   y                    copy citekey
   b                    copy BibTeX
   r                    toggle read / unread
+  q                    put on the queue / take off (▸ in the list)
   n                    write a note (saved to Obsidian; esc leaves the box)
-  a                    add a paper (URL, DOI, arXiv id, NBER number)
+  a                    add a paper (URL, DOI, arXiv id, NBER number); shift+Enter also queues it
   m                    show course material too
   R                    rescan Dropbox
   t                    light / dark
@@ -1018,7 +1059,14 @@ bookmarklet            open /bookmarklet and drag "+ refs" to the bookmarks bar
 search filters
 
   author:saez   year:2019   course:220a   project:bets
-  tag:theory    kind:book   status:needs-review   topic:demand`;
+  tag:theory    kind:book   status:needs-review   topic:demand
+  read:read     read:reading   read:unread   queued:yes
+
+reading
+
+  your highlights and notes in a PDF count: marks on 30% of its pages (at
+  least 5) make it read, marks on 2 or more pages make it started (◐). What
+  you set with r always wins.`;
 
 document.addEventListener("keydown", async (event) => {
   if ($("help").open) { $("help").close(); return; }
@@ -1051,6 +1099,7 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "y") act("citekey");
   else if (key === "b") act("bibtex");
   else if (key === "r") act("read");
+  else if (key === "q") act("queue");
   else if (key === "n" && $("note")) { event.preventDefault(); $("note").focus(); }
   else if (key === "m") {
     state.scope = state.scope === "all" ? "library" : "all";

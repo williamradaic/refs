@@ -30,11 +30,14 @@ abbreviations such as `IO`, `PF`, `RDD` match their spelled-out tags. Filters: `
 `220a`, `bets`), `term:` (`2026-fall`), `area:` (`coursework`, `research`,
 `dump`, ...), `in:` (context contains), `topic:`, `kind:` (`paper`, `book`,
 `chapter`, `slides`, `syllabus`, `notes`, `problem-set`, ...), `year:`,
-`author:`, `tag:`, `status:`.
+`author:`, `tag:`, `status:`, `read:` (`read`, `reading`, `unread`),
+`queued:yes`.
 
 Each JSON result has `title`, `authors` (surnames), `year`, `venue`, `doi`,
 `citekey`, `status`, `kind`, `tags`, `description` (a short summary written from
-the paper itself) and `locations` (Dropbox-relative `path`, plus `context`,
+the paper itself), `read_status` (William's own, or detected from his
+highlights in the PDF), `queued` (when he put it on his reading queue, or null)
+and `locations` (Dropbox-relative `path`, plus `context`,
 `topic`). Library works have a `citekey`; course material such as slides has
 none.
 
@@ -99,6 +102,14 @@ reads it with Claude Haiku (about $0.001 a paper) and looks it up in the
 registries; a paywalled paper is saved without a PDF and attaches itself when
 the PDF later lands in papers-dump. Run it when asked to save or add a paper. A PDF saved into papers-dump by any other means is picked up by the
 running refs service on its own, so there is no need to call `add` for it.
+
+## The reading queue
+
+`refs queue` lists the papers William means to read next (`--json` for
+scripts). When he asks to save a paper *to read*, add it with
+`refs add <link> --queue`; `refs queue <search>` queues a paper already in the
+library and `refs queue --remove <search>` takes it off. Papers leave the queue
+by themselves once read.
 
 ## Leave these to William
 

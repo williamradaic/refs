@@ -32,6 +32,9 @@ refs process in:dump --relookup   # redo only the free registry step
 refs eval course:220a          # compare results with convention-style file names
 
 refs add w32515                # quick add: NBER number, arXiv id, DOI, URL or a PDF file
+refs add w32515 --queue        # ... and put it on the reading queue
+refs queue                     # the reading queue, oldest first
+refs queue blp                 # queue the best match (--remove takes it off)
 refs wanted                    # works saved without a PDF yet
 refs bib blp                   # BibTeX for the best match (or `refs bib project:bets`)
 refs bib blp --append overleaf/references.bib   # add it unless the file already has it
@@ -69,6 +72,35 @@ renamed note is a new, empty one to refs. Notes are searched like everything
 else (by word and by meaning); an edit made in Obsidian is picked up a few
 seconds later while refs runs. Settings: `obsidian_vault` and
 `obsidian_folder` in `config.toml`.
+
+**Queue** (`q`, or the button under BibTeX): papers you mean to read next.
+Queued papers carry an accent-coloured ▸ in the list's first column, and
+"queue" in the sidebar lists them in the order you queued them. In the add
+bar, shift+Enter adds a paper and queues it. A paper leaves the queue when it
+is read: when you mark it (`r`), or when your markup shows you read it. The
+queue time is stored in the work file (`user.queued`), so it syncs.
+
+**Read status** is unread, reading (◐ in the first column) or read (the row is
+greyed out). You set it with `r`; otherwise refs works it out from your own
+markup in the PDF (`src/refs/reading.py`):
+
+| Your highlights, underlines, notes or ink | Status |
+|---|---|
+| on at least 30% of the pages, and on at least 5 pages (half the pages of a shorter PDF) | read |
+| on 2 or more pages | reading |
+| on 1 page, or none | no change |
+| any, in a PDF of more than 150 pages (a book) | reading at most |
+
+Pages with marks count, not marks: you may highlight one paragraph in ten
+pieces. Only marks whose author is you count, so an instructor's highlights on
+a course reading do not; the names are `annotation_authors` in `config.py`
+(Preview writes your macOS name, the iPad apps the device name). What you set
+always wins, and detection only ever raises a status. The detail panel says
+where a status came from ("from your markup on 39/57 pages"). Each PDF is read
+for marks once per content (about 4 ms); annotating it changes the content, so
+the next scan counts it again. The detected status is stored in the work file
+(`read_auto`). The sidebar lists unread, reading and read papers. Filters:
+`read:read`, `read:reading`, `read:unread`, `queued:yes`.
 
 **File to…** (`F`, or the link under each file) moves a PDF into another folder,
 typically out of `papers-dump` into a course or project. It is the only way refs
@@ -116,7 +148,8 @@ re-embeds everything (about 30 seconds). The similarity cut-offs in
 
 Filters for `find`: `course:` / `project:` (folder slug), `term:`, `area:`,
 `in:` (context contains), `topic:`, `section:`, `kind:`, `year:`, `author:`,
-`status:` (any status in the table below, or unprocessed), `tag:`.
+`status:` (any status in the table below, or unprocessed), `tag:`,
+`read:` (read, reading, unread), `queued:` (yes, no).
 Add `--json` to `find`, `status`, `contexts`, `dupes` or `scan` for machine-readable
 output; this is how coding agents query the library.
 
@@ -204,7 +237,7 @@ no usable registry record and end as extracted or needs-review.
 | Code | `~/phd/tools/refs` (this repo) |
 | Index (rebuildable cache), incl. search vectors and Haiku answers with their cost | `~/Library/Application Support/refs/index.db` |
 | Embedding model (64 MB, downloaded once) | `~/Library/Caches/refs/fastembed/` |
-| Works, one per paper (citekey, your read status and tags) | `Dropbox/phd/tools/refs/works/` |
+| Works, one per paper (citekey, your read status, queue and tags) | `Dropbox/phd/tools/refs/works/` |
 | Reading notes, one per paper | `~/wr-vault/phd/refs/<citekey>.md` (Obsidian Sync) |
 | Rename journal | `Dropbox/phd/tools/refs/journal.jsonl` |
 | Read records, one per file | `Dropbox/phd/tools/refs/reads/`, reachable here as `dropbox/reads/` |
