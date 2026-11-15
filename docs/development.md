@@ -1,0 +1,121 @@
+# Developing refs
+
+## Setup
+
+```sh
+git clone https://github.com/williamradaic/refs && cd refs
+uv sync                                  # .venv with the dev tools
+uv run pytest                            # the tests (no network, no real library)
+uv tool install --editable . --force     # the `refs` command, running this checkout
+```
+
+The `refs` command runs from its own environment. Code changes reach it
+through the editable install (`refs service restart` to load them into the
+background service); a new dependency in `pyproject.toml` needs the
+`uv tool install` line again first.
+
+The agent skill lives in `src/refs/skill/SKILL.md` (shipped with the package;
+`extras/agent-skill/refs` links to it). For a skill that follows your edits,
+link it instead of copying it, which `refs skill install` then leaves alone:
+
+```sh
+ln -s "$PWD/src/refs/skill" ~/.claude/skills/refs
+ln -s "$PWD/src/refs/skill" ~/.codex/skills/refs
+```
+
+## Trying changes without touching your library
+
+`.claude/launch.json` defines three local servers:
+
+| Entry | Port | What it serves |
+|---|---|---|
+| `refs-dev` | 8378 | your real library and settings, without the folder watcher |
+| `refs-sandbox` | 8379 | a fake, set-up library in `local/sandbox/` (its own settings and index), no watcher |
+| `refs-first-run` | 8380 | an unconfigured library in `local/first-run/`, with the watcher: the first-run screens |
+
+The sandboxes are made by hand (`local/` is ignored by Git): a `Dropbox/`
+folder with a few PDFs, and for `refs-sandbox` a `config.toml`. The servers
+use `REFS_CONFIG`, `REFS_DROPBOX_ROOT` and `REFS_INDEX_DB`, which the tests
+use too; the API key still comes from the Keychain, so avoid reading PDFs
+there unless you mean to pay for it.
+
+## Map of the code
+
+| Module | Job |
+|---|---|
+| `config.py` | settings: generic defaults, `~/.config/refs/config.toml`, environment |
+| `settings.py` | the settings page's back end: checks a change, writes it with tomlkit (comments kept) |
+| `onboarding.py` | first run: library candidates, the folder survey, private-folder and term-rule suggestions |
+| `contexts.py` | folders → course or project (`Layout`: own rules, a preset, a generic rule per watched folder) |
+| `storage.py`, `scan.py` | walk the watched folders, hash, reconcile with the index |
+| `index.py`, `embed.py` | the SQLite index (a rebuildable cache) and semantic search |
+| `extract.py`, `llm.py`, `resolve.py`, `pipeline.py` | reading a PDF: text and identifiers, Claude Haiku's transcription, registry lookup, status |
+| `works.py`, `records.py` | works (one per paper) and read records, the JSON files kept in the library |
+| `ingest.py`, `watch.py` | read new PDFs; follow the folders (FSEvents) |
+| `budget.py` | the reading ledger, the monthly limit, approval of large batches |
+| `reading.py`, `notes.py` | read status from your markup; Obsidian notes |
+| `bib.py`, `bibkeys.py` | BibTeX; keys learned from project `.bib` files |
+| `rename.py`, `organize.py` | tidy names, file to / copy to, copies (journaled, undoable) |
+| `ask.py` | Claude Haiku ranks a shortlist when local search is unsure |
+| `doctor.py`, `agents.py`, `service.py`, `keys.py` | `refs doctor` and `uninstall`, the agent skill, the login service, the Keychain |
+| `web/app.py`, `web/static/` | the local server and JSON API; the page (plain HTML, CSS and JavaScript, no build step) |
+| `cli.py` | the `refs` command |
+
+## How it identifies files
+
+A file is its content (SHA-256 hash), not its path. One scan classifies every PDF:
+
+| Situation | How it is recognised | Reported as |
+|---|---|---|
+| Same path, same size and time | no need to re-read | unchanged |
+| New path, inode of a vanished path | the disk's own file ID survived | moved |
+| New path, known content, old path vanished | hash | moved |
+| New path, known content, old path still there | hash | copy |
+| Same path, new content | hash; new version points to the old | modified |
+
+## How metadata is produced
+
+The rule: the model never authors a bibliographic fact.
+
+1. `extract.py` reads the first three pages and any identifier printed on the
+   first two (DOI, arXiv, NBER, SSRN, JSTOR).
+2. `llm.py` has Claude Haiku transcribe kind, title, authors, year and venue as
+   printed, and write a description and tags. It never sees the file name.
+3. `resolve.py` looks the identifier up, or searches Crossref and OpenAlex for
+   the transcribed title. A candidate is accepted only if the title is at least
+   90% similar and at least half the printed authors appear; the right version
+   is then chosen by year (published article vs working paper vs reprint).
+4. `pipeline.py` assigns a status (README, "The record status") and saves one
+   record per file hash.
+
+Known gap: many pre-2000 articles (old *AER* issues on JSTOR, for instance)
+have no usable registry record and end as extracted or needs-review.
+
+## Where things live
+
+| What | Where |
+|---|---|
+| Settings | `~/.config/refs/config.toml` (`.bak` = the version before the last save) |
+| Index (rebuildable cache), search vectors, Haiku answers, reading ledger | `~/Library/Application Support/refs/index.db` |
+| Search model (about 70 MB, downloaded once), registry cache | `~/Library/Caches/refs/` |
+| Works, read records, rename journal, `review.json` (synced) | `<library>/<state_dir>/`, `.refs/` by default |
+| Reading notes | `<vault>/<obsidian_folder>/<citekey>.md` |
+| API key | macOS Keychain, item `refs` |
+| Login service, log | `~/Library/LaunchAgents/com.williamradaic.refs.plist`, `~/Library/Logs/refs.log` |
+
+The JSON files in the library carry a data version (`"schema"`,
+`records.SCHEMA`). Raise it when their shape changes in a way an older refs
+would get wrong, and teach `records.read_json` to upgrade older files. refs
+never overwrites a file from a newer version (`records.NewerData`), so an old
+copy on a second Mac cannot undo a newer one's data. The index has its own
+`SCHEMA_VERSION` and is simply rebuilt when it changes.
+
+## Calibration
+
+Several numbers were set on the author's library and may want revisiting on
+others: the similarity cut-offs for semantic search and for asking
+(`index.py`, `ask.py`, with the small model), the read-status thresholds
+(`reading.py`), the private-folder name patterns (`onboarding.py`), and the
+field vocabulary given to the model (`llm.py`, economics).
+`scripts/measure_identifiers.py` reports how many papers carry an identifier a
+registry can resolve (about a third, on the first run).

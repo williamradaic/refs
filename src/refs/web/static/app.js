@@ -790,7 +790,7 @@ function setAdding(on) {
   $("q").value = on ? "" : state.query;
   $("q").placeholder = on
     ? "add a paper: paste a URL, DOI, arXiv id or NBER number, then Enter (shift+Enter: add and queue)"
-    : "search   author:saez   course:220a   tag:theory   year:2019";
+    : "search   author:smith   course:101   tag:theory   year:2019";
   if (on) $("q").focus();
 }
 
@@ -928,9 +928,9 @@ async function showRenames(token) {
     <p>Names built from the verified record: <code>surname-year-short-title.pdf</code>.
     Files stay in their folders. Your old names stay searchable.</p>
     <p class="where" style="margin-top:8px">${data.protected} more are in folders refs never renames
-    (canvas-sync, overleaf, Git repositories).</p>
-    <p class="where" style="margin-top:8px">Folders shared with coauthors (e.g. research/bets) are
-    renamed for them too, through Dropbox.</p>`;
+    (folders another tool keeps in sync, set under settings, and Git repositories).</p>
+    <p class="where" style="margin-top:8px">A file in a folder you share with coauthors is
+    renamed for them too, through the shared folder.</p>`;
 }
 
 async function applyRenames() {
@@ -1267,7 +1267,7 @@ async function openPicker(path, mode = "move") {
   // The box takes the keyboard at once, before the folder list has loaded:
   // otherwise quick typing would land on the page's single-key shortcuts.
   const verb = mode === "copy" ? "copy into" : "file into";
-  box.innerHTML = `<input class="pick" placeholder="${verb}: type to find a folder, e.g. 220a readings demand" spellcheck="false" autocomplete="off">
+  box.innerHTML = `<input class="pick" placeholder="${verb}: type to find a folder, e.g. 101 readings demand" spellcheck="false" autocomplete="off">
     <div class="choices"><div class="where">loading folders …</div></div>`;
   const input = box.querySelector("input");
   input.focus();
@@ -1339,7 +1339,7 @@ bookmarklet            open /bookmarklet and drag "+ refs" to the bookmarks bar
 
 search filters
 
-  author:saez   year:2019   course:220a   project:bets
+  author:smith   year:2019   course:101   project:thesis
   tag:theory    kind:book   status:needs-review   topic:demand
   read:read     read:reading   read:unread   queued:yes
 

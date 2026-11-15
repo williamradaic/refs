@@ -4,7 +4,7 @@
     refs doctor               check that everything is in order
     refs scan                 bring the index in line with Dropbox
     refs status               what the library holds
-    refs find blp             search; add filters like course:220a kind:paper
+    refs find blp             search; add filters like course:101 kind:paper
     refs ask "IO paper on ice cream"   let Haiku rank the candidates (about $0.0005)
     refs contexts             the courses and projects the app has recognised
     refs dupes                files stored in more than one place
@@ -352,7 +352,7 @@ def cmd_process(args: argparse.Namespace) -> int:
     conn = index.connect(cfg)
     terms, filters = _split_query(args.query)
     if not terms and not filters and not args.all:
-        print("Say which files (e.g. `refs process course:220a kind:paper`), or pass --all.",
+        print("Say which files (e.g. `refs process course:101 kind:paper`), or pass --all.",
               file=sys.stderr)
         return 2
     # Works without a PDF have nothing to read.
@@ -1004,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_status)
 
-    p = sub.add_parser("find", help="search, e.g. `refs find demand course:220a`")
+    p = sub.add_parser("find", help="search, e.g. `refs find demand course:101`")
     p.add_argument("query", nargs="*", help="words and key:value filters")
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--all", action="store_true", help="no limit")
@@ -1021,7 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_ask)
 
-    p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:bets`")
+    p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:thesis`")
     p.add_argument("query", nargs="+", help="words and key:value filters, as in `find`")
     p.add_argument("--limit", type=int, default=1, help="how many matches when searching by words")
     p.add_argument("--append", metavar="FILE.bib",
