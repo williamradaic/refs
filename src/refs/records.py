@@ -26,11 +26,28 @@ def read_json(path: Path) -> dict | None:
         return None
 
 
+# The version of the JSON files refs keeps in Dropbox (works, read records,
+# review.json); each file carries it as "schema". Raise it when their shape
+# changes in a way an older refs would get wrong, and have read_json upgrade
+# older files. A file written by a newer refs is read but never overwritten, so
+# an older copy of refs on another Mac cannot undo what the newer one wrote.
+SCHEMA = 1
+
+
+class NewerData(RuntimeError):
+    """A file was written by a newer version of refs: update this one."""
+
+
 def write_json(path: Path, data: dict) -> None:
     """Write a JSON file in one step, so a reader never sees half a file."""
+    existing = read_json(path)
+    if existing is not None and int(existing.get("schema", 0)) > SCHEMA:
+        raise NewerData(f"{path.name} was written by a newer version of refs (data version "
+                        f"{existing['schema']}, this one knows {SCHEMA}). Update refs with "
+                        "`uv tool upgrade refs`; nothing was overwritten.")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    temporary.write_text(json.dumps({**data, "schema": SCHEMA}, indent=1, ensure_ascii=False))
     temporary.replace(path)
 
 

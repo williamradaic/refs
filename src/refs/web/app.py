@@ -59,6 +59,11 @@ def create_app(watch: bool = False) -> FastAPI:
             watcher.stop()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+
+    # A file written by a newer refs is never overwritten (records.py): say so.
+    @app.exception_handler(records.NewerData)
+    async def newer_data(_request, error: records.NewerData):
+        return JSONResponse({"error": str(error), "detail": str(error)}, status_code=409)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     # --- who may talk to this server -----------------------------------------------
