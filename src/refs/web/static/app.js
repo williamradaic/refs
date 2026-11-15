@@ -408,7 +408,7 @@ $("colmenu").addEventListener("click", (event) => {
   if (layout.sort && layout.hidden.includes(layout.sort.col)) { layout.sort = null; sortItems(); }
   saveLayout(); applyLayout(); renderColumnMenu(); renderList();
 });
-document.addEventListener("click", () => { $("colmenu").hidden = true; });
+document.addEventListener("click", () => { $("colmenu").hidden = true; $("watchpanel").hidden = true; });
 
 // --- pane dividers -----------------------------------------------------------------
 
@@ -1327,6 +1327,7 @@ const HELP = `keys
   a                    add a paper (URL, DOI, arXiv id, NBER number); shift+Enter also queues it
   m                    show course material too
   R                    rescan Dropbox
+  w                    the folder watcher: what it is reading now, and what it did
   ,                    settings (folders, notes, AI, API key)
   t                    light / dark
 
@@ -1404,6 +1405,8 @@ document.addEventListener("keydown", async (event) => {
     try { localStorage.setItem("refs-theme", document.documentElement.dataset.theme); } catch {}
   }
   else if (key === "?") { $("helptext").textContent = HELP; $("help").showModal(); }
+  else if (key === "w") toggleWatchPanel();
+  else if (key === "Escape" && !$("watchpanel").hidden) toggleWatchPanel(false);
   else if (key === ",") {
     state.context = null; state.tag = null; state.view = "settings";
     markSidebar(); search();
@@ -1612,6 +1615,7 @@ function obProgressHtml() {
     const what = !p ? "starting …"
       : p.stage === "scanning" ? `scanning: ${p.done.toLocaleString()} of ${p.total.toLocaleString()} PDFs`
       : p.stage === "indexing" ? "building the search index (the first time, this downloads a 70 MB search model)"
+      : p.stage === "filing" ? "filing what was read and updating the index"
       : `reading with Claude: ${p.done.toLocaleString()} of ${p.total.toLocaleString()} PDFs`;
     const share = p && p.total ? Math.round((100 * p.done) / p.total) : 0;
     return `<h1>Setting up your library</h1><p>${esc(what)}</p>
@@ -1815,6 +1819,123 @@ function renderNotice(status) {
   $("notice").innerHTML = html;
 }
 
+// --- the watcher's status: header chip, progress bar, details panel ----------------------
+
+let watchStatus = null;           // the last /api/changes answer (null: no answer)
+
+const STAGES = {
+  scanning: "scanning folders", indexing: "updating the search index",
+  reading: "reading with Claude", filing: "filing and renaming",
+};
+const OUTCOME = {   // glyph and word for each entry of the activity list
+  read: ["■", "read"], review: ["◧", "review"], failed: ["✗", "failed"],
+  skipped: ["·", "skipped"], scan: ["~", "folders"],
+};
+const fileName = (path) => path?.split("/").pop() ?? "";
+const clock = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+function span(seconds) {
+  if (seconds < 1) return "under 1 s";
+  seconds = Math.round(seconds);
+  if (seconds < 60) return `${seconds} s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ${seconds % 60 ? `${seconds % 60} s` : ""}`.trim();
+  return `${Math.floor(seconds / 3600)} h ${Math.round((seconds % 3600) / 60)} min`;
+}
+
+// How far the stage has come, and a guess at how long the rest takes: the
+// average time per file so far, times the files left (after 2 files, so the
+// first slow one does not skew it).
+function stageNumbers(p, now) {
+  const counted = p.total > 0 && ["scanning", "reading"].includes(p.stage);
+  const share = counted ? Math.min(1, p.done / p.total) : null;
+  const took = p.since ? now - p.since : 0;
+  const left = counted && p.done >= 2 ? (took / p.done) * (p.total - p.done) : null;
+  return { share, took, left };
+}
+
+function renderWatch(status) {
+  watchStatus = status;
+  const chip = $("watch"), bar = $("watchbar");
+  const p = status?.progress;
+  chip.classList.toggle("busy", Boolean(p));
+  chip.classList.toggle("off", !status?.watching);
+  bar.hidden = !p;
+  if (!status) {
+    chip.innerHTML = `<span class="dot">○</span> no answer`;
+    chip.title = "the refs server does not answer";
+  } else if (!status.watching) {
+    chip.innerHTML = `<span class="dot">○</span> not watching`;
+    chip.title = "this refs does not follow your folders (--no-watch, or another refs already does)";
+  } else if (p) {
+    const count = p.total && ["scanning", "reading"].includes(p.stage) ? ` ${p.done}/${p.total}` : " …";
+    chip.innerHTML = `<span class="dot">◐</span> ${esc(p.stage)}${count}`;
+    chip.title = (p.file ? `${fileName(p.file)}\n` : "") + "click for details (w)";
+    const { share } = stageNumbers(p, status.now ?? Date.now() / 1000);
+    bar.classList.toggle("unknown", share === null);
+    bar.firstElementChild.style.width = `${Math.round((share ?? 0) * 100)}%`;
+  } else if (status.pending) {
+    chip.innerHTML = `<span class="dot">◌</span> changes seen`;
+    chip.title = "waiting for the folders to settle, then a pass runs";
+  } else {
+    chip.innerHTML = `<span class="dot">●</span> watching`;
+    chip.title = `following ${(status.roots ?? []).join(", ")}` +
+      (status.last_pass ? `; last pass ${status.last_pass.slice(11, 16)}` : "") + "\nclick for details (w)";
+  }
+  if (!$("watchpanel").hidden) renderWatchPanel();
+}
+
+function renderWatchPanel() {
+  const s = watchStatus, panel = $("watchpanel");
+  if (!s) { panel.innerHTML = `<div>The refs server does not answer.</div>`; return; }
+  if (!s.watching) {
+    panel.innerHTML = `<div class="label">Watcher</div><div>Not watching. This refs was started
+      with --no-watch, or another refs (the login service) already follows your folders.
+      R rescans by hand.</div>`;
+    return;
+  }
+  const reads = { all: "reads every new PDF", dump: `reads new PDFs in ${esc(state.dump)}`,
+                  none: "reads nothing on its own" }[s.auto_process] ?? "";
+  let html = `<div class="label">Watcher</div>
+    <div>following ${esc((s.roots ?? []).join(", "))}; ${reads}</div>`;
+  const p = s.progress;
+  if (p) {
+    const { share, took, left } = stageNumbers(p, s.now ?? Date.now() / 1000);
+    const count = share !== null ? `: ${p.done.toLocaleString()} of ${p.total.toLocaleString()}` : " …";
+    const timing = [`${span(took)} so far`, left !== null && `about ${span(left)} left`].filter(Boolean).join(", ");
+    html += `<div class="label">Now</div>
+      <div>${esc(STAGES[p.stage] ?? p.stage)}${count} <span class="path">· ${timing}</span></div>
+      <div class="ob-bar"><span style="width:${Math.round((share ?? 1) * 100)}%"></span></div>`;
+    if (p.file) html += `<div class="now">${esc(fileName(p.file))}</div><div class="path">${esc(p.file)}</div>`;
+    if (s.pass_started) html += `<div class="path">this pass began at ${clock(s.pass_started)}</div>`;
+  } else if (s.pending) {
+    html += `<div class="label">Now</div><div>changes seen; a pass starts once the folders are quiet for a few seconds</div>`;
+  } else {
+    html += `<div class="label">Now</div><div>idle${s.last_pass
+      ? `; last pass at ${esc(s.last_pass.slice(11, 16))}${s.last_pass_seconds != null ? `, took ${span(s.last_pass_seconds)}` : ""}`
+      : ""}</div>`;
+  }
+  html += `<div class="label">Recent</div>`;
+  if (!s.recent?.length) {
+    html += `<div class="path">nothing yet since refs started</div>`;
+  } else {
+    html += `<div class="wlog">` + s.recent.map((e) => {
+      const [glyph, word] = OUTCOME[e.outcome] ?? ["·", e.outcome];
+      const renamed = e.renamed_from ? `<div class="sub">renamed from ${esc(fileName(e.renamed_from))}</div>` : "";
+      const issues = e.issues?.length ? `<div class="sub">! ${esc(e.issues.join("; "))}</div>` : "";
+      const where = e.path ? `<div class="sub">${esc(e.path)}</div>` : "";
+      return `<span class="t">${clock(e.at)}</span><span class="${e.outcome}">${glyph} ${word}</span>
+        <span title="${esc(e.path ?? "")}">${esc(e.text)}${where}${renamed}${issues}</span>`;
+    }).join("") + `</div>`;
+  }
+  panel.innerHTML = html;
+}
+
+function toggleWatchPanel(open = $("watchpanel").hidden) {
+  $("watchpanel").hidden = !open;
+  if (open) { $("colmenu").hidden = true; renderWatchPanel(); checkChanges(); }
+}
+$("watch").addEventListener("click", (event) => { event.stopPropagation(); toggleWatchPanel(); });
+$("watchpanel").addEventListener("click", (event) => event.stopPropagation());
+
 $("notice").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-notice]");
   if (!button) return;
@@ -1834,8 +1955,9 @@ $("notice").addEventListener("click", async (event) => {
 async function checkChanges() {
   if (document.hidden) return;
   let status;
-  try { status = await get("/api/changes"); } catch { return; }
+  try { status = await get("/api/changes"); } catch { renderWatch(null); return; }
   renderNotice(status);
+  renderWatch(status);
   if (seenGeneration === null) { seenGeneration = status.generation; return; }
   if (status.generation === seenGeneration) return;
   if (document.activeElement?.matches?.("input, textarea, select")) return;
@@ -1844,7 +1966,12 @@ async function checkChanges() {
   loadSidebar();
   search(state.items[state.selected]?.id ?? null);
 }
-setInterval(checkChanges, 5000);
+// Every 5 s; every second while a pass runs or the watcher panel is open.
+(async function followWatcher() {
+  await checkChanges();
+  const busy = watchStatus?.progress || watchStatus?.pending || !$("watchpanel").hidden;
+  setTimeout(followWatcher, busy ? 1000 : 5000);
+})();
 document.addEventListener("visibilitychange", checkChanges);
 if (params.get("add")) {
   setAdding(true);

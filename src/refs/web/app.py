@@ -131,7 +131,8 @@ def create_app(watch: bool = False) -> FastAPI:
         """What the folder watcher last did. The page polls this and reloads the
         list when `generation` moves, so a PDF saved in Finder shows up by itself."""
         if watcher is None:
-            return {"watching": False, "generation": 0, "last_pass": None, "message": ""}
+            return {"watching": False, "generation": 0, "last_pass": None, "message": "",
+                    "progress": None, "pending": False, "recent": []}
         return watcher.status()
 
     @app.get("/api/job/{job_id}")
@@ -272,7 +273,8 @@ def create_app(watch: bool = False) -> FastAPI:
         """Counts for the left pane: presets, then works per course and project."""
         conn = index.connect(cfg)
         all_works = works.load_all(cfg)
-        library = [i for i in index.search(conn, [], {}, limit=None) if i["work_id"]]
+        everything = index.search(conn, [], {}, limit=None)   # read once: renames needs it too
+        library = [i for i in everything if i["work_id"]]
         contexts: dict[str, set] = {}
         fields: dict[str, int] = {}
         for item in library:
@@ -296,8 +298,7 @@ def create_app(watch: bool = False) -> FastAPI:
                              if "meta" in w),
                 "review": sum(i["status"] == "needs-review" for i in library),
                 "wanted": sum(not w["files"] for w in all_works.values()),
-                "renames": len(rename.plan(cfg, conn, index.search(conn, [], {}, limit=None),
-                                           all_works)[0]),
+                "renames": len(rename.plan(cfg, conn, everything, all_works)[0]),
                 "copies": len(organize.copies(cfg, conn)),
                 "unprocessed": conn.execute(
                     "SELECT COUNT(*) FROM files WHERE status IS NULL "

@@ -101,3 +101,20 @@ def test_skill_is_copied_to_each_agent_present_and_links_are_left_alone(tmp_path
     assert ("Claude Code", copy.parent, "old") in agents.status()
     agents.install()
     assert ("Claude Code", copy.parent, "current") in agents.status()
+
+
+def test_a_service_set_up_by_an_older_refs_is_reinstalled_on_restart(mac, monkeypatch):
+    """launchd keeps a service's old settings (the slow "Background" priority)
+    until it is loaded again: restart notices and reinstalls."""
+    import plistlib
+    service.PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with service.PLIST.open("wb") as handle:
+        plistlib.dump({**service.definition(), "ProcessType": "Background"}, handle)
+    assert service.outdated()
+    monkeypatch.setattr(service, "is_loaded", lambda: True)
+    monkeypatch.setattr(service, "install", lambda: "reinstalled")
+    assert service.restart() == "reinstalled"
+
+    with service.PLIST.open("wb") as handle:     # the current settings, another program path
+        plistlib.dump({**service.definition(), "ProgramArguments": ["/elsewhere/refs", "serve"]}, handle)
+    assert not service.outdated()

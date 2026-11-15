@@ -26,6 +26,7 @@ import subprocess
 import threading
 import time
 import traceback
+from collections import deque
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Callable
@@ -43,6 +44,9 @@ QUIET_SECONDS = 4.0
 # ...but at the latest this long after the first change, so a long copy is
 # taken in steps instead of waiting for its very end.
 MAX_WAIT_SECONDS = 60.0
+# How many recent outcomes (a PDF read, skipped or failed; a scan's changes)
+# the page's activity list can show.
+RECENT = 50
 
 
 def _log(message: str) -> None:
@@ -56,6 +60,14 @@ def notify(title: str, message: str) -> None:
          "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
          "-e", "end run", title, message],
         capture_output=True, timeout=10)
+
+
+def _summary(report: scanner.ScanReport) -> str:
+    """What a scan changed, in a few words ("2 new, 1 moved"); empty if nothing."""
+    counts = [(len(report.added), "new"), (len(report.copies), "copied"), (len(report.moved), "moved"),
+              (len(report.modified), "edited"), (len(report.removed), "gone"),
+              (len(report.restored), "back")]
+    return ", ".join(f"{n} {word}" for n, word in counts if n)
 
 
 class _Handler(FileSystemEventHandler):
@@ -94,8 +106,15 @@ class Watcher:
         self.generation = 0
         self.last_pass: str | None = None
         self.last_message = ""
-        # The pass in progress: {"stage": scanning|indexing|reading, "done", "total"}.
+        # The pass in progress: {"stage": scanning|indexing|reading|filing, "done",
+        # "total", "file" (the PDF being read), "since" (when this stage began)},
+        # and when the pass began. None between passes.
         self.progress: dict | None = None
+        self.pass_started: float | None = None
+        self.last_pass_seconds: float | None = None
+        # What recent passes did, newest last (see _remember).
+        self.recent: deque[dict] = deque(maxlen=RECENT)
+        self._entries: dict[str, dict] = {}     # this pass's entries by path, for renames
         # A large batch of unread PDFs waiting for your OK ({"pdfs", "dollars"}),
         # whether you gave it, and whether the monthly limit stopped reading.
         self.held: dict | None = None
@@ -226,10 +245,14 @@ class Watcher:
     def run_pass(self) -> list[ingest.Ingested]:
         """One scan-and-ingest pass. Public so it can be run directly (and tested)."""
         cfg = self.cfg
+        self._entries = {}
         with ingest.exclusive(cfg):
+            self.pass_started = time.time()
+            self._stage("scanning", 0, 0)
             conn = index.connect(cfg)
             try:
                 report = scanner.scan(cfg, conn, progress=self._scanning)
+                self._remember_scan(report)
                 pending = ([] if cfg.auto_process == "none" else
                            ingest.unread_files(cfg, conn, dump_only=cfg.auto_process == "dump"))
                 # Papers in the quick-add folder (you added them) are read; a large
@@ -246,23 +269,60 @@ class Watcher:
                 pending = added + others
                 # Reading on its own stops at the monthly limit.
                 left = budget.left_this_month(cfg, conn)
-                results = (ingest.ingest(cfg, conn, pending, progress=self._reading, budget_left=left)
+                results = (ingest.ingest(cfg, conn, pending, progress=self._reading,
+                                         on_result=self._remember, budget_left=left)
                            if pending else [])
                 self.limit_reached = any(r.skipped and "reading limit" in r.skipped for r in results)
             finally:
                 conn.close()
                 self.progress = None
+                if self.pass_started is not None:
+                    self.last_pass_seconds = round(time.time() - self.pass_started, 1)
+                self.pass_started = None
         self.last_pass = datetime.now().isoformat(timespec="seconds")
         self._report(report, results)
         return results
 
+    def _stage(self, stage: str, done: int, total: int, file: str | None = None) -> None:
+        """Say where the pass is. `since` stays put while the stage does not
+        change, so the page can tell how fast it goes and estimate the rest."""
+        same = self.progress is not None and self.progress["stage"] == stage
+        since = self.progress["since"] if same else time.time()
+        self.progress = {"stage": stage, "done": done, "total": total, "file": file, "since": since}
+
     def _scanning(self, done: int, total: int) -> None:
         # After the last file is hashed, the index and search vectors are
         # rebuilt (the first time, the search model is downloaded).
-        self.progress = {"stage": "indexing" if done >= total else "scanning", "done": done, "total": total}
+        self._stage("indexing" if done >= total else "scanning", done, total)
 
-    def _reading(self, done: int, total: int) -> None:
-        self.progress = {"stage": "reading", "done": done, "total": total}
+    def _reading(self, done: int, total: int, rel: str = "") -> None:
+        # After the last file: filing under works, renaming in the dump, indexing.
+        if rel:
+            self._stage("reading", done, total, rel)
+        else:
+            self._stage("filing", done, total)
+
+    def _remember_scan(self, report: scanner.ScanReport) -> None:
+        """What the scan found in the folders, for the activity list (if anything)."""
+        found = _summary(report)
+        if found:
+            self.recent.append({"at": time.time(), "outcome": "scan", "path": None,
+                                "text": f"folders: {found}", "issues": []})
+
+    def _remember(self, item: ingest.Ingested) -> None:
+        """One file's outcome, for the page's activity list, as soon as it is known."""
+        if item.skipped:
+            outcome = "skipped"
+        elif any("failed" in issue or "could not open" in issue for issue in item.issues):
+            outcome = "failed"
+        elif item.read is not None and item.read.get("status") == "needs-review":
+            outcome = "review"
+        else:
+            outcome = "read"
+        entry = {"at": time.time(), "outcome": outcome, "path": item.rel,
+                 "text": ingest.headline(item), "issues": list(item.issues)}
+        self._entries[item.rel] = entry
+        self.recent.append(entry)
 
     # --- telling you what happened ---------------------------------------------------------
 
@@ -274,14 +334,12 @@ class Watcher:
                 pass
 
     def _report(self, report: scanner.ScanReport, results: list[ingest.Ingested]) -> None:
-        moved = len(report.moved)
-        counts = [(len(report.added), "new"), (len(report.copies), "copied"), (moved, "moved"),
-                  (len(report.modified), "edited"), (len(report.removed), "gone"),
-                  (len(report.restored), "back")]
-        summary = ", ".join(f"{n} {word}" for n, word in counts if n)
+        summary = _summary(report)
         if summary:
             _log(f"scan: {summary}")
         for item in results:
+            if item.renamed_from and (entry := self._entries.get(item.renamed_from)):
+                entry["path"], entry["renamed_from"] = item.rel, item.renamed_from
             line = ingest.headline(item)
             if item.renamed_from:
                 line += f"  (renamed {PurePosixPath(item.renamed_from).name} -> {PurePosixPath(item.rel).name})"
@@ -322,6 +380,10 @@ class Watcher:
 
     def status(self) -> dict:
         return {"watching": self._observer is not None, "generation": self.generation,
-                "last_pass": self.last_pass, "message": self.last_message,
-                "progress": self.progress, "pending": self._wake.is_set(),
+                "last_pass": self.last_pass, "last_pass_seconds": self.last_pass_seconds,
+                "message": self.last_message,
+                "progress": self.progress, "pass_started": self.pass_started,
+                "pending": self._wake.is_set(), "now": time.time(),
+                "roots": list(self.cfg.roots), "auto_process": self.cfg.auto_process,
+                "recent": list(reversed(self.recent)),          # newest first
                 "held": self.held, "limit_reached": self.limit_reached}

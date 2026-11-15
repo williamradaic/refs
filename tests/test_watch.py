@@ -153,3 +153,39 @@ def test_free_name_keeps_an_existing_wp_suffix(tmp_path, monkeypatch):
     # The published file itself is already right.
     assert rename.free_name(cfg, f"papers-dump/{published}", published, False) is None
     assert os.listdir(root / "papers-dump")          # nothing was renamed by asking
+
+
+def test_the_page_sees_which_file_is_being_read_and_what_happened(lib, monkeypatch):
+    """status() says the stage and the file while a PDF is read, then lists the
+    outcome (with the rename inside the dump) and what the scan found."""
+    lib.write("papers-dump/w4264.pdf")
+    watcher = lib.watcher()
+    seen = []
+    real = pipeline.process_file
+
+    def spying(cfg, api, file_hash, rel, topics=None, previous=None):
+        seen.append(dict(watcher.status()["progress"]))      # what the page sees meanwhile
+        return real(cfg, api, file_hash, rel, topics)
+    monkeypatch.setattr(pipeline, "process_file", spying)
+    watcher.run_pass()
+
+    [during] = seen
+    assert during["stage"] == "reading" and during["file"] == "papers-dump/w4264.pdf"
+    assert (during["done"], during["total"]) == (0, 1) and during["since"] > 0
+
+    status = watcher.status()
+    assert status["progress"] is None and status["pass_started"] is None
+    assert status["last_pass_seconds"] is not None
+    read, scan = status["recent"]                             # newest first
+    assert read["outcome"] == "read" and "Automobile Prices" in read["text"]
+    assert read["path"] == f"papers-dump/{CANONICAL}"
+    assert read["renamed_from"] == "papers-dump/w4264.pdf"
+    assert scan["outcome"] == "scan" and "1 new" in scan["text"]
+
+
+def test_a_skipped_file_is_listed_with_the_reason(lib):
+    lib.write("papers-dump/partial.pdf", b"%PDF-1.4\nhalf a file")
+    watcher = lib.watcher()
+    watcher.run_pass()
+    skipped = [e for e in watcher.status()["recent"] if e["outcome"] == "skipped"]
+    assert len(skipped) == 1 and "incomplete" in skipped[0]["text"]

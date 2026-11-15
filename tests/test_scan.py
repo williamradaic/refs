@@ -222,3 +222,32 @@ def test_admin_folders_and_excluded_files_are_never_read(lib, tmp_path, monkeypa
 
     report = lib.scan()
     assert report.added == [BLP]
+
+
+def test_opening_the_index_does_not_wait_for_a_writer(lib, tmp_path):
+    """The page opens the index on every request. Once the index is current,
+    opening it only reads, so it never waits while a scan holds the write lock."""
+    import sqlite3
+    import time
+    cfg = config.load()
+    index.connect(cfg).close()                     # create it at the current version
+    writer = sqlite3.connect(cfg.index_db, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")              # a scan, mid-write
+    try:
+        started = time.monotonic()
+        conn = index.connect(cfg)
+        assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+        assert time.monotonic() - started < 1      # the old connect() waited up to 30 s
+    finally:
+        writer.execute("ROLLBACK")
+
+
+def test_an_index_missing_a_column_is_still_upgraded(lib):
+    """The read-only shortcut must not skip a needed change."""
+    cfg = config.load()
+    conn = index.connect(cfg)
+    conn.execute("ALTER TABLE files DROP COLUMN queued")
+    conn.commit()
+    conn.close()
+    have = {r["name"] for r in index.connect(cfg).execute("PRAGMA table_info(files)")}
+    assert "queued" in have

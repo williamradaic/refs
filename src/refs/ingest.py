@@ -113,7 +113,8 @@ def unread_files(cfg: Config, conn: sqlite3.Connection, *, dump_only: bool = Fal
 
 def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], *,
            source_url: str | None = None, check_complete: bool = True,
-           progress: Callable[[int, int], None] | None = None,
+           progress: Callable[[int, int, str], None] | None = None,
+           on_result: Callable[[Ingested], None] | None = None,
            budget_left: float | None = None) -> list[Ingested]:
     """Process, file and (inside the dump) rename the given (path, hash) pairs.
 
@@ -123,6 +124,9 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
     that was handed over explicitly (`refs add file.pdf`). `budget_left`, in
     dollars, stops reading once this run has spent it (the monthly limit on
     automatic reading, budget.py); None means no limit.
+
+    For the page: `progress(done, total, path)` is called before each file,
+    and `on_result(item)` after each file that was read or left for later.
     """
     results = [Ingested(rel=rel, file_hash=h) for rel, h in files]
     api, no_key = None, False
@@ -132,12 +136,13 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
     # 1. Read and look up each file that has no read record yet.
     for done, item in enumerate(results):
         if progress is not None:
-            progress(done, len(results))           # `progress(done, total)`, for the page
+            progress(done, len(results), item.rel)
         item.read = pipeline.load_read(cfg, item.file_hash)
         if item.read is not None:
             continue
         if check_complete and not looks_complete(cfg, item.rel):
             item.skipped = "the file looks incomplete (still downloading?)"
+            _tell(on_result, item)
             continue
         confidential = pipeline._is_confidential(cfg, item.rel)
         if api is None and not confidential and not no_key:
@@ -147,9 +152,11 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
                 no_key = True
         if api is None and not confidential:
             item.skipped = "no Anthropic API key (run `refs setup-key`)"
+            _tell(on_result, item)
             continue
         if budget_left is not None and not confidential and spent + budget.PER_PDF > budget_left:
             item.skipped = "this month's reading limit is reached (read_monthly_cap)"
+            _tell(on_result, item)
             continue
         item.read = pipeline.process_file(cfg, api, item.file_hash, item.rel, topics)
         item.processed_now = True
@@ -158,6 +165,10 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
             cost = llm.cost(item.read.get("usage") or {})
             spent += cost
             budget.record(conn, cost)
+        _tell(on_result, item)
+
+    if progress is not None:                    # all read: filing and indexing follow
+        progress(len(results), len(results), "")
 
     # 2. File everything under its work (and attach PDFs that a "wanted" work awaited).
     file_to_work = works.sync(cfg)
@@ -187,6 +198,15 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
     # 4. Bring the index up to date with the renames and the new records.
     scanner.scan(cfg, conn)
     return results
+
+
+def _tell(on_result: Callable[[Ingested], None] | None, item: Ingested) -> None:
+    """Pass one file's outcome on; a failure there never stops the reading."""
+    if on_result is not None:
+        try:
+            on_result(item)
+        except Exception:                               # noqa: BLE001
+            pass
 
 
 def headline(item: Ingested) -> str:
