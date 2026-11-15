@@ -3,6 +3,8 @@ name = "refs"
 version = "0.1.0"
 description = "A folder-aware reference manager that sits on top of Dropbox."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 # Phase 1 (scanner, index, command line) uses only the Python standard library.
 # Later phases add: pymupdf, watchdog, fastapi, uvicorn, jinja2, httpx, anthropic,
