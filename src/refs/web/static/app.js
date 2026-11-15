@@ -26,13 +26,18 @@ const GLYPH = { verified: "■", confirmed: "▣", imported: "◆", extracted: "
 // Each column knows its header label, default width (in characters; null = takes
 // the remaining space), how to sort, and what to show.
 const last = "￿";      // sorts after every real string: empty values go to the end
-const READ_RANK = { read: 1, reading: 2, unread: 3 };
+// Sort orders for the two glyph columns, as text so every key compares alike.
+// Reading: the queue (in queue order), then started, read, unread.
+const READ_RANK = { reading: "1", read: "2", unread: "3" };
+// Status: from the most trustworthy record to the least, then no PDF, not a paper.
+const STATUS_RANK = { confirmed: 0, verified: 1, imported: 2, extracted: 3, "needs-review": 4,
+  "no-file": 5, confidential: 6, classified: 7 };
 const COLUMNS = {
   // Your reading: ▸ on the queue, ◐ started, ● read (set by you or detected
   // from your markup). Circles, so they never look like the status column's
   // squares. The queue mark wins: a paper queued to re-read shows ▸.
-  rd:      { label: "",        width: 1,  fixed: true, align: "center",
-             sort: (i) => (i.queued ? "0" + i.queued : READ_RANK[i.read_status] ?? 9),
+  rd:      { label: "◐",       width: 1,  fixed: true, align: "center",
+             sort: (i) => (i.queued ? "0" + i.queued : READ_RANK[i.read_status] ?? "9"),
              cell: (i) => {
                const status = i.read_status;
                const how = i.read_source === "detected" ? " (from your markup)" : "";
@@ -40,7 +45,8 @@ const COLUMNS = {
                if (status === "reading") return `<span class="rd" title="started${how}">◐</span>`;
                if (status === "read") return `<span class="rd done" title="read${how}">●</span>`;
                return `<span class="rd"></span>`; } },
-  st:      { label: "",        width: 1,  fixed: true, align: "center", sort: (i) => i.status ?? last,
+  st:      { label: "■",       width: 1,  fixed: true, align: "center",
+             sort: (i) => STATUS_RANK[i.status] ?? 8,
              cell: (i) => { const st = i.status ?? "classified";
                return `<span class="st ${st}" title="${st}">${GLYPH[st] ?? "·"}</span>`; } },
   authors: { label: "authors", width: 20, cls: "au", sort: (i) => (i.authors?.[0] ?? last).toLowerCase(),
@@ -263,8 +269,12 @@ function renderHead() {
     // goes on the inner side, so the label itself stays flush with the data.
     const label = `<span class="hl">${esc(column.label)}</span>`;
     const mark = arrow ? `<i>${arrow}</i>` : "";
-    return `<span class="hc ${column.align ?? "left"}" draggable="true" data-col="${id}"
-      title="click to sort, drag to move">${column.align === "right" ? mark + label : label + mark}${grip}</span>`;
+    // A one-glyph column has no room for both: the arrow replaces the glyph.
+    const content = column.fixed ? (arrow ? mark : label)
+      : column.align === "right" ? mark + label : label + mark;
+    const what = column.fixed ? `sort by ${column.name}; ` : "";
+    return `<span class="hc ${column.align ?? "left"}${column.fixed ? " glyph" : ""}" draggable="true" data-col="${id}"
+      title="${what}click to sort, drag to move">${content}${grip}</span>`;
   }).join("") + `</div>`;
 }
 

@@ -125,6 +125,9 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
 .hc:hover { color: var(--fg); }
 .hl { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
 .hc i { font-style: normal; color: var(--accent); font-size: 9px; margin: 0 .6ch; }
+/* One-glyph columns: the glyph (or sort arrow) alone, no letter-spacing or margin. */
+.hc.glyph .hl { letter-spacing: 0; }
+.hc.glyph i { margin: 0; }
 /* Alignment by type of content: text left, numbers right, glyphs centred. */
 .left { text-align: left; }
 .right { text-align: right; }
