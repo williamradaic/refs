@@ -131,7 +131,8 @@ def create_app(watch: bool = False) -> FastAPI:
         """What the folder watcher last did. The page polls this and reloads the
         list when `generation` moves, so a PDF saved in Finder shows up by itself."""
         if watcher is None:
-            return {"watching": False, "generation": 0, "last_pass": None, "message": ""}
+            return {"watching": False, "generation": 0, "last_pass": None, "message": "",
+                    "progress": None, "pending": False, "recent": []}
         return watcher.status()
 
     @app.get("/api/job/{job_id}")
