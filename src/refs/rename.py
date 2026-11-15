@@ -107,7 +107,7 @@ def apply(cfg: Config, rel: str, new_name: str, file_hash: str | None = None) ->
 
 
 def journal(cfg: Config, rel: str, new_rel: str, file_hash: str | None, action: str = "rename") -> None:
-    """Record one rename or move, so `undo` can reverse it."""
+    """Record one rename, move or copy, so `undo` can reverse it."""
     journal_path(cfg).parent.mkdir(parents=True, exist_ok=True)
     with journal_path(cfg).open("a") as handle:
         handle.write(json.dumps({
@@ -116,18 +116,41 @@ def journal(cfg: Config, rel: str, new_rel: str, file_hash: str | None, action: 
         }, ensure_ascii=False) + "\n")
 
 
-def undo(cfg: Config, count: int = 1) -> list[tuple[str, str]]:
-    """Reverse the last `count` renames. Returns (restored path, path it had)."""
+def to_trash(source: Path) -> Path:
+    """Move a file to the macOS Trash under its own name. Returns where it went."""
+    trash_dir = Path.home() / ".Trash"
+    target = trash_dir / source.name
+    number = 2
+    while target.exists():                         # never overwrite something in the Trash
+        target = trash_dir / f"{source.stem} {number}{source.suffix}"
+        number += 1
+    os.rename(source, target)                      # same disk: a move, not a copy
+    return target
+
+
+def undo(cfg: Config, count: int = 1) -> list[tuple[str, str, str]]:
+    """Reverse the last `count` renames, moves or copies.
+
+    Returns (original path, path it had, action). A rename or move is put back;
+    a copy is sent to the Trash (not deleted, since you may have marked it up),
+    and only while the original is still there, so undo never removes the
+    last copy of a file.
+    """
     if not journal_path(cfg).exists():
         return []
     lines = journal_path(cfg).read_text().splitlines()
     restored = []
     while lines and len(restored) < count:
         entry = json.loads(lines.pop())
+        action = entry.get("action", "rename")
         current, original = cfg.absolute(entry["to"]), cfg.absolute(entry["from"])
-        if current.exists() and not original.exists():
+        if action == "copy":
+            if current.exists() and original.exists():
+                to_trash(current)
+                restored.append((entry["from"], entry["to"], action))
+        elif current.exists() and not original.exists():
             os.rename(current, original)
-            restored.append((entry["from"], entry["to"]))
+            restored.append((entry["from"], entry["to"], action))
     journal_path(cfg).write_text("".join(line + "\n" for line in lines))
     return restored
 

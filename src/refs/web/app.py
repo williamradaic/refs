@@ -442,9 +442,11 @@ def create_app(watch: bool = False) -> FastAPI:
 
     @app.get("/api/copies")
     def copies() -> dict:
-        found = organize.copies(cfg, index.connect(cfg))
-        all_works = works.load_all(cfg)
-        return {"items": [shape(item, all_works) | {"hash": item["hash"]} for item in found]}
+        conn, all_works = index.connect(cfg), works.load_all(cfg)
+        def rows(found):
+            return [shape(item, all_works) | {"hash": item["hash"]} for item in found]
+        return {"items": rows(organize.copies(cfg, conn)),
+                "kept": rows(organize.copies(cfg, conn, kept=True))}
 
     @app.post("/api/copies/keep")
     def keep(file_hash: str = Body(embed=True, alias="hash"),
@@ -452,6 +454,14 @@ def create_app(watch: bool = False) -> FastAPI:
         """These copies are on purpose: take them out of the Review queue."""
         guard(x_refs)
         organize.keep_copies(cfg, file_hash)
+        return {"ok": True}
+
+    @app.post("/api/copies/unkeep")
+    def unkeep(file_hash: str = Body(embed=True, alias="hash"),
+               x_refs: str | None = Header(default=None)) -> dict:
+        """Undo "keep all": the copies come back to the Review queue."""
+        guard(x_refs)
+        organize.unkeep_copies(cfg, file_hash)
         return {"ok": True}
 
     @app.post("/api/trash")
@@ -481,6 +491,20 @@ def create_app(watch: bool = False) -> FastAPI:
             conn = index.connect(cfg)
             try:
                 new_path = organize.move(cfg, conn, path, folder)
+            except organize.Refused as error:
+                raise refused(error)
+            scanner.scan(cfg, conn)
+        return {"path": new_path}
+
+    @app.post("/api/copy")
+    def copy(path: str = Body(embed=True), folder: str = Body(embed=True),
+             x_refs: str | None = Header(default=None)) -> dict:
+        """Copy a PDF into another folder; the original stays. Undo trashes the copy."""
+        guard(x_refs)
+        with ingest.exclusive(cfg):
+            conn = index.connect(cfg)
+            try:
+                new_path = organize.copy(cfg, conn, path, folder)
             except organize.Refused as error:
                 raise refused(error)
             scanner.scan(cfg, conn)

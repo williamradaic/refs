@@ -32,7 +32,7 @@ def test_rename_journal_and_undo(cfg):
     assert new == "papers-dump/barberis-1998-model.pdf"
     assert (cfg.dropbox_root / new).exists() and not (cfg.dropbox_root / "papers-dump/junk.pdf").exists()
 
-    assert rename.undo(cfg) == [("papers-dump/junk.pdf", "papers-dump/barberis-1998-model.pdf")]
+    assert rename.undo(cfg) == [("papers-dump/junk.pdf", "papers-dump/barberis-1998-model.pdf", "rename")]
     assert (cfg.dropbox_root / "papers-dump/junk.pdf").exists()
     assert rename.undo(cfg) == []                     # journal is now empty
 

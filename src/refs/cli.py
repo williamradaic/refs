@@ -595,8 +595,11 @@ def cmd_rename(args: argparse.Namespace) -> int:
     cfg = config.load()
     conn = index.connect(cfg)
     if args.undo:
-        for original, was in rename.undo(cfg, args.undo):
-            print(f"restored  {was}  ->  {original}")
+        for original, was, action in rename.undo(cfg, args.undo):
+            if action == "copy":
+                print(f"trashed copy  {was}  (original stays at {original})")
+            else:
+                print(f"restored  {was}  ->  {original}")
         scanner.scan(cfg, conn)
         return 0
 
@@ -850,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("rename", help="propose canonical file names (add --apply to rename)")
     p.add_argument("query", nargs="*")
     p.add_argument("--apply", action="store_true", help="actually rename the files")
-    p.add_argument("--undo", type=int, metavar="N", help="reverse the last N renames")
+    p.add_argument("--undo", type=int, metavar="N", help="reverse the last N renames, moves or copies")
     p.set_defaults(run=cmd_rename)
 
     p = sub.add_parser("wanted", help="works saved without a PDF yet")

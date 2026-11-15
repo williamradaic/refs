@@ -521,6 +521,7 @@ async function renderDetail() {
         <button class="act" data-open="${esc(loc.path)}">preview.app</button>
         <button class="act" data-reveal="${esc(loc.path)}">finder</button>
         <button class="act" data-fileto="${esc(loc.path)}">file to…</button>
+        <button class="act" data-copyto="${esc(loc.path)}">copy to…</button>
       </div><div class="picker" data-for="${esc(loc.path)}"></div></div>`;
   }
 
@@ -700,8 +701,12 @@ $("detail").addEventListener("click", (event) => {
   }
   else if (el.dataset.open) post("/api/open", { path: el.dataset.open });
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
-  else if (el.dataset.fileto) openPicker(el.dataset.fileto);
-  else if (el.dataset.folder) fileTo(el.closest(".picker").dataset.for, el.dataset.folder);
+  else if (el.dataset.fileto) openPicker(el.dataset.fileto, "move");
+  else if (el.dataset.copyto) openPicker(el.dataset.copyto, "copy");
+  else if (el.dataset.folder) {
+    const box = el.closest(".picker");
+    fileTo(box.dataset.for, el.dataset.folder, box.dataset.mode);
+  }
   else if (el.dataset.act === "edit") showEditor();
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
   else if (el.dataset.act === "note-reload") renderDetail();
@@ -929,30 +934,38 @@ async function undoBatch(count) {
 
 // The same PDF in more than one place. Often on purpose (a reading for a course
 // and for a project); otherwise trash the extra copy. The last copy cannot be trashed.
+// Sets marked "keep all" are listed at the bottom, folded, where they can be un-kept.
+function copySet(item, kept) {
+  const name = item.title ?? item.locations[0].path.split("/").pop();
+  const who = item.authors?.length ? `${authorsShort(item.authors)} (${item.year ?? "n.d."}) ` : "";
+  const button = kept ? `<button class="act" data-unkeep="${esc(item.hash)}">un-keep</button>`
+                      : `<button class="act" data-keep="${esc(item.hash)}">keep all</button>`;
+  let html = `<div class="copyset"><div class="topic"><span>${esc(who + name)}</span>${button}</div>`;
+  for (const loc of item.locations) {
+    html += `<div class="copy"><span class="path">${esc(loc.path)}</span>
+      <span class="acts"><button class="act" data-reveal="${esc(loc.path)}">finder</button>
+      ${kept ? "" : `<button class="act" data-trash="${esc(loc.path)}">trash</button>`}</span></div>`;
+  }
+  return html + `</div>`;
+}
+
 async function showCopies(token) {
   const data = await get("/api/copies");
   if (token !== listToken) return;
   state.items = [];
   $("count").textContent = `${data.items.length} sets of copies`;
   let html = data.items.length ? "" : `<div class="empty">no file is stored twice.</div>`;
-  for (const item of data.items) {
-    const name = item.title ?? item.locations[0].path.split("/").pop();
-    const who = item.authors?.length ? `${authorsShort(item.authors)} (${item.year ?? "n.d."}) ` : "";
-    html += `<div class="copyset"><div class="topic"><span>${esc(who + name)}</span>
-      <button class="act" data-keep="${esc(item.hash)}">keep all</button></div>`;
-    for (const loc of item.locations) {
-      html += `<div class="copy"><span class="path">${esc(loc.path)}</span>
-        <span class="acts"><button class="act" data-reveal="${esc(loc.path)}">finder</button>
-        <button class="act" data-trash="${esc(loc.path)}">trash</button></span></div>`;
-    }
-    html += `</div>`;
+  html += data.items.map((item) => copySet(item, false)).join("");
+  if (data.kept.length) {
+    html += `<details class="kept"><summary class="topic">kept on purpose (${data.kept.length})</summary>
+      ${data.kept.map((item) => copySet(item, true)).join("")}</details>`;
   }
   $("list").innerHTML = html;
   $("detail").innerHTML = `<div class="label">Copies</div>
     <p>The same PDF, byte for byte, stored in more than one place.</p>
     <p class="where" style="margin-top:8px"><b>trash</b> moves that copy to the macOS Trash
-    (drag it back to restore). <b>keep all</b> says the copies are on purpose and takes the
-    set out of this list.</p>`;
+    (drag it back to restore). <b>keep all</b> says the copies are on purpose and moves the
+    set to <b>kept on purpose</b> at the bottom, where <b>un-keep</b> brings it back.</p>`;
 }
 
 const REVIEW_VIEWS = { renames: showRenames, copies: showCopies };
@@ -983,7 +996,12 @@ $("list").addEventListener("click", async (event) => {
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
   else if (el.dataset.keep) {
     await post("/api/copies/keep", { hash: el.dataset.keep });
-    say("kept: these copies are on purpose");
+    say("kept: these copies are on purpose (un-keep under \"kept on purpose\")");
+    loadSidebar(); search();
+  }
+  else if (el.dataset.unkeep) {
+    await post("/api/copies/unkeep", { hash: el.dataset.unkeep });
+    say("back in the list to review");
     loadSidebar(); search();
   }
   else if (el.dataset.trash) {
@@ -998,17 +1016,20 @@ $("list").addEventListener("click", async (event) => {
   if (counter) counter.textContent = state.picked.size;
 });
 
-// --- file to… --------------------------------------------------------------------------------
+// --- file to… / copy to… --------------------------------------------------------------------------------
 
 // A filter box over every folder refs knows (where PDFs already are, and the
 // folders above them). Type words of the path, then Enter or click.
+// `mode` is "move" (file to…) or "copy" (copy to…: the original stays put).
 let folderList = null;
-async function openPicker(path) {
+async function openPicker(path, mode = "move") {
   const box = [...$("detail").querySelectorAll(".picker")].find((el) => el.dataset.for === path);
   if (!box) return;
+  box.dataset.mode = mode;
   // The box takes the keyboard at once, before the folder list has loaded:
   // otherwise quick typing would land on the page's single-key shortcuts.
-  box.innerHTML = `<input class="pick" placeholder="type to find a folder, e.g. 220a readings demand" spellcheck="false" autocomplete="off">
+  const verb = mode === "copy" ? "copy into" : "file into";
+  box.innerHTML = `<input class="pick" placeholder="${verb}: type to find a folder, e.g. 220a readings demand" spellcheck="false" autocomplete="off">
     <div class="choices"><div class="where">loading folders …</div></div>`;
   const input = box.querySelector("input");
   input.focus();
@@ -1024,21 +1045,23 @@ async function openPicker(path) {
   input.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       const first = box.querySelector(".choice");
-      if (first) fileTo(path, first.dataset.folder);
+      if (first) fileTo(path, first.dataset.folder, mode);
     }
   });
   draw();
   input.focus();
 }
 
-async function fileTo(path, folder) {
-  const response = await fetch("/api/move", { method: "POST",
+async function fileTo(path, folder, mode = "move") {
+  const copying = mode === "copy";
+  const response = await fetch(copying ? "/api/copy" : "/api/move", { method: "POST",
     headers: { "Content-Type": "application/json", "X-Refs": "1" },
     body: JSON.stringify({ path, folder }) });
   const result = await response.json();
-  if (!response.ok) { say(result.detail ?? "could not move it"); return; }
+  if (!response.ok) { say(result.detail ?? (copying ? "could not copy it" : "could not move it")); return; }
   folderList = null;                          // the new location may add a folder
-  say(`filed into ${folder}. undo: refs rename --undo`, 9000);
+  say(copying ? `copied into ${folder}; the original stays. undo (trashes the copy): refs rename --undo`
+              : `filed into ${folder}. undo: refs rename --undo`, 9000);
   loadSidebar();
   search(state.items[state.selected]?.id ?? null);
 }
@@ -1054,6 +1077,7 @@ const HELP = `keys
   p                    open in Preview
   f                    show in Finder
   F                    file to… (move the PDF into a course or project folder)
+  C                    copy to… (same, but the original stays where it is)
   y                    copy citekey
   b                    copy BibTeX
   r                    toggle read / unread
@@ -1110,7 +1134,11 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "Enter" || key === "o") act("open");
   else if (key === "p") act("preview");
   else if (key === "f") act("reveal");
-  else if (key === "F") { event.preventDefault(); const p = state.items[state.selected]?.locations[0]?.path; if (p) openPicker(p); }
+  else if (key === "F" || key === "C") {
+    event.preventDefault();
+    const p = state.items[state.selected]?.locations[0]?.path;
+    if (p) openPicker(p, key === "C" ? "copy" : "move");
+  }
   else if (key === "y") act("citekey");
   else if (key === "b") act("bibtex");
   else if (key === "r") act("read");

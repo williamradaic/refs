@@ -6,7 +6,7 @@ course or project each one belongs to, and follows renames, moves and copies.
 
 Status: **Phases 1–4 built**: engine, metadata pipeline, works, quick add and
 bookmarklet, live folder watching, launch at login, the web UI with a Review
-queue (records, renames, copies), "file to…", BibTeX with `--append`, keys
+queue (records, renames, copies), "file to…" and "copy to…", BibTeX with `--append`, keys
 learned from project `.bib` files, and an agent skill. Dropped: first-page
 thumbnails and a Raycast "add the front tab" command (the bookmarklet covers
 it). What remains is the plan's "Later" list, in `local/admin/plan.md`.
@@ -105,6 +105,11 @@ the next scan counts it again. The detected status is stored in the work file
 **File to…** (`F`, or the link under each file) moves a PDF into another folder,
 typically out of `papers-dump` into a course or project. It is the only way refs
 moves a file; the move is journaled, so `refs rename --undo 1` reverses it.
+
+**Copy to…** (`C`, or the link next to it) does the same but leaves the original
+where it is, for a PDF that has to sit in a shared project folder. The pair is
+marked as kept on purpose, so it stays out of Review > copies. Undo sends the copy
+to the Trash, and only while the original still exists.
 
 **Bookmarklet**: open `http://refs.localhost:8377/bookmarklet` and drag
 "+ refs" to the bookmarks bar. On a paper's page it opens refs with the link

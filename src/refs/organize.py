@@ -4,9 +4,11 @@
   out of papers-dump into a course or project folder). This is the only way
   refs moves a file. The file keeps its name, and the move is journaled like
   a rename, so `refs rename --undo` reverses it.
+* Copy to…: the same, but the original stays put; for a PDF that has to sit
+  in a shared project folder. Undo sends the copy to the Trash.
 * Copies: the same PDF stored in more than one place. Each extra copy can be
   moved to the Trash (never the last one), or the set can be marked as kept on
-  purpose, which takes it out of the Review queue.
+  purpose, which takes it out of the Review queue (and can be un-kept).
 
 Files that other tools manage (canvas-sync, overleaf, Git repositories) are
 never moved or trashed, and nothing is ever moved into them.
@@ -15,6 +17,7 @@ never moved or trashed, and nothing is ever moved into them.
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 from pathlib import Path, PurePosixPath
 
@@ -44,17 +47,26 @@ def _hash_of(conn: sqlite3.Connection, rel: str) -> str:
 
 # --- Identical copies -----------------------------------------------------------------
 
-def copies(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
-    """Files stored in more than one place, minus the sets you chose to keep."""
-    kept = set(_review(cfg)["kept_copies"])
+def copies(cfg: Config, conn: sqlite3.Connection, *, kept: bool = False) -> list[dict]:
+    """Files stored in more than one place: the sets still to review, or with
+    `kept=True` the sets you marked as on purpose (so they can be un-kept)."""
+    kept_hashes = set(_review(cfg)["kept_copies"])
     return [item for item in index.search(conn, [], {}, limit=None)
-            if len(item["locations"]) > 1 and item["hash"] not in kept]
+            if len(item["locations"]) > 1 and (item["hash"] in kept_hashes) == kept]
 
 
 def keep_copies(cfg: Config, file_hash: str) -> None:
     review = _review(cfg)
     if file_hash not in review["kept_copies"]:
         review["kept_copies"].append(file_hash)
+        records.write_json(_review_path(cfg), review)
+
+
+def unkeep_copies(cfg: Config, file_hash: str) -> None:
+    """Undo `keep_copies`: the set comes back to the Review queue."""
+    review = _review(cfg)
+    if file_hash in review["kept_copies"]:
+        review["kept_copies"].remove(file_hash)
         records.write_json(_review_path(cfg), review)
 
 
@@ -71,15 +83,7 @@ def trash(cfg: Config, conn: sqlite3.Connection, rel: str) -> Path:
         raise Refused("this is the only copy; refs never trashes the last one")
     if reason := rename.blocked_reason(cfg, rel):
         raise Refused(f"refs leaves this file alone: {reason}")
-    source = cfg.absolute(rel)
-    trash_dir = Path.home() / ".Trash"
-    target = trash_dir / source.name
-    number = 2
-    while target.exists():                         # never overwrite something in the Trash
-        target = trash_dir / f"{source.stem} {number}{source.suffix}"
-        number += 1
-    os.rename(source, target)                      # same disk: a move, not a copy
-    return target
+    return rename.to_trash(cfg.absolute(rel))
 
 
 # --- File to… -----------------------------------------------------------------------------
@@ -106,12 +110,9 @@ def destinations(cfg: Config, conn: sqlite3.Connection) -> list[str]:
     return sorted(allowed)
 
 
-def move(cfg: Config, conn: sqlite3.Connection, rel: str, folder: str) -> str:
-    """Move one PDF into `folder` (Dropbox-relative). Returns its new path."""
+def _target(cfg: Config, conn: sqlite3.Connection, rel: str, folder: str) -> tuple[str, Path, Path]:
+    """Check that `rel` may be filed into `folder`. Returns (hash, source, target)."""
     file_hash = _hash_of(conn, rel)
-    folder = folder.strip("/")
-    if reason := rename.blocked_reason(cfg, rel):
-        raise Refused(f"refs leaves this file alone: {reason}")
     if not any(folder == root or folder.startswith(root + "/") for root in cfg.roots):
         raise Refused("that folder is outside the folders refs scans")
     if reason := _folder_allowed(cfg, folder):
@@ -123,7 +124,33 @@ def move(cfg: Config, conn: sqlite3.Connection, rel: str, folder: str) -> str:
     target = target_dir / source.name
     if target.exists():
         raise Refused(f"{folder} already has a file called {source.name}")
+    return file_hash, source, target
+
+
+def move(cfg: Config, conn: sqlite3.Connection, rel: str, folder: str) -> str:
+    """Move one PDF into `folder` (Dropbox-relative). Returns its new path."""
+    folder = folder.strip("/")
+    if reason := rename.blocked_reason(cfg, rel):
+        raise Refused(f"refs leaves this file alone: {reason}")
+    file_hash, source, target = _target(cfg, conn, rel, folder)
     os.rename(source, target)
     new_rel = f"{folder}/{source.name}"
     rename.journal(cfg, rel, new_rel, file_hash, action="move")
+    return new_rel
+
+
+def copy(cfg: Config, conn: sqlite3.Connection, rel: str, folder: str) -> str:
+    """Copy one PDF into `folder`, leaving the original where it is. Returns the copy's path.
+
+    For a PDF that must physically sit in a project folder (one shared with
+    coauthors, say). Unlike a move, the source may be in a managed folder: it
+    is only read. The pair is marked as kept on purpose, so the copy does not
+    turn up in the Review queue.
+    """
+    folder = folder.strip("/")
+    file_hash, source, target = _target(cfg, conn, rel, folder)
+    shutil.copy2(source, target)                   # keeps the modification time
+    new_rel = f"{folder}/{source.name}"
+    rename.journal(cfg, rel, new_rel, file_hash, action="copy")
+    keep_copies(cfg, file_hash)
     return new_rel

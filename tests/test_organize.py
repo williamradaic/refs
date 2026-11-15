@@ -1,4 +1,4 @@
-"""Review actions through the web API: renames, copies, Trash, File to…, and .bib appending.
+"""Review actions through the web API: renames, copies, Trash, File to…, Copy to…, and .bib appending.
 
 Runs against a fake Dropbox (and a fake home folder, so "the Trash" is a
 temporary folder too). Works are given read records directly, as in test_works.
@@ -93,9 +93,14 @@ def test_copies_trash_and_keep(lib):
     assert lib.client.get("/api/copies").json()["items"] == []
 
 
-def test_keep_takes_a_set_out_of_review(lib):
+def test_keep_takes_a_set_out_of_review_and_unkeep_brings_it_back(lib):
     assert lib.client.post("/api/copies/keep", json={"hash": lib.hash}, headers=H).status_code == 200
-    assert lib.client.get("/api/copies").json()["items"] == []
+    found = lib.client.get("/api/copies").json()
+    assert found["items"] == [] and [k["hash"] for k in found["kept"]] == [lib.hash]
+    assert lib.client.post("/api/copies/unkeep", json={"hash": lib.hash}).status_code == 403
+    assert lib.client.post("/api/copies/unkeep", json={"hash": lib.hash}, headers=H).status_code == 200
+    found = lib.client.get("/api/copies").json()
+    assert [i["hash"] for i in found["items"]] == [lib.hash] and found["kept"] == []
 
 
 def test_file_to_moves_into_a_known_folder_and_undoes(lib):
@@ -112,6 +117,33 @@ def test_file_to_moves_into_a_known_folder_and_undoes(lib):
         assert r.status_code == 409
     lib.client.post("/api/undo", json={"count": 1}, headers=H)
     assert (lib.root / DUMP_NAME).exists()
+
+
+def test_copy_to_leaves_the_original_and_undo_trashes_the_copy(lib):
+    (lib.root / READINGS / "blp.pdf").unlink()
+    scan.scan(lib.cfg, index.connect(lib.cfg))
+    copied = lib.client.post("/api/copy", json={"path": DUMP_NAME, "folder": READINGS}, headers=H)
+    assert copied.json() == {"path": f"{READINGS}/w4264.pdf"}
+    assert (lib.root / READINGS / "w4264.pdf").exists() and (lib.root / DUMP_NAME).exists()
+    # The deliberate copy stays out of the Review queue.
+    assert lib.client.get("/api/copies").json()["items"] == []
+    # Same name already there, or a managed folder: refused.
+    again = lib.client.post("/api/copy", json={"path": DUMP_NAME, "folder": READINGS}, headers=H)
+    assert again.status_code == 409
+    r = lib.client.post("/api/copy", json={"path": DUMP_NAME, "folder": "phd/research/bets/overleaf"}, headers=H)
+    assert r.status_code == 409
+    assert lib.client.post("/api/undo", json={"count": 1}, headers=H).json() == {"restored": 1}
+    assert not (lib.root / READINGS / "w4264.pdf").exists()
+    assert (lib.home / ".Trash/w4264.pdf").exists() and (lib.root / DUMP_NAME).exists()
+
+
+def test_undo_never_trashes_a_copy_whose_original_is_gone(lib):
+    (lib.root / READINGS / "blp.pdf").unlink()
+    scan.scan(lib.cfg, index.connect(lib.cfg))
+    lib.client.post("/api/copy", json={"path": DUMP_NAME, "folder": READINGS}, headers=H)
+    (lib.root / DUMP_NAME).unlink()                  # the copy is now the only one
+    assert lib.client.post("/api/undo", json={"count": 1}, headers=H).json() == {"restored": 0}
+    assert (lib.root / READINGS / "w4264.pdf").exists()
 
 
 def test_bookmarklet_page_is_served(lib):

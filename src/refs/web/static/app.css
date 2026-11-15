@@ -282,6 +282,8 @@ header .act { white-space: nowrap; }
 .prop .old { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prop .new { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prop .who { grid-column: 2 / 4; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+details.kept { margin-top: 1.5em; }
+details.kept > summary { cursor: pointer; }
 .copy { display: flex; justify-content: space-between; gap: 2ch; padding: 1px 2ch 1px 4ch; }
 .copy .path { overflow-wrap: anywhere; }
 .copy .acts { flex-wrap: nowrap; }
