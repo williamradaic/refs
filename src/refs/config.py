@@ -22,6 +22,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import contexts
+
 
 def _macos_full_name() -> str:
     """This Mac account's full name ("Jane Doe"), which Preview writes as the
@@ -68,6 +70,15 @@ DEFAULTS: dict = {
     # `**` = any depth. List your own projects' files, not course ones: a
     # course's .bib holds someone else's keys.
     "bib_files": [],
+    # How folders become courses and projects (contexts.py). "folders": each
+    # folder directly inside a watched folder is one. "phd": phd/coursework/
+    # <term>/<course>, phd/research/<project>, ... Rules in `contexts` are
+    # tried first, e.g. ["Classes/{term}/{course}", "Research/{name}"].
+    "layout": "folders",
+    "contexts": [],
+    # Folder names whose PDFs are course material (slides, handouts synced
+    # from a course website), not papers, whatever their names suggest.
+    "material_dirs": [],
     # Optional. Crossref and OpenAlex allow more requests per second to clients
     # that identify themselves with an email. Empty = send none.
     "contact_email": "",
@@ -117,6 +128,9 @@ class Config:
     no_rename: list[str] = field(default_factory=list)
     auto_process: str = "all"
     bib_files: list[str] = field(default_factory=list)
+    layout: str = "folders"
+    contexts: list[str] = field(default_factory=list)
+    material_dirs: list[str] = field(default_factory=list)
     obsidian_vault: Path | None = None   # None = no vault, notes are off
     obsidian_folder: str = "refs"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
@@ -196,6 +210,9 @@ def load() -> Config:
         no_llm=list(settings["no_llm"]),
         no_rename=list(settings["no_rename"]),
         bib_files=list(settings["bib_files"]),
+        layout=_choice(settings["layout"], "layout", set(contexts.PRESETS)),
+        contexts=_rules(settings["contexts"]),
+        material_dirs=[str(name) for name in settings["material_dirs"]],
         # An empty setting must mean "no vault", not Path("") (the current folder).
         obsidian_vault=(Path(settings["obsidian_vault"]).expanduser()
                         if str(settings["obsidian_vault"]).strip() else None),
@@ -216,6 +233,16 @@ def not_set_up(cfg: Config) -> str | None:
                 "(inside your Dropbox), e.g. `roots = [\"papers\", \"papers-dump\"]`, "
                 "to ~/.config/refs/config.toml.")
     return None
+
+
+def _rules(texts: list[str]) -> list[str]:
+    """`contexts` rules, checked now so a typo is reported at once, by name."""
+    for text in texts:
+        try:
+            contexts.Rule.parse(str(text))
+        except contexts.RuleError as error:
+            raise SystemExit(f"config.toml: contexts: {error}.") from None
+    return [str(text) for text in texts]
 
 
 def _choice(value: str, key: str, allowed: set[str]) -> str:

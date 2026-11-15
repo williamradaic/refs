@@ -61,3 +61,17 @@ def test_an_empty_vault_setting_is_not_the_current_folder(tmp_path, monkeypatch,
     settings.write_text('obsidian_vault = ""\n')
     monkeypatch.setenv("REFS_CONFIG", str(settings))
     assert config.load().obsidian_vault is None
+
+
+def test_layout_and_rules_are_checked_when_loading(tmp_path, monkeypatch, cfg):
+    assert (cfg.layout, cfg.contexts, cfg.material_dirs) == ("folders", [], [])
+    settings = tmp_path / "config.toml"
+    monkeypatch.setenv("REFS_CONFIG", str(settings))
+    settings.write_text('layout = "phd"\ncontexts = ["Classes/{term}/{course}"]\n')
+    assert config.load().contexts == ["Classes/{term}/{course}"]
+    settings.write_text('contexts = ["Classes/{semester}"]\n')
+    with pytest.raises(SystemExit, match="unknown placeholder"):
+        config.load()
+    settings.write_text('layout = "law-school"\n')
+    with pytest.raises(SystemExit, match="layout must be one of folders, phd"):
+        config.load()

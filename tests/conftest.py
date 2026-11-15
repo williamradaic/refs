@@ -41,6 +41,8 @@ TEST_LIBRARY = {
     "ignore_dirs": [*config.DEFAULTS["ignore_dirs"], "admin"],
     "no_llm": ["phd/referee"],
     "no_rename": [*config.DEFAULTS["no_rename"], "canvas-sync"],
+    "layout": "phd",
+    "material_dirs": ["canvas-sync"],
     "bib_files": [],                   # tests list their own .bib files
 }
 

@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import bib, config, index, ingest, notes, organize, reading, records, rename, resolve, venues, works
 from .. import ask as asking
+from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
 from .. import scan as scanner
 from ..cli import _split_query
 
@@ -254,6 +255,9 @@ def create_app(watch: bool = False) -> FastAPI:
                 contexts.setdefault(loc["context"], set()).add(item["work_id"])
             for tag in item["tags"][:2]:           # the first tags are the broad fields
                 fields[tag] = fields.get(tag, 0) + 1
+        # Each context's area and term, so the page groups without parsing keys.
+        about = {row["context"]: {"area": row["area"], "term": row["term"]} for row in conn.execute(
+            "SELECT context, MIN(area) AS area, MIN(term) AS term FROM paths GROUP BY context")}
         user = lambda i: (all_works.get(i["work_id"]) or {}).get("user", {})   # noqa: E731
         return {
             "presets": {
@@ -274,7 +278,10 @@ def create_app(watch: bool = False) -> FastAPI:
                     "SELECT COUNT(*) FROM files WHERE status IS NULL "
                     "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
             },
-            "contexts": [{"key": key, "count": len(ids)} for key, ids in sorted(contexts.items())],
+            "contexts": [{"key": key, "count": len(ids), **about.get(key, {})}
+                         for key, ids in sorted(contexts.items())],
+            # Areas the sidebar lists by name, in order (others go under "Other").
+            "areas": contexts_mod.layout_for(cfg).areas,
             "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
             # The quick-add folder's name, for the page's hints ("save it into …").
             "dump": cfg.dump,

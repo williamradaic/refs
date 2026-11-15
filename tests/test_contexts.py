@@ -1,6 +1,11 @@
 """Folder rules, checked against real paths from the Dropbox tree."""
 
-from refs.contexts import course_slug, derive, pretty_topic
+import pytest
+
+from refs.contexts import Layout, RuleError, Rule, course_slug, pretty_topic, term_of
+
+# The "phd" preset on a library watched at phd/ and papers-dump/.
+derive = Layout([], ["phd", "papers-dump"], "papers-dump", "phd").derive
 
 
 def test_course_reading_with_topic():
@@ -58,3 +63,49 @@ def test_pretty_topic():
         "Insurance markets and choice frictions", 10)
     assert pretty_topic("02-demand-estimation-i") == ("Demand estimation I", 2)
     assert pretty_topic("extra") == ("Extra", None)
+
+
+# --- Layouts other than the phd preset ----------------------------------------
+
+def test_generic_layout_makes_each_folder_in_a_root_a_context():
+    lay = Layout([], ["Papers", "Grad School/Classes", "inbox"], "inbox")
+    ctx = lay.derive("Papers/IO/readings/02-entry/bresnahan-reiss-1991.pdf")
+    assert (ctx.key, ctx.area, ctx.slug) == ("Papers/IO", "Papers", "IO")
+    assert (ctx.section, ctx.topic, ctx.topic_order) == ("readings", "Entry", 2)
+    assert lay.derive("Papers/loose.pdf").key == "Papers"
+    # A watched folder deeper in the library: its own name is the area.
+    assert lay.derive("Grad School/Classes/Econ 101/syllabus.pdf").key == "Classes/Econ 101"
+    assert lay.derive("inbox/w32515.pdf").key == "dump"
+    # The sidebar lists the watched folders as areas (the dump has its own place).
+    assert lay.areas == ["Papers", "Classes"]
+
+
+def test_own_rules_come_first_and_name_their_areas():
+    lay = Layout(["Grad/Classes/{term}/{course}", "Grad/Research/{name}"], ["Grad", "inbox"], "inbox")
+    ctx = lay.derive("Grad/Classes/Fall 2025/Econ 240A/notes.pdf")
+    assert (ctx.key, ctx.area, ctx.term, ctx.slug) == ("Classes/2025-fall/240a", "Classes", "2025-fall", "240a")
+    assert lay.derive("Grad/Research/bets/lit/x.pdf").key == "Research/bets"
+    # Other folders in Grad/ still get the generic rule, tried last; but Grad
+    # is reached by the rules, so it is not an area of its own ("Other").
+    assert lay.derive("Grad/Misc/x.pdf").key == "Grad/Misc"
+    assert lay.areas == ["Classes", "Research"]
+
+
+def test_rules_match_folder_names_regardless_of_case():
+    lay = Layout(["papers/{name}"], ["Papers"], "inbox")
+    ctx = lay.derive("Papers/Labor/x.pdf")
+    assert (ctx.key, ctx.area) == ("papers/Labor", "papers")     # the rule's spelling
+
+
+def test_term_folders_in_any_common_spelling():
+    for folder in ["2026-fall", "Fall 2026", "fall-2026", "2026 Autumn", "FALL_2026"]:
+        assert term_of(folder) == "2026-fall"
+    assert term_of("2026-falls") is None and term_of("fall") is None
+
+
+def test_bad_rules_are_reported_by_name():
+    with pytest.raises(RuleError, match="unknown placeholder"):
+        Rule.parse("Classes/{semester}")
+    with pytest.raises(RuleError, match="needs a plain folder name"):
+        Rule.parse("{term}/{course}")
+    assert Rule.parse("{area}").parts == ("{area}",)

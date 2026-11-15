@@ -182,6 +182,25 @@ watches at a time, and an ingest from `refs add` and one from the watcher
 never run together, so no file is paid for twice. The web page reloads its
 list by itself when something changed.
 
+## Courses and projects
+
+refs reads a PDF's course or project off its folders (`src/refs/contexts.py`),
+using rules set in `config.toml`:
+
+| Setting | What it does |
+|---|---|
+| `layout = "folders"` (default) | each folder directly inside a watched folder is a context: `Papers/IO/x.pdf` → `Papers/IO` |
+| `layout = "phd"` | `phd/coursework/<term>/<course>`, `phd/research/<project>`, `phd/referee/<journal>/<manuscript>`, … |
+| `contexts = [...]` | your own rules, tried first, e.g. `["Classes/{term}/{course}", "Research/{name}"]` |
+| `material_dirs = [...]` | folder names whose PDFs are course material, not papers (e.g. a course-site sync folder) |
+
+Placeholders: `{term}` (`2026-fall`, `Fall 2026`, …), `{course}` (`220a`,
+`1-Econ 201A` → `201a`), `{name}` (any folder), `{area}` (any folder, which
+names the area). A rule's area is its last plain folder name, so
+`Classes/{term}/{course}` puts `Classes/Fall 2026/Econ 240A` under "Classes",
+grouped by term. Folders named like `readings/03-demand` still give topics.
+Changing these takes effect at the next scan.
+
 ## Launching
 
 - At login: `refs service install` keeps refs running in the background

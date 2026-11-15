@@ -16,6 +16,13 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+// Order of terms, oldest to newest: "2026-fall" -> 2026*4 + 3. Terms arrive
+// in one form (contexts.term_of). No term sorts before every term.
+const SEASONS = { winter: 0, spring: 1, summer: 2, fall: 3 };
+const termRank = (term) => {
+  const [year, season] = String(term ?? "").split("-");
+  return term ? Number(year) * 4 + (SEASONS[season] ?? 0) : Infinity;
+};
 const esc = (text) => String(text ?? "").replace(/[&<>"]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // Record status: squares (filled = confirmed by a registry, framed = by you,
@@ -147,32 +154,42 @@ async function loadSidebar() {
   // that arrived through Finder). Shown only when there are some.
   if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
 
-  // Contexts arrive as keys like "coursework/2026-fall/220a"; group by area,
-  // and within coursework by term (newest first).
+  // Contexts arrive as keys like "coursework/2026-fall/220a", each with its
+  // area and term. The layout (contexts.py) says which areas get a heading of
+  // their own, in order; within an area that has terms, group by term, newest
+  // first.
   const areas = {};
-  for (const { key, count } of data.contexts) {
-    const [area, ...rest] = key.split("/");
-    (areas[area] ??= []).push({ key, rest, count });
+  for (const { key, count, area, term } of data.contexts) {
+    const name = area ?? key.split("/")[0];
+    const rest = key.split("/").slice(1);          // the key below the area
+    (areas[name] ??= []).push({ key, rest, count, term });
   }
-  for (const area of ["dump", "research", "coursework", "projects", "ra", "referee"]) {
+  const listed = ["dump", ...data.areas];
+  for (const area of listed) {
     if (!areas[area]) continue;
     if (area === "dump") {
-      html += nav("dump", areas.dump[0].count, `data-context="dump"`);
+      html += nav(state.dump, areas.dump[0].count, `data-context="dump"`);
       continue;
     }
     html += `<div class="label">${esc(area)}</div>`;
     let term = null;
-    const entries = areas[area].sort((a, b) => (b.rest[0] ?? "").localeCompare(a.rest[0] ?? ""));
-    for (const { key, rest, count } of area === "coursework" ? entries : areas[area]) {
-      if (area === "coursework" && rest.length > 1 && rest[0] !== term) {
-        term = rest[0];
+    const termed = areas[area].some((c) => c.term);
+    // Contexts without a term first (by name), then terms newest first; the
+    // sort is stable, so a term's courses keep their alphabetical order.
+    const entries = termed
+      ? areas[area].sort((a, b) => termRank(b.term) - termRank(a.term))
+      : areas[area];
+    for (const { key, rest, count, term: t } of entries) {
+      const grouped = Boolean(t) && rest.length > 1;
+      if (grouped && t !== term) {
+        term = t;
         html += `<div class="group">${esc(term)}</div>`;
       }
       const label = rest[rest.length - 1] ?? area;
-      html += nav(label, count, `data-context="${esc(key)}"`, area === "coursework" && rest.length > 1);
+      html += nav(label, count, `data-context="${esc(key)}"`, grouped);
     }
   }
-  const shown = new Set(["dump", "research", "coursework", "projects", "ra", "referee"]);
+  const shown = new Set(listed);
   const others = Object.keys(areas).filter((a) => !shown.has(a));
   if (others.length) html += `<div class="label">Other</div>`;
   for (const area of others) for (const { key, count } of areas[area]) html += nav(key, count, `data-context="${esc(key)}"`);
@@ -472,7 +489,7 @@ async function renderDetail() {
   if (item.citekey) html += `<dt>citekey</dt><dd>${esc(item.citekey)}</dd>`;
   // Keys the project .bib files use for this paper (learned by refs).
   for (const [key, file] of Object.entries(work?.bib_keys ?? {})) {
-    html += `<dt>also</dt><dd>${esc(key)} <span class="badge">· ${esc(file.replace(/^~\/phd\/|^Dropbox\/phd\//, ""))}</span></dd>`;
+    html += `<dt>also</dt><dd>${esc(key)} <span class="badge">· ${esc(file.replace(/^(~|Dropbox)\//, ""))}</span></dd>`;
   }
   if (meta.doi) html += `<dt>doi</dt><dd><a href="https://doi.org/${esc(meta.doi)}" target="_blank" rel="noreferrer">${esc(meta.doi)}</a></dd>`;
   html += `<dt>kind</dt><dd>${esc(item.kind)}</dd>`;
@@ -1039,8 +1056,11 @@ async function openPicker(path, mode = "move") {
   const draw = () => {
     const words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
     const hits = folderList.filter((f) => words.every((w) => f.toLowerCase().includes(w))).slice(0, 14);
+    // A first folder every choice shares ("phd/") says nothing: leave it out.
+    const first = folderList[0]?.split("/")[0];
+    const shared = first && folderList.every((f) => f.startsWith(first + "/")) ? first.length + 1 : 0;
     box.querySelector(".choices").innerHTML = hits.map((f) =>
-      `<div class="choice" data-folder="${esc(f)}">${esc(f.replace(/^phd\//, ""))}</div>`).join("")
+      `<div class="choice" data-folder="${esc(f)}">${esc(f.slice(shared))}</div>`).join("")
       || `<div class="where">no folder matches</div>`;
   };
   input.addEventListener("input", draw);
