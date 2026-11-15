@@ -31,8 +31,14 @@ class Conflict(Exception):
     """The file changed after the page loaded it."""
 
 
-def folder(cfg: Config) -> Path:
-    return cfg.obsidian_vault / cfg.obsidian_folder
+def enabled(cfg: Config) -> bool:
+    """Notes are on when a vault is set and it really is an Obsidian vault."""
+    return cfg.obsidian_vault is not None and (cfg.obsidian_vault / ".obsidian").is_dir()
+
+
+def folder(cfg: Config) -> Path | None:
+    """The folder that holds the notes; None when no vault is set."""
+    return cfg.obsidian_vault / cfg.obsidian_folder if cfg.obsidian_vault else None
 
 
 def path_for(cfg: Config, work: dict) -> Path:
@@ -52,6 +58,10 @@ def _split(text: str) -> tuple[str, str]:
 
 def read(cfg: Config, work: dict) -> dict:
     """What the page needs: the text below the front matter, the version, a link."""
+    if cfg.obsidian_vault is None:
+        # No vault set: the page says notes are off and how to turn them on.
+        return {"body": "", "version": "", "exists": False, "available": False,
+                "file": "", "uri": ""}
     path = path_for(cfg, work)
     try:
         raw = path.read_bytes()
@@ -61,7 +71,7 @@ def read(cfg: Config, work: dict) -> dict:
     relative = f"{cfg.obsidian_folder}/{work['citekey']}"
     return {
         "body": body, "version": _version(raw), "exists": raw is not None,
-        "available": (cfg.obsidian_vault / ".obsidian").is_dir(),
+        "available": enabled(cfg),
         "file": f"{relative}.md",
         # Opens (or, if it is missing, creates) the note in Obsidian.
         "uri": f"obsidian://open?vault={quote(cfg.obsidian_vault.name)}&file={quote(relative)}",
@@ -75,6 +85,8 @@ def bodies(cfg: Config) -> dict[str, str]:
     vault that is missing or unreadable simply yields no notes.
     """
     found: dict[str, str] = {}
+    if folder(cfg) is None:
+        return found
     try:
         paths = sorted(folder(cfg).glob("*.md"))
     except OSError:
@@ -120,8 +132,9 @@ def write(cfg: Config, work: dict, body: str, version: str) -> dict:
     `version` is what read() gave the page. Raises Conflict if the file is no
     longer that version. An empty note that does not exist yet is not created.
     """
-    if not (cfg.obsidian_vault / ".obsidian").is_dir():
-        raise FileNotFoundError(f"no Obsidian vault at {cfg.obsidian_vault}")
+    if not enabled(cfg):
+        raise FileNotFoundError(f"no Obsidian vault at {cfg.obsidian_vault}"
+                                if cfg.obsidian_vault else "notes are off: no Obsidian vault is set")
     path = path_for(cfg, work)
     try:
         raw = path.read_bytes()

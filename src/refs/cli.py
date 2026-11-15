@@ -73,6 +73,9 @@ def _split_query(words: list[str]) -> tuple[list[str], dict[str, str]]:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     cfg = config.load()
+    if problem := config.not_set_up(cfg):
+        print(problem, file=sys.stderr)
+        return 1
     conn = index.connect(cfg)
 
     # A progress line while hashing, only when a person is watching.
@@ -500,14 +503,14 @@ def cmd_add(args: argparse.Namespace) -> int:
         record, _ = resolve.by_ids(target.ids) if target.ids else (None, None)
         if record is None:
             print("Could not identify a paper or find an open PDF from that. "
-                  "Download the PDF yourself and save it into papers-dump.")
+                  f"Download the PDF yourself and save it into {cfg.dump}.")
             return 1
         work = works.create_stub(cfg, record.to_dict(), source_url)
         if args.queue:
             _queue(cfg, work)
         print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})"
               + ("  [queued]" if args.queue else ""))
-        print(f"  @{work['citekey']} . Save the PDF into papers-dump and it will attach itself.")
+        print(f"  @{work['citekey']} . Save the PDF into {cfg.dump} and it will attach itself.")
         return 0
 
     # 3. Index the new file, then read it, file it under its work and, inside
@@ -651,6 +654,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     from .web.app import create_app
 
+    # Not set up yet: still serve (the page works, just empty), but say why.
+    if problem := config.not_set_up(config.load()):
+        print(problem, file=sys.stderr, flush=True)
     url = f"http://refs.localhost:{args.port}"
     print(f"refs is running at {url}  (Ctrl-C to stop)", flush=True)
     if args.open:
@@ -670,6 +676,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     from .watch import Watcher, notify
 
     cfg = config.load()
+    if problem := config.not_set_up(cfg):
+        print(problem, file=sys.stderr)
+        return 1
     watcher = Watcher(cfg, notifier=None if args.quiet else notify)
     if args.once:
         watcher.run_pass()

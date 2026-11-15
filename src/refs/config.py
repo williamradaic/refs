@@ -1,7 +1,8 @@
 """Settings: where Dropbox is, which folders to scan, and what to leave alone.
 
-Defaults live in this file. To change one, create `~/.config/refs/config.toml`
-and set only the keys you want to override, for example:
+Defaults live in this file and are generic: nothing here assumes one person's
+folders. To change one, create `~/.config/refs/config.toml` and set only the
+keys you want to override, for example:
 
     roots = ["phd", "papers-dump", "Theory Reading Group"]
 
@@ -16,35 +17,46 @@ All folder settings are written relative to the Dropbox root (never as
 from __future__ import annotations
 
 import os
+import pwd
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
+def _macos_full_name() -> str:
+    """This Mac account's full name ("Jane Doe"), which Preview writes as the
+    author of your highlights and notes. "" if the account has none."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].strip()
+    except (KeyError, OSError):
+        return ""
+
+
 # --- Defaults ---------------------------------------------------------------
 
 DEFAULTS: dict = {
-    # Folders (relative to the Dropbox root) that are scanned for PDFs.
-    "roots": ["phd", "papers-dump"],
+    # Folders (relative to the Dropbox root) that are scanned for PDFs. None
+    # until you choose: refs never guesses which of your folders hold papers.
+    "roots": [],
     # The quick-add folder: the one place the app is allowed to rename freely.
     "dump": "papers-dump",
     # Where the app keeps its own record files inside Dropbox. Never scanned.
-    "state_dir": "phd/tools/refs",
-    # Folders left out entirely: visa, immigration and insurance paperwork.
-    # They are not references, and must never reach an index or an LLM.
-    # Single files can be listed too (say, a transcript inside a course folder).
-    "exclude_paths": ["phd/admission", "phd/move-in"],
+    "state_dir": ".refs",
+    # Folders left out entirely, e.g. visa, immigration and insurance paperwork:
+    # not references, and they must never reach an index or an LLM. Single
+    # files can be listed too (say, a transcript inside a course folder).
+    "exclude_paths": [],
     # Folder names skipped everywhere (compared case-insensitively). Figure
-    # folders hold plots, not documents; `_versions` holds old canvas-sync copies.
-    # `admin` is where paperwork goes (reimbursements, contracts, the `local/admin`
-    # of the project layout): any folder of that name is never read.
+    # folders hold plots, not documents; `_versions` holds old synced copies.
     "ignore_dirs": [
         ".git", ".claude", ".venv", "node_modules", "__pycache__",
-        "_versions", "fig", "figs", "figures", "admin",
+        "_versions", "fig", "figs", "figures",
     ],
     # Path prefixes whose contents are never sent to an LLM (confidential).
-    "no_llm": ["phd/referee"],
-    # Folder names whose files the app must never rename (managed by other tools).
-    "no_rename": ["canvas-sync", "overleaf"],
+    "no_llm": [],
+    # Folder names whose files the app must never rename (managed by other
+    # tools; Overleaf's Dropbox sync is the common one).
+    "no_rename": ["overleaf"],
     # What the folder watcher (part of `refs serve`) reads when a new PDF
     # appears: "all" = new PDFs anywhere under the roots (about $0.001 each),
     # "dump" = only those saved into the dump, "none" = keep the index current
@@ -53,23 +65,18 @@ DEFAULTS: dict = {
     # Project .bib files whose citation keys refs learns (bibkeys.py), so a
     # paper cited as `BLP95` in a project is found by that key too. Read only.
     # "~/..." or "/..." = a path on this Mac; anything else = inside Dropbox.
-    # `**` = any depth. Course and TA folders are left out on purpose: their
-    # .bib files are someone else's keys.
-    "bib_files": [
-        "~/phd/research/*/overleaf/**/*.bib",
-        "~/phd/research/*/*.bib",
-        "~/phd/ra/*/overleaf/**/*.bib",
-        "~/phd/projects/*/overleaf/**/*.bib",
-        "phd/research/**/*.bib",
-    ],
+    # `**` = any depth. List your own projects' files, not course ones: a
+    # course's .bib holds someone else's keys.
+    "bib_files": [],
     # Optional. Crossref and OpenAlex allow more requests per second to clients
     # that identify themselves with an email. Empty = send none.
     "contact_email": "",
     # Reading notes (notes.py): one Markdown file per paper, named by citekey,
     # in this folder of this Obsidian vault. The vault is a path on this Mac
     # ("~/..."), not in Dropbox; the folder is relative to the vault.
-    "obsidian_vault": "~/wr-vault",
-    "obsidian_folder": "phd/refs",
+    # "" = no vault: notes are off.
+    "obsidian_vault": "",
+    "obsidian_folder": "refs",
     # Semantic search (embed.py): the local model that turns each paper's text
     # into a vector. Changing it re-embeds the library at the next scan (about
     # a minute). "BAAI/bge-base-en-v1.5" is the larger, somewhat better option.
@@ -85,11 +92,9 @@ DEFAULTS: dict = {
     # in a PDF mark it as being read or read; marks by anyone else (an
     # instructor's highlights on a course reading) are not counted. Preview
     # writes your macOS name, the iPad apps the device name; "" counts marks
-    # saved with no author. Compared without regard to case.
-    "annotation_authors": [
-        "William Radaic", "William", "William Radaic Peron",
-        "iPad Pro 11-inch (3rd generation)", "",
-    ],
+    # saved with no author. Compared without regard to case. The default is
+    # this Mac account's name; add your iPad's name in config.toml.
+    "annotation_authors": [name for name in [_macos_full_name()] if name] + [""],
 }
 
 
@@ -105,15 +110,15 @@ class Config:
     index_db: Path              # local SQLite index (rebuildable cache)
     roots: list[str] = field(default_factory=list)
     dump: str = "papers-dump"
-    state_dir: str = "phd/tools/refs"
+    state_dir: str = ".refs"
     exclude_paths: list[str] = field(default_factory=list)
     ignore_dirs: frozenset[str] = frozenset()
     no_llm: list[str] = field(default_factory=list)
     no_rename: list[str] = field(default_factory=list)
     auto_process: str = "all"
     bib_files: list[str] = field(default_factory=list)
-    obsidian_vault: Path = Path.home() / "wr-vault"
-    obsidian_folder: str = "phd/refs"
+    obsidian_vault: Path | None = None   # None = no vault, notes are off
+    obsidian_folder: str = "refs"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     ask: str = "auto"
     ask_monthly_cap: float = 1.0
@@ -191,7 +196,9 @@ def load() -> Config:
         no_llm=list(settings["no_llm"]),
         no_rename=list(settings["no_rename"]),
         bib_files=list(settings["bib_files"]),
-        obsidian_vault=Path(settings["obsidian_vault"]).expanduser(),
+        # An empty setting must mean "no vault", not Path("") (the current folder).
+        obsidian_vault=(Path(settings["obsidian_vault"]).expanduser()
+                        if str(settings["obsidian_vault"]).strip() else None),
         obsidian_folder=str(settings["obsidian_folder"]).strip("/"),
         auto_process=_choice(settings["auto_process"], "auto_process", {"all", "dump", "none"}),
         embedding_model=str(settings["embedding_model"]),
@@ -199,6 +206,16 @@ def load() -> Config:
         ask_monthly_cap=float(settings["ask_monthly_cap"]),
         annotation_authors=[str(name) for name in settings["annotation_authors"]],
     )
+
+
+def not_set_up(cfg: Config) -> str | None:
+    """Why refs cannot do its job yet, or None when it can. With the generic
+    defaults no folder is scanned until you choose some."""
+    if not cfg.roots:
+        return ("refs has no folders to scan yet. Add the folders that hold your papers "
+                "(inside your Dropbox), e.g. `roots = [\"papers\", \"papers-dump\"]`, "
+                "to ~/.config/refs/config.toml.")
+    return None
 
 
 def _choice(value: str, key: str, allowed: set[str]) -> str:

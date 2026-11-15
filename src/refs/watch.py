@@ -90,7 +90,8 @@ class Watcher:
         self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths]]
         # Reading notes (in the Obsidian vault, outside Dropbox): an edited note
         # changes what search finds, so it too starts a pass.
-        self._notes = str(notes.folder(cfg))
+        # None when no vault is set (notes off): then no note path is relevant.
+        self._notes = str(notes.folder(cfg)) if notes.folder(cfg) else None
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._first_event = self._last_event = 0.0
@@ -106,7 +107,7 @@ class Watcher:
 
     def relevant(self, path: str, is_directory: bool) -> bool:
         """Could a change at this path change the index?"""
-        if path.startswith(self._notes + os.sep):
+        if self._notes and path.startswith(self._notes + os.sep):
             name = os.path.basename(path)
             return not is_directory and name.endswith(".md") and not name.startswith(".")
         if any(path == skip or path.startswith(skip + os.sep) for skip in self._skip):
@@ -149,7 +150,7 @@ class Watcher:
             top = self.cfg.absolute(root)
             if top.is_dir():
                 self._observer.schedule(handler, str(top), recursive=True)
-        if os.path.isdir(self._notes):
+        if self._notes and os.path.isdir(self._notes):
             self._observer.schedule(handler, self._notes, recursive=False)
         self._observer.daemon = True
         self._observer.start()

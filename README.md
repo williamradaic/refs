@@ -93,8 +93,9 @@ markup in the PDF (`src/refs/reading.py`):
 
 Pages with marks count, not marks: you may highlight one paragraph in ten
 pieces. Only marks whose author is you count, so an instructor's highlights on
-a course reading do not; the names are `annotation_authors` in `config.py`
-(Preview writes your macOS name, the iPad apps the device name). What you set
+a course reading do not; the names are `annotation_authors` in `config.toml`
+(Preview writes your macOS name, the iPad apps the device name; the default
+is your macOS name only). What you set
 always wins, and detection only ever raises a status. The detail panel says
 where a status came from ("from your markup on 39/57 pages"). Each PDF is read
 for marks once per content (about 4 ms); annotating it changes the content, so
@@ -119,9 +120,9 @@ filled in; Enter adds it.
 remembers the key each one uses for a library paper, so `refs find o2006optimal`
 finds O'Donoghue and Rabin (2006) even though refs calls it
 `odonoghue2006optimal`. The detail panel lists these keys with their file, and
-`refs status` lists the files read. Which files: `bib_files` in `config.py`
-(the research, RA and project repositories, and `phd/research` in Dropbox; not
-course or TA folders); override it in `config.toml`. Matching is by DOI, or by
+`refs status` lists the files read. Which files: `bib_files` in `config.toml`
+(none by default; list your own projects' files, not course ones, whose keys
+are someone else's). Matching is by DOI, or by
 exactly the same title; keys are recomputed on every scan.
 
 **`--append`** never adds a paper the `.bib` already holds under any key

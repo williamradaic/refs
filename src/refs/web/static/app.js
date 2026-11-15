@@ -12,6 +12,7 @@ const state = {
   adding: false,      // true while the bar is in "add a paper" mode
   picked: new Set(),  // renames view: paths ticked for renaming
   lastBatch: 0,       // how many renames the last "rename selected" did (for undo)
+  dump: "papers-dump", // the quick-add folder's name (config.toml `dump`), from the sidebar
 };
 
 const $ = (id) => document.getElementById(id);
@@ -126,6 +127,7 @@ function say(text, ms = 4000) {
 
 async function loadSidebar() {
   const data = await get("/api/sidebar");
+  state.dump = data.dump || state.dump;
   const nav = (label, count, attrs, sub = false) =>
     `<div class="nav${sub ? " sub" : ""}" ${attrs}><span>${esc(label)}</span><span class="n">${count}</span></div>`;
 
@@ -511,7 +513,7 @@ async function renderDetail() {
       <div class="acts"><button class="act" data-identify="${esc(item.locations[0].path)}">identify it now</button></div>`;
   }
   html += `<div class="label">Files</div>`;
-  if (!item.locations.length) html += `<p class="where">no pdf yet. Save it into papers-dump and it attaches itself.</p>`;
+  if (!item.locations.length) html += `<p class="where">no pdf yet. Save it into ${esc(state.dump)} and it attaches itself.</p>`;
   for (const loc of item.locations) {
     const place = [loc.context, loc.topic ?? loc.section].filter(Boolean).join(" · ");
     html += `<div class="loc"><div>${esc(place)}</div>
@@ -561,8 +563,8 @@ let noteTimer = null;
 
 function noteHtml(work, data) {
   if (!data.available) {
-    return `<div class="label">Notes</div><p class="where">No Obsidian vault found. Set
-      <code>obsidian_vault</code> in ~/.config/refs/config.toml.</p>`;
+    return `<div class="label">Notes</div><p class="where">Notes are off: no Obsidian vault is set
+      (or it was not found). Set <code>obsidian_vault</code> in ~/.config/refs/config.toml.</p>`;
   }
   return `<div class="label">Notes</div>
     <textarea id="note" class="note" data-work="${esc(work.id)}" spellcheck="true"
@@ -821,7 +823,7 @@ async function follow(start, label) {
       break;
     }
   } catch {
-    say(`lost contact with refs while adding ${label}. The file, if saved, is in papers-dump.`, 0);
+    say(`lost contact with refs while adding ${label}. The file, if saved, is in ${state.dump}.`, 0);
   }
   loadSidebar(); search();
 }

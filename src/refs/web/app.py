@@ -276,6 +276,8 @@ def create_app(watch: bool = False) -> FastAPI:
             },
             "contexts": [{"key": key, "count": len(ids)} for key, ids in sorted(contexts.items())],
             "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
+            # The quick-add folder's name, for the page's hints ("save it into …").
+            "dump": cfg.dump,
         }
 
     @app.get("/api/work/{work_id}")
