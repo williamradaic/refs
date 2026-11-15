@@ -1,8 +1,10 @@
 """The `refs` command.
 
+    refs init                 set refs up (the first-run questions; the web page asks them too)
+    refs doctor               check that everything is in order
     refs scan                 bring the index in line with Dropbox
     refs status               what the library holds
-    refs find blp             search; add filters like course:220a kind:paper
+    refs find blp             search; add filters like course:101 kind:paper
     refs ask "IO paper on ice cream"   let Haiku rank the candidates (about $0.0005)
     refs contexts             the courses and projects the app has recognised
     refs dupes                files stored in more than one place
@@ -73,6 +75,9 @@ def _split_query(words: list[str]) -> tuple[list[str], dict[str, str]]:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     cfg = config.load()
+    if problem := config.not_set_up(cfg):
+        print(problem, file=sys.stderr)
+        return 1
     conn = index.connect(cfg)
 
     # A progress line while hashing, only when a person is watching.
@@ -124,6 +129,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     data = {
         "dropbox_root": str(cfg.dropbox_root),
         "roots": cfg.roots,
+        "dump": cfg.dump,                       # the quick-add folder
+        "never_sent_to_ai": cfg.no_llm,         # confidential folders (no_llm)
         "index": str(cfg.index_db),
         "last_scan": (conn.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone() or [None])[0],
         "locations": one("SELECT COUNT(*) FROM paths"),
@@ -151,8 +158,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if data["last_scan"] is None:
         print("The index is empty. Run `refs scan` first.")
         return 0
-    print(f"Dropbox     {data['dropbox_root']}")
+    print(f"Library at  {data['dropbox_root']}")
     print(f"Scanning    {', '.join(data['roots'])}")
+    print(f"Quick-add   {data['dump']}")
+    if data["never_sent_to_ai"]:
+        print(f"Private     {', '.join(data['never_sent_to_ai'])} (never sent to an AI)")
     print(f"Last scan   {data['last_scan']}")
     print(f"Library     {_plural(data['files'], 'distinct file')} in "
           f"{_plural(data['locations'], 'location')} "
@@ -342,7 +352,7 @@ def cmd_process(args: argparse.Namespace) -> int:
     conn = index.connect(cfg)
     terms, filters = _split_query(args.query)
     if not terms and not filters and not args.all:
-        print("Say which files (e.g. `refs process course:220a kind:paper`), or pass --all.",
+        print("Say which files (e.g. `refs process course:101 kind:paper`), or pass --all.",
               file=sys.stderr)
         return 2
     # Works without a PDF have nothing to read.
@@ -369,6 +379,16 @@ def cmd_process(args: argparse.Namespace) -> int:
     print(f"{_plural(len(files), 'file')} selected, {len(todo):,} to process.")
     if not todo:
         return 0
+    # A large run says what it costs first (budget.py); --yes skips the question.
+    from . import budget
+    if len(todo) > budget.BULK and not args.yes and not args.relookup:
+        question = f"Reading {len(todo):,} PDFs costs about ${budget.estimate(len(todo)):.2f}. Go ahead? [y/N] "
+        if not sys.stdin.isatty():
+            print(f"{question.split(' Go')[0]} Run again with --yes to go ahead.", file=sys.stderr)
+            return 1
+        if not input(question).strip().lower().startswith("y"):
+            print("Nothing was read.")
+            return 1
 
     api = llm.client()
     topics = pipeline.known_topics(cfg)
@@ -388,6 +408,7 @@ def cmd_process(args: argparse.Namespace) -> int:
             if not read["reused_reading"]:      # a reused reading costs nothing now
                 for key in totals:
                     totals[key] += read["usage"].get(key, 0)
+                budget.record(conn, llm.cost(read["usage"]))     # counts toward the month
             meta = pipeline.final_metadata(read)
             kind = (read.get("reading") or {}).get("kind") or "?"
             who = ", ".join(meta["surnames"][:3]) + (" et al." if len(meta["surnames"]) > 3 else "")
@@ -500,14 +521,14 @@ def cmd_add(args: argparse.Namespace) -> int:
         record, _ = resolve.by_ids(target.ids) if target.ids else (None, None)
         if record is None:
             print("Could not identify a paper or find an open PDF from that. "
-                  "Download the PDF yourself and save it into papers-dump.")
+                  f"Download the PDF yourself and save it into {cfg.dump}.")
             return 1
         work = works.create_stub(cfg, record.to_dict(), source_url)
         if args.queue:
             _queue(cfg, work)
         print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})"
               + ("  [queued]" if args.queue else ""))
-        print(f"  @{work['citekey']} . Save the PDF into papers-dump and it will attach itself.")
+        print(f"  @{work['citekey']} . Save the PDF into {cfg.dump} and it will attach itself.")
         return 0
 
     # 3. Index the new file, then read it, file it under its work and, inside
@@ -651,6 +672,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     from .web.app import create_app
 
+    # Not set up yet: still serve (the page works, just empty), but say why.
+    if problem := config.not_set_up(config.load()):
+        print(problem, file=sys.stderr, flush=True)
     url = f"http://refs.localhost:{args.port}"
     print(f"refs is running at {url}  (Ctrl-C to stop)", flush=True)
     if args.open:
@@ -670,6 +694,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
     from .watch import Watcher, notify
 
     cfg = config.load()
+    if problem := config.not_set_up(cfg):
+        print(problem, file=sys.stderr)
+        return 1
     watcher = Watcher(cfg, notifier=None if args.quiet else notify)
     if args.once:
         watcher.run_pass()
@@ -752,6 +779,196 @@ def cmd_service(args: argparse.Namespace) -> int:
     actions = {"install": service.install, "uninstall": service.uninstall,
                "restart": service.restart, "status": service.status}
     print(actions[args.action]())
+    # Not set up yet: the page's first-run screens ask the questions.
+    if args.action == "install" and service.is_loaded() and config.not_set_up(config.load()):
+        url = f"http://refs.localhost:{service.PORT}"
+        print(f"Opening {url} to set refs up (or run `refs init` here).")
+        subprocess.Popen(["open", url])
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Set refs up in the terminal: the questions of the first-run page."""
+    import getpass
+    from pathlib import Path
+
+    from . import keys, onboarding, service, settings
+
+    cfg = config.load()
+    if config.not_set_up(cfg) is None and not args.again:
+        print(f"refs is already set up (watching {', '.join(cfg.roots)}). Change settings on the "
+              "settings page (key `,`), or start over with `refs init --again`.")
+        return 0
+
+    def ask(prompt: str, default: str = "") -> str:
+        shown = f" [{default}]" if default else ""
+        return input(f"{prompt}{shown}: ").strip() or default
+
+    def pick(answer: str, options: list[str]) -> list[str]:
+        """Numbers from a printed list, or the texts themselves."""
+        chosen = []
+        for token in answer.replace(",", " ").split():
+            chosen.append(options[int(token) - 1] if token.isdigit() and 0 < int(token) <= len(options)
+                          else token.strip("/"))
+        return chosen
+
+    print("Set up refs. Enter takes the [default]; Ctrl-C stops without saving anything.\n")
+    try:
+        # 1. The library folder.
+        libraries = onboarding.library_candidates()
+        if cfg.dropbox_root != Path.home().resolve() and all(l["path"] != str(cfg.dropbox_root) for l in libraries):
+            libraries.insert(0, {"label": "set now", "path": str(cfg.dropbox_root)})
+        print("Where do you keep your papers? (the library folder)")
+        for i, lib in enumerate(libraries, 1):
+            print(f"  {i}. {lib['label']:<13} {lib['path']}")
+        library = pick(ask("Number, or a path", "1"), [lib["path"] for lib in libraries])[0]
+        library = str(Path(library).expanduser().resolve())
+
+        # 2. The folders with papers.
+        print("\nCounting PDFs …")
+        found = onboarding.survey(Path(library))
+        top = sorted((c for c in found["tree"]["children"] if c["pdfs"]), key=lambda c: -c["pdfs"])
+        for i, c in enumerate(top, 1):
+            print(f"  {i:>2}. {c['pdfs']:>7,}  {c['name']}")
+        roots: list[str] = []
+        while not roots:
+            roots = pick(ask("Which hold papers? Numbers like `1 3`, or paths inside the library"),
+                         [c["path"] for c in top])
+
+        # 3. The quick-add folder.
+        print("\nPapers you add in refs are saved in the quick-add folder (created if new).")
+        dump = ask("Quick-add folder", cfg.dump).strip("/")
+
+        # 4. Private folders: suggestions from folder names, then any others.
+        exclude: list[str] = []
+        no_llm: list[str] = []
+        offered = [s for s in found["suggestions"] if onboarding._under(s["path"], roots)]
+        if offered:
+            print("\nFolders whose names suggest they are private:")
+            for i, s in enumerate(offered, 1):
+                what = "never send to Claude" if s["kind"] == "no_llm" else "leave out entirely"
+                print(f"  {i}. [{'x' if s['ticked'] else ' '}] {s['path']}  ({what})")
+            ticked = " ".join(str(i) for i, s in enumerate(offered, 1) if s["ticked"])
+            answer = ask("Which to use (numbers; `none` for none)", ticked or "none")
+            for path in pick("" if answer == "none" else answer, [s["path"] for s in offered]):
+                kind = next((s["kind"] for s in offered if s["path"] == path), "exclude")
+                (no_llm if kind == "no_llm" else exclude).append(path)
+        exclude += pick(ask("Other folders to leave out entirely (paths, or Enter)"), [])
+        no_llm += pick(ask("Other folders to keep from Claude (paths, or Enter)"), [])
+
+        # 5. Reading notes in Obsidian.
+        vaults = settings.obsidian_vaults()
+        print("\nReading notes can be Markdown files in an Obsidian vault.")
+        for i, vault in enumerate(vaults, 1):
+            print(f"  {i}. {vault}")
+        answer = ask("Vault (number or path; `none` for no notes)", "1" if vaults else "none")
+        vault = "" if answer == "none" else pick(answer, vaults)[0]
+
+        # 6. The API key and what to read.
+        print("\nTo tell what each PDF is, refs sends the text of its first three pages (an image of")
+        print("page one for scans) to Claude Haiku, then checks Crossref and OpenAlex. Never file")
+        print("names, notes or private folders. About $0.001 a PDF, on your own Anthropic API key.")
+        if settings.api_key_status() == "missing":
+            for _ in range(2):
+                key = getpass.getpass("Anthropic API key (hidden; Enter to skip for now): ").strip()
+                if not key:
+                    break
+                if problem := keys.problem_with(key):
+                    print(f"  {problem}.")
+                    continue
+                keys.set_api_key(key)
+                print("  Saved in the macOS Keychain.")
+                break
+        n = onboarding.pdfs_in(found["tree"], roots, exclude)
+        cost = onboarding.estimate(n)
+        answer = ask(f"Read [a]ll {n:,} PDFs now (about ${cost['dollars']:.2f}), only papers [d]umped "
+                     "from now on, or [n]othing", "d").lower()[:1]
+        auto = {"a": "all", "n": "none"}.get(answer, "dump")
+    except (KeyboardInterrupt, EOFError):
+        print("\nStopped; nothing was saved.")
+        return 1
+
+    changes = {"dropbox_root": library, "roots": roots, "dump": dump, "exclude_paths": exclude,
+               "no_llm": no_llm, "obsidian_vault": vault, "auto_process": auto,
+               "contexts": onboarding.rules_for(found, roots)}
+    try:
+        saved = settings.save(changes)
+    except settings.SettingError as error:
+        print(f"Not saved: {error}. Run `refs init` again.")
+        return 1
+    print(f"\nSaved {config.config_path()}.")
+    for rule in saved.contexts:
+        print(f"  Courses: {rule} (term folders found)")
+
+    # 7. Running in the background: a running refs must restart to see the new settings.
+    # The login service reads the default settings file only; with another one
+    # (REFS_CONFIG), it is left alone.
+    import os
+    if os.environ.get("REFS_CONFIG"):
+        print("These settings are not the default file, so the background service was left alone.")
+    elif service.is_loaded():
+        print(service.restart(), "refs is following your folders at", f"http://refs.localhost:{service.PORT}")
+    elif ask("\nStart refs in the background now and at login? [Y/n]", "y").lower().startswith("y"):
+        print(service.install())
+    else:
+        print("Start it with `refs serve --open`, or index now with `refs scan`.")
+    if auto == "all":
+        print("Reading happens in the background; the page shows each paper as it is read.")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check settings, library, index, key, spending, notes, model and service."""
+    from . import doctor
+
+    found = doctor.checks(online=not args.offline)
+    for check in found:
+        print(f"  {check.state} {check.name:<13} {check.detail}")
+        if check.fix:
+            print(f"    {'':<13} → {check.fix}")
+    bad = sum(c.state == doctor.BAD for c in found)
+    print("\nAll in order." if not bad else f"\n{bad} problem{'s' if bad > 1 else ''} above.")
+    return 1 if bad else 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Take refs off this Mac: service, index, caches, log, settings, key."""
+    from . import doctor
+
+    cfg = config.load()
+    items = doctor.leftovers(cfg, args.keep_settings, args.keep_key)
+    print("This removes from this Mac:")
+    for what, path in items:
+        print(f"  - {what}" + (f"  ({doctor._home(path)})" if path else ""))
+    print("It keeps your PDFs, your notes, and refs' records in "
+          f"{doctor._home(cfg.absolute(cfg.state_dir))} (a reinstall picks them up again;")
+    print("delete that folder yourself if you will not).")
+    if not items:
+        print("Nothing to remove.")
+    elif not args.yes:
+        if not sys.stdin.isatty():
+            print("Run again with --yes to go ahead.", file=sys.stderr)
+            return 1
+        if not input("Go ahead? [y/N] ").strip().lower().startswith("y"):
+            print("Nothing was removed.")
+            return 1
+    for line in doctor.uninstall(cfg, args.keep_settings, args.keep_key):
+        print(f"  removed {line}")
+    print("Last step, to remove the program itself: uv tool uninstall refs")
+    return 0
+
+
+def cmd_skill(args: argparse.Namespace) -> int:
+    """Install the agent skill, or say where it is installed."""
+    from . import agents
+
+    if args.action == "install":
+        for line in agents.install():
+            print(line)
+        print("Agents now know to look papers up with refs (start a new agent session).")
+    else:
+        for name, dest, state in agents.status():
+            print(f"{name:<13} {state:<8} {dest}")
     return 0
 
 
@@ -759,22 +976,11 @@ def cmd_setup_key(args: argparse.Namespace) -> int:
     """Store the Anthropic API key in the macOS Keychain and check that it works."""
     import getpass
 
-    import anthropic
-
-    from . import keys, llm
+    from . import keys
 
     key = getpass.getpass("Paste your Anthropic API key (it will not be shown): ").strip()
-    if not key.startswith("sk-ant-"):
-        print("That does not look like an Anthropic API key (it should start with sk-ant-).")
-        return 1
-    try:
-        # A free request that only succeeds with a valid key.
-        anthropic.Anthropic(api_key=key).models.retrieve(llm.MODEL)
-    except anthropic.AuthenticationError:
-        print("Anthropic rejected that key. Nothing was saved.")
-        return 1
-    except anthropic.APIConnectionError:
-        print("Could not reach Anthropic to check the key. Nothing was saved; try again.")
+    if problem := keys.problem_with(key):
+        print(f"{problem[0].upper()}{problem[1:]}. Nothing was saved.")
         return 1
     keys.set_api_key(key)
     print("Key saved to the macOS Keychain (item \"refs\") and verified.")
@@ -798,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_status)
 
-    p = sub.add_parser("find", help="search, e.g. `refs find demand course:220a`")
+    p = sub.add_parser("find", help="search, e.g. `refs find demand course:101`")
     p.add_argument("query", nargs="*", help="words and key:value filters")
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--all", action="store_true", help="no limit")
@@ -815,7 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_ask)
 
-    p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:bets`")
+    p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:thesis`")
     p.add_argument("query", nargs="+", help="words and key:value filters, as in `find`")
     p.add_argument("--limit", type=int, default=1, help="how many matches when searching by words")
     p.add_argument("--append", metavar="FILE.bib",
@@ -867,6 +1073,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--relookup", action="store_true",
                    help="repeat only the registry lookup, reusing the saved reading (free)")
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--yes", action="store_true", help="do not ask before reading many PDFs")
     p.set_defaults(run=cmd_process)
 
     p = sub.add_parser("eval", help="check results against convention-style file names")
@@ -898,6 +1105,24 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("setup-key", help="store the Anthropic API key in the Keychain")
     p.set_defaults(run=cmd_setup_key)
+
+    p = sub.add_parser("doctor", help="check that everything is in order (send this when asking for help)")
+    p.add_argument("--offline", action="store_true", help="skip the checks that use the network")
+    p.set_defaults(run=cmd_doctor)
+
+    p = sub.add_parser("uninstall", help="remove refs' service, index, caches, settings and key from this Mac")
+    p.add_argument("--keep-settings", action="store_true", help="keep ~/.config/refs/config.toml")
+    p.add_argument("--keep-key", action="store_true", help="keep the API key in the Keychain")
+    p.add_argument("--yes", action="store_true", help="do not ask before removing")
+    p.set_defaults(run=cmd_uninstall)
+
+    p = sub.add_parser("skill", help="teach coding agents (Claude Code, Codex) to use refs")
+    p.add_argument("action", choices=["install", "status"], nargs="?", default="status")
+    p.set_defaults(run=cmd_skill)
+
+    p = sub.add_parser("init", help="set refs up: the first-run questions, in the terminal")
+    p.add_argument("--again", action="store_true", help="ask again although refs is set up")
+    p.set_defaults(run=cmd_init)
 
     args = parser.parse_args(argv)
     return args.run(args)

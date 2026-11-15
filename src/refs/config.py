@@ -1,7 +1,8 @@
 """Settings: where Dropbox is, which folders to scan, and what to leave alone.
 
-Defaults live in this file. To change one, create `~/.config/refs/config.toml`
-and set only the keys you want to override, for example:
+Defaults live in this file and are generic: nothing here assumes one person's
+folders. To change one, create `~/.config/refs/config.toml` and set only the
+keys you want to override, for example:
 
     roots = ["phd", "papers-dump", "Theory Reading Group"]
 
@@ -16,35 +17,48 @@ All folder settings are written relative to the Dropbox root (never as
 from __future__ import annotations
 
 import os
+import pwd
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import contexts
+
+
+def _macos_full_name() -> str:
+    """This Mac account's full name ("Jane Doe"), which Preview writes as the
+    author of your highlights and notes. "" if the account has none."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].strip()
+    except (KeyError, OSError):
+        return ""
+
+
 # --- Defaults ---------------------------------------------------------------
 
 DEFAULTS: dict = {
-    # Folders (relative to the Dropbox root) that are scanned for PDFs.
-    "roots": ["phd", "papers-dump"],
+    # Folders (relative to the Dropbox root) that are scanned for PDFs. None
+    # until you choose: refs never guesses which of your folders hold papers.
+    "roots": [],
     # The quick-add folder: the one place the app is allowed to rename freely.
     "dump": "papers-dump",
     # Where the app keeps its own record files inside Dropbox. Never scanned.
-    "state_dir": "phd/tools/refs",
-    # Folders left out entirely: visa, immigration and insurance paperwork.
-    # They are not references, and must never reach an index or an LLM.
-    # Single files can be listed too (say, a transcript inside a course folder).
-    "exclude_paths": ["phd/admission", "phd/move-in"],
+    "state_dir": ".refs",
+    # Folders left out entirely, e.g. visa, immigration and insurance paperwork:
+    # not references, and they must never reach an index or an LLM. Single
+    # files can be listed too (say, a transcript inside a course folder).
+    "exclude_paths": [],
     # Folder names skipped everywhere (compared case-insensitively). Figure
-    # folders hold plots, not documents; `_versions` holds old canvas-sync copies.
-    # `admin` is where paperwork goes (reimbursements, contracts, the `local/admin`
-    # of the project layout): any folder of that name is never read.
+    # folders hold plots, not documents; `_versions` holds old synced copies.
     "ignore_dirs": [
         ".git", ".claude", ".venv", "node_modules", "__pycache__",
-        "_versions", "fig", "figs", "figures", "admin",
+        "_versions", "fig", "figs", "figures",
     ],
     # Path prefixes whose contents are never sent to an LLM (confidential).
-    "no_llm": ["phd/referee"],
-    # Folder names whose files the app must never rename (managed by other tools).
-    "no_rename": ["canvas-sync", "overleaf"],
+    "no_llm": [],
+    # Folder names whose files the app must never rename (managed by other
+    # tools; Overleaf's Dropbox sync is the common one).
+    "no_rename": ["overleaf"],
     # What the folder watcher (part of `refs serve`) reads when a new PDF
     # appears: "all" = new PDFs anywhere under the roots (about $0.001 each),
     # "dump" = only those saved into the dump, "none" = keep the index current
@@ -53,23 +67,27 @@ DEFAULTS: dict = {
     # Project .bib files whose citation keys refs learns (bibkeys.py), so a
     # paper cited as `BLP95` in a project is found by that key too. Read only.
     # "~/..." or "/..." = a path on this Mac; anything else = inside Dropbox.
-    # `**` = any depth. Course and TA folders are left out on purpose: their
-    # .bib files are someone else's keys.
-    "bib_files": [
-        "~/phd/research/*/overleaf/**/*.bib",
-        "~/phd/research/*/*.bib",
-        "~/phd/ra/*/overleaf/**/*.bib",
-        "~/phd/projects/*/overleaf/**/*.bib",
-        "phd/research/**/*.bib",
-    ],
+    # `**` = any depth. List your own projects' files, not course ones: a
+    # course's .bib holds someone else's keys.
+    "bib_files": [],
+    # How folders become courses and projects (contexts.py). "folders": each
+    # folder directly inside a watched folder is one. "phd": phd/coursework/
+    # <term>/<course>, phd/research/<project>, ... Rules in `contexts` are
+    # tried first, e.g. ["Classes/{term}/{course}", "Research/{name}"].
+    "layout": "folders",
+    "contexts": [],
+    # Folder names whose PDFs are course material (slides, handouts synced
+    # from a course website), not papers, whatever their names suggest.
+    "material_dirs": [],
     # Optional. Crossref and OpenAlex allow more requests per second to clients
     # that identify themselves with an email. Empty = send none.
     "contact_email": "",
     # Reading notes (notes.py): one Markdown file per paper, named by citekey,
     # in this folder of this Obsidian vault. The vault is a path on this Mac
     # ("~/..."), not in Dropbox; the folder is relative to the vault.
-    "obsidian_vault": "~/wr-vault",
-    "obsidian_folder": "phd/refs",
+    # "" = no vault: notes are off.
+    "obsidian_vault": "",
+    "obsidian_folder": "refs",
     # Semantic search (embed.py): the local model that turns each paper's text
     # into a vector. Changing it re-embeds the library at the next scan (about
     # a minute). "BAAI/bge-base-en-v1.5" is the larger, somewhat better option.
@@ -81,15 +99,17 @@ DEFAULTS: dict = {
     # Dollars per calendar month that asking may spend (about $0.0005 a question).
     # Once reached, searches stay local until the next month.
     "ask_monthly_cap": 1.0,
+    # Dollars per calendar month that reading new PDFs on its own (the folder
+    # watcher) may spend, about $0.001 a PDF (budget.py). Papers you add
+    # yourself are always read.
+    "read_monthly_cap": 10.0,
     # Annotation authors that mean you (reading.py). Your highlights and notes
     # in a PDF mark it as being read or read; marks by anyone else (an
     # instructor's highlights on a course reading) are not counted. Preview
     # writes your macOS name, the iPad apps the device name; "" counts marks
-    # saved with no author. Compared without regard to case.
-    "annotation_authors": [
-        "William Radaic", "William", "William Radaic Peron",
-        "iPad Pro 11-inch (3rd generation)", "",
-    ],
+    # saved with no author. Compared without regard to case. The default is
+    # this Mac account's name; add your iPad's name in config.toml.
+    "annotation_authors": [name for name in [_macos_full_name()] if name] + [""],
 }
 
 
@@ -105,19 +125,24 @@ class Config:
     index_db: Path              # local SQLite index (rebuildable cache)
     roots: list[str] = field(default_factory=list)
     dump: str = "papers-dump"
-    state_dir: str = "phd/tools/refs"
+    state_dir: str = ".refs"
     exclude_paths: list[str] = field(default_factory=list)
     ignore_dirs: frozenset[str] = frozenset()
     no_llm: list[str] = field(default_factory=list)
     no_rename: list[str] = field(default_factory=list)
     auto_process: str = "all"
     bib_files: list[str] = field(default_factory=list)
-    obsidian_vault: Path = Path.home() / "wr-vault"
-    obsidian_folder: str = "phd/refs"
+    layout: str = "folders"
+    contexts: list[str] = field(default_factory=list)
+    material_dirs: list[str] = field(default_factory=list)
+    obsidian_vault: Path | None = None   # None = no vault, notes are off
+    obsidian_folder: str = "refs"
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     ask: str = "auto"
     ask_monthly_cap: float = 1.0
+    read_monthly_cap: float = 10.0
     annotation_authors: list[str] = field(default_factory=list)
+    contact_email: str = ""     # also read on its own by contact_email() below
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -126,7 +151,7 @@ class Config:
 
 # --- Loading ----------------------------------------------------------------
 
-def _find_dropbox_root() -> Path:
+def find_dropbox() -> Path | None:
     """Locate the Dropbox folder: modern macOS location first, then the classic one."""
     candidates = [
         Path.home() / "Library" / "CloudStorage" / "Dropbox",
@@ -137,14 +162,35 @@ def _find_dropbox_root() -> Path:
             # resolve() follows symlinks, so ~/Dropbox and the CloudStorage path
             # end up as the same string. Every stored path is relative to this.
             return candidate.resolve()
+    return None
+
+
+def _library_root(watched: list[str]) -> Path:
+    """No library folder set: Dropbox if there is one. Before setup (nothing
+    watched yet) your home folder stands in, so refs starts and onboarding can
+    ask; once folders are watched, a missing library is an error, because
+    scanning the wrong folder would make the whole library look deleted."""
+    found = find_dropbox()
+    if found is not None:
+        return found
+    if not watched:
+        return Path.home().resolve()
     raise SystemExit(
-        "Could not find a Dropbox folder. Set REFS_DROPBOX_ROOT or add "
-        "`dropbox_root = \"/path/to/Dropbox\"` to ~/.config/refs/config.toml."
+        "Could not find the library folder (no Dropbox found). Set it on the settings page, "
+        "or add `dropbox_root = \"/path/to/folder\"` to ~/.config/refs/config.toml."
     )
 
 
-def load() -> Config:
+def config_path() -> Path:
+    """Where your settings file is: ~/.config/refs/config.toml, or REFS_CONFIG."""
+    return Path(os.environ.get("REFS_CONFIG", Path.home() / ".config" / "refs" / "config.toml"))
+
+
+def load(config_file: Path | None = None) -> Config:
     """Build the Config from defaults, then the optional file, then environment.
+
+    `config_file` reads another file instead of config_path() (settings.py
+    uses it to check a change before saving it).
 
     Environment variables (used mainly by the tests):
       REFS_CONFIG        path to a config file other than ~/.config/refs/config.toml
@@ -154,9 +200,7 @@ def load() -> Config:
     settings = dict(DEFAULTS)
 
     # Optional user file: only the keys present there replace the defaults.
-    config_file = Path(
-        os.environ.get("REFS_CONFIG", Path.home() / ".config" / "refs" / "config.toml")
-    )
+    config_file = config_file or config_path()
     if config_file.is_file():
         with config_file.open("rb") as handle:
             user = tomllib.load(handle)
@@ -169,7 +213,8 @@ def load() -> Config:
         settings.update(user)
 
     root_setting = os.environ.get("REFS_DROPBOX_ROOT") or settings.get("dropbox_root")
-    dropbox_root = Path(root_setting).expanduser().resolve() if root_setting else _find_dropbox_root()
+    dropbox_root = (Path(root_setting).expanduser().resolve() if root_setting
+                    else _library_root(list(settings["roots"])))
 
     # The index is a cache and stays OUT of Dropbox: syncing a live SQLite file
     # between machines corrupts it.
@@ -191,14 +236,40 @@ def load() -> Config:
         no_llm=list(settings["no_llm"]),
         no_rename=list(settings["no_rename"]),
         bib_files=list(settings["bib_files"]),
-        obsidian_vault=Path(settings["obsidian_vault"]).expanduser(),
+        layout=_choice(settings["layout"], "layout", set(contexts.PRESETS)),
+        contexts=_rules(settings["contexts"]),
+        material_dirs=[str(name) for name in settings["material_dirs"]],
+        # An empty setting must mean "no vault", not Path("") (the current folder).
+        obsidian_vault=(Path(settings["obsidian_vault"]).expanduser()
+                        if str(settings["obsidian_vault"]).strip() else None),
         obsidian_folder=str(settings["obsidian_folder"]).strip("/"),
         auto_process=_choice(settings["auto_process"], "auto_process", {"all", "dump", "none"}),
         embedding_model=str(settings["embedding_model"]),
         ask=_choice(settings["ask"], "ask", {"auto", "never"}),
         ask_monthly_cap=float(settings["ask_monthly_cap"]),
+        read_monthly_cap=float(settings["read_monthly_cap"]),
         annotation_authors=[str(name) for name in settings["annotation_authors"]],
+        contact_email=str(settings["contact_email"]).strip(),
     )
+
+
+def not_set_up(cfg: Config) -> str | None:
+    """Why refs cannot do its job yet, or None when it can. With the generic
+    defaults no folder is scanned until you choose some."""
+    if not cfg.roots:
+        return ("refs is not set up yet: no folders to watch. Run `refs init`, or open "
+                "http://refs.localhost:8377 (or `refs serve --open`), to choose them.")
+    return None
+
+
+def _rules(texts: list[str]) -> list[str]:
+    """`contexts` rules, checked now so a typo is reported at once, by name."""
+    for text in texts:
+        try:
+            contexts.Rule.parse(str(text))
+        except contexts.RuleError as error:
+            raise SystemExit(f"config.toml: contexts: {error}.") from None
+    return [str(text) for text in texts]
 
 
 def _choice(value: str, key: str, allowed: set[str]) -> str:
@@ -210,8 +281,7 @@ def _choice(value: str, key: str, allowed: set[str]) -> str:
 
 def contact_email() -> str:
     """The email to show registries, if you chose to set one in config.toml."""
-    config_file = Path(
-        os.environ.get("REFS_CONFIG", Path.home() / ".config" / "refs" / "config.toml"))
+    config_file = config_path()
     try:
         with config_file.open("rb") as handle:
             return str(tomllib.load(handle).get("contact_email", "")).strip()

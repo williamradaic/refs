@@ -197,7 +197,8 @@ def _detect_reading(cfg: Config, conn: sqlite3.Connection, all_works: dict) -> l
 
 # --- Provisional document kind ------------------------------------------------
 
-def guess_kind(rel: str, ctx: contexts.Context, guess: naming.NameGuess) -> str:
+def guess_kind(rel: str, ctx: contexts.Context, guess: naming.NameGuess,
+               material_dirs: list[str] = ()) -> str:
     """First, cheap guess at what a PDF is, from its name and folder alone.
 
     Phase 2 replaces this with a classification that actually reads the PDF.
@@ -230,7 +231,8 @@ def guess_kind(rel: str, ctx: contexts.Context, guess: naming.NameGuess) -> str:
                      r"|(?<![a-z])sections?(?![a-z])", text):
             return "slides"
 
-    if ctx.section == "canvas-sync":
+    # A course-site sync folder (config.toml `material_dirs`, e.g. canvas-sync).
+    if ctx.section and ctx.section.lower() in {d.lower() for d in material_dirs}:
         return "course-material"
     # Anything inside a readings/<topic>/ folder, or named like "Author 2017".
     if ctx.topic or guess.looks_like_paper:
@@ -254,8 +256,9 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
     by_hash: dict[str, list[tuple[str, contexts.Context]]] = {}
 
     # 1. Context columns for every path.
+    layout = contexts.layout_for(cfg)
     for row in conn.execute("SELECT path, hash FROM paths").fetchall():
-        ctx = contexts.derive(row["path"], cfg.dump)
+        ctx = layout.derive(row["path"])
         conn.execute(
             "UPDATE paths SET context=?, area=?, term=?, slug=?, section=?, topic=?, "
             "topic_order=? WHERE path=?",
@@ -284,7 +287,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
         # Defaults: guessed from names and folders.
         kind_ctx = next((ctx for _, _, ctx in guesses if ctx.topic), best_ctx)
         title, authors, year = best.title, best.authors, best.year
-        kind, kind_source = guess_kind(best_path, kind_ctx, best), "path"
+        kind, kind_source = guess_kind(best_path, kind_ctx, best, cfg.material_dirs), "path"
         status = venue = doi = description = None
         tags: list[str] = []
 

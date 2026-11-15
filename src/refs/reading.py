@@ -72,6 +72,28 @@ def count_marks(path: Path, authors: set[str]) -> tuple[int, int, int]:
         doc.close()
 
 
+def marks_by_author(path: Path) -> dict[str, int]:
+    """How many highlights, underlines, notes and ink marks each author left in
+    one PDF, by the name as written ("" = no author). For the settings page,
+    which lets you pick the names that are you."""
+    found: dict[str, int] = {}
+    try:
+        doc = pymupdf.open(path)
+    except Exception:                                   # noqa: BLE001 (damaged, encrypted, not a PDF)
+        return found
+    try:
+        for page in doc:
+            for a in page.annots() or []:
+                if a.type[1] in MARKUP:
+                    name = (a.info.get("title") or "").strip()
+                    found[name] = found.get(name, 0) + 1
+    except Exception:                                   # noqa: BLE001 (broken page tree)
+        pass
+    finally:
+        doc.close()
+    return found
+
+
 def detect(pages: int, marked_pages: int) -> str | None:
     """The read status your marks suggest: "read", "reading", or None (no sign)."""
     if not pages or marked_pages < STARTED_MIN_PAGES:

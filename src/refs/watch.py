@@ -33,7 +33,7 @@ from typing import Callable
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from . import index, ingest, notes
+from . import budget, index, ingest, notes
 from . import scan as scanner
 from .config import Config
 
@@ -81,16 +81,9 @@ class Watcher:
 
     def __init__(self, cfg: Config, *, quiet: float = QUIET_SECONDS,
                  notifier: Callable[[str, str], None] | None = notify) -> None:
-        self.cfg = cfg
         self.quiet = quiet
         self.notifier = notifier
-        root = str(cfg.dropbox_root)
-        # Folders whose changes never matter: the app's own records (written
-        # by every pass, so watching them would loop) and excluded paths.
-        self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths]]
-        # Reading notes (in the Obsidian vault, outside Dropbox): an edited note
-        # changes what search finds, so it too starts a pass.
-        self._notes = str(notes.folder(cfg))
+        self._use(cfg)
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._first_event = self._last_event = 0.0
@@ -101,12 +94,57 @@ class Watcher:
         self.generation = 0
         self.last_pass: str | None = None
         self.last_message = ""
+        # The pass in progress: {"stage": scanning|indexing|reading, "done", "total"}.
+        self.progress: dict | None = None
+        # A large batch of unread PDFs waiting for your OK ({"pdfs", "dollars"}),
+        # whether you gave it, and whether the monthly limit stopped reading.
+        self.held: dict | None = None
+        self._approved = False
+        self.limit_reached = False
+
+    def _use(self, cfg: Config) -> None:
+        """Take these settings: what to watch, and what to ignore."""
+        self.cfg = cfg
+        root = str(cfg.dropbox_root)
+        # Folders whose changes never matter: the app's own records (written
+        # by every pass, so watching them would loop) and excluded paths.
+        self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths]]
+        # Reading notes (in the Obsidian vault, outside Dropbox): an edited note
+        # changes what search finds, so it too starts a pass.
+        # None when no vault is set (notes off): then no note path is relevant.
+        self._notes = str(notes.folder(cfg)) if notes.folder(cfg) else None
+
+    def _schedule(self) -> None:
+        """Ask FSEvents for changes in the watched folders and the notes folder."""
+        self._observer.unschedule_all()
+        handler = _Handler(self)
+        for root in self.cfg.roots:
+            top = self.cfg.absolute(root)
+            if top.is_dir():
+                self._observer.schedule(handler, str(top), recursive=True)
+        if self._notes and os.path.isdir(self._notes):
+            self._observer.schedule(handler, self._notes, recursive=False)
+
+    def approve(self) -> None:
+        """You said yes to the batch the page showed: read it in the next pass."""
+        self._approved = True
+        self.poke()
+
+    def reconfigure(self, cfg: Config) -> None:
+        """Settings changed (the settings page): watch what they now say, and
+        run a pass soon. The pass in progress, if any, finishes first: passes
+        run one at a time on the watcher's own thread."""
+        self._use(cfg)
+        if self._observer is not None:
+            self._schedule()
+            _log(f"settings changed: watching {', '.join(cfg.roots)} (reading new PDFs: {cfg.auto_process})")
+            self.poke()
 
     # --- events ----------------------------------------------------------------------
 
     def relevant(self, path: str, is_directory: bool) -> bool:
         """Could a change at this path change the index?"""
-        if path.startswith(self._notes + os.sep):
+        if self._notes and path.startswith(self._notes + os.sep):
             name = os.path.basename(path)
             return not is_directory and name.endswith(".md") and not name.startswith(".")
         if any(path == skip or path.startswith(skip + os.sep) for skip in self._skip):
@@ -144,13 +182,7 @@ class Watcher:
             return False
 
         self._observer = Observer()
-        handler = _Handler(self)
-        for root in self.cfg.roots:
-            top = self.cfg.absolute(root)
-            if top.is_dir():
-                self._observer.schedule(handler, str(top), recursive=True)
-        if os.path.isdir(self._notes):
-            self._observer.schedule(handler, self._notes, recursive=False)
+        self._schedule()
         self._observer.daemon = True
         self._observer.start()
         _log(f"watching {', '.join(self.cfg.roots)} (reading new PDFs: {self.cfg.auto_process})")
@@ -197,15 +229,40 @@ class Watcher:
         with ingest.exclusive(cfg):
             conn = index.connect(cfg)
             try:
-                report = scanner.scan(cfg, conn)
+                report = scanner.scan(cfg, conn, progress=self._scanning)
                 pending = ([] if cfg.auto_process == "none" else
                            ingest.unread_files(cfg, conn, dump_only=cfg.auto_process == "dump"))
-                results = ingest.ingest(cfg, conn, pending) if pending else []
+                # Papers in the quick-add folder (you added them) are read; a large
+                # batch anywhere else waits for your OK on the page (budget.py).
+                added = [p for p in pending if ingest.in_dump(cfg, p[0])]
+                others = [p for p in pending if not ingest.in_dump(cfg, p[0])]
+                if len(others) > budget.BULK and not self._approved:
+                    self.held = {"pdfs": len(others), "dollars": budget.estimate(len(others))}
+                    others = []
+                else:
+                    self.held = None
+                    if others:
+                        self._approved = False          # an OK covers one batch
+                pending = added + others
+                # Reading on its own stops at the monthly limit.
+                left = budget.left_this_month(cfg, conn)
+                results = (ingest.ingest(cfg, conn, pending, progress=self._reading, budget_left=left)
+                           if pending else [])
+                self.limit_reached = any(r.skipped and "reading limit" in r.skipped for r in results)
             finally:
                 conn.close()
+                self.progress = None
         self.last_pass = datetime.now().isoformat(timespec="seconds")
         self._report(report, results)
         return results
+
+    def _scanning(self, done: int, total: int) -> None:
+        # After the last file is hashed, the index and search vectors are
+        # rebuilt (the first time, the search model is downloaded).
+        self.progress = {"stage": "indexing" if done >= total else "scanning", "done": done, "total": total}
+
+    def _reading(self, done: int, total: int) -> None:
+        self.progress = {"stage": "reading", "done": done, "total": total}
 
     # --- telling you what happened ---------------------------------------------------------
 
@@ -265,4 +322,6 @@ class Watcher:
 
     def status(self) -> dict:
         return {"watching": self._observer is not None, "generation": self.generation,
-                "last_pass": self.last_pass, "message": self.last_message}
+                "last_pass": self.last_pass, "message": self.last_message,
+                "progress": self.progress, "pending": self._wake.is_set(),
+                "held": self.held, "limit_reached": self.limit_reached}

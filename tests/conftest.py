@@ -30,18 +30,44 @@ def fake_encoder(texts: list[str], query: bool) -> np.ndarray:
     return rows / np.maximum(norms, 1e-12)
 
 
-@pytest.fixture(autouse=True)
-def no_real_bib_files(monkeypatch):
-    # The default `bib_files` point at real project folders under ~/phd. Tests
-    # must not depend on (or read) those: they list their own .bib files.
-    monkeypatch.setitem(config.DEFAULTS, "bib_files", [])
+# The tests' library is laid out like a PhD student's Dropbox (phd/coursework/
+# <term>/<course>, phd/research/<project>, a papers-dump), with private folders
+# to keep out. These settings describe it; the shipped defaults are generic.
+TEST_LIBRARY = {
+    "roots": ["phd", "papers-dump"],
+    "dump": "papers-dump",
+    "state_dir": "phd/tools/refs",
+    "exclude_paths": ["phd/admission", "phd/move-in"],
+    "ignore_dirs": [*config.DEFAULTS["ignore_dirs"], "admin"],
+    "no_llm": ["phd/referee"],
+    "no_rename": [*config.DEFAULTS["no_rename"], "canvas-sync"],
+    "layout": "phd",
+    "material_dirs": ["canvas-sync"],
+    "bib_files": [],                   # tests list their own .bib files
+}
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "generic_defaults: run with the shipped defaults, not the test library's")
 
 
 @pytest.fixture(autouse=True)
-def isolated_vault_and_model(monkeypatch, tmp_path):
-    # Nor may they read the real Obsidian vault, or load (and download) the
-    # real embedding model: a throwaway vault and the fake model above.
+def test_library_settings(monkeypatch, tmp_path, request):
+    # Never the real ~/.config/refs/config.toml (it names real folders, a real
+    # vault and real .bib files). A test that needs a file sets its own.
+    monkeypatch.setenv("REFS_CONFIG", str(tmp_path / "no-config.toml"))
+    if request.node.get_closest_marker("generic_defaults"):
+        return
+    for key, value in TEST_LIBRARY.items():
+        monkeypatch.setitem(config.DEFAULTS, key, value)
+    # A throwaway Obsidian vault, never the real one.
     monkeypatch.setitem(config.DEFAULTS, "obsidian_vault", str(tmp_path / "test-vault"))
+
+
+@pytest.fixture(autouse=True)
+def fake_model():
+    # Never load (and download) the real embedding model: the fake one above.
     embed.set_encoder(fake_encoder)
     yield
     embed.set_encoder(None)

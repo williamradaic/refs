@@ -217,3 +217,33 @@ def test_keys_from_project_bib_files_become_search_keys(cfg, tmp_path, monkeypat
     (project / "references.bib").write_text("")
     works.sync(cfg)
     assert "bib_keys" not in works.load_all(cfg)[by_file["aaa"]]
+
+
+# --- data versions (records.SCHEMA) --------------------------------------------------
+
+def test_files_carry_their_data_version(tmp_path):
+    from refs import records
+    path = tmp_path / "w1.json"
+    records.write_json(path, {"id": "w1"})
+    assert records.read_json(path) == {"id": "w1", "schema": records.SCHEMA}
+
+
+def test_a_newer_refs_file_is_never_overwritten(tmp_path):
+    from refs import records
+    path = tmp_path / "w1.json"
+    path.write_text('{"id": "w1", "schema": 99, "new_field": 1}')
+    with pytest.raises(records.NewerData, match="newer version of refs"):
+        records.write_json(path, {"id": "w1"})
+    assert '"new_field": 1' in path.read_text()
+
+
+def test_syncing_twice_writes_nothing_the_second_time(cfg):
+    # The "schema" key must not make every work look changed (Dropbox churn).
+    write_read(cfg, "aaa", title="Automobile Prices in Market Equilibrium", family="Berry",
+               year=1995, doi="10.2307/2171802", venue="Econometrica")
+    works.sync(cfg)
+    files = list(works.works_dir(cfg).glob("*.json"))
+    stamps = {f: f.stat().st_mtime_ns for f in files}
+    assert files and all(json.loads(f.read_text())["schema"] == 1 for f in files)
+    works.sync(cfg)
+    assert {f: f.stat().st_mtime_ns for f in files} == stamps

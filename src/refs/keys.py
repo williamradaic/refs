@@ -20,3 +20,22 @@ def get_api_key() -> str | None:
 
 def set_api_key(key: str) -> None:
     keyring.set_password(SERVICE, ACCOUNT, key)
+
+
+def problem_with(key: str) -> str | None:
+    """Why this key cannot be used, or None if Anthropic accepts it. Asks for
+    the model's description: free, and it only succeeds with a valid key."""
+    import anthropic
+
+    from . import llm
+
+    key = key.strip()
+    if not key.startswith("sk-ant-") or any(c.isspace() for c in key):
+        return "that does not look like an Anthropic API key (it starts with sk-ant-)"
+    try:
+        anthropic.Anthropic(api_key=key).models.retrieve(llm.MODEL)
+    except anthropic.AuthenticationError:
+        return "Anthropic rejected that key"
+    except anthropic.APIConnectionError:
+        return "could not reach Anthropic to check the key; try again"
+    return None

@@ -20,16 +20,25 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import bib, config, index, ingest, notes, organize, reading, records, rename, resolve, venues, works
+from .. import (bib, config, index, ingest, keys, notes, onboarding, organize, reading, records, rename, resolve,
+                settings, venues, works)
 from .. import ask as asking
+from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
 from .. import scan as scanner
 from ..cli import _split_query
 
 STATIC = Path(__file__).parent / "static"
+
+
+def _refs_origin(origin: str) -> bool:
+    """Is this Origin header one of refs' own addresses (any port)?"""
+    from urllib.parse import urlsplit
+    host = (urlsplit(origin).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1", "refs.test"} or host.endswith(".localhost")
 
 
 def create_app(watch: bool = False) -> FastAPI:
@@ -50,6 +59,11 @@ def create_app(watch: bool = False) -> FastAPI:
             watcher.stop()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+
+    # A file written by a newer refs is never overwritten (records.py): say so.
+    @app.exception_handler(records.NewerData)
+    async def newer_data(_request, error: records.NewerData):
+        return JSONResponse({"error": str(error), "detail": str(error)}, status_code=409)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     # --- who may talk to this server -----------------------------------------------
@@ -60,6 +74,18 @@ def create_app(watch: bool = False) -> FastAPI:
         client = request.client.host if request.client else ""
         if client not in {"127.0.0.1", "::1", "testclient"}:
             return PlainTextResponse("refs only answers this computer.", status_code=403)
+        return await call_next(request)
+
+    # 3. Only from refs' own page. A browser names the site a request comes from
+    #    (Origin) on every POST; anything that changes something must come from a
+    #    refs address. Requests without an Origin (the command line, scripts) are
+    #    still held to the X-Refs header that guard() checks.
+    @app.middleware("http")
+    async def same_site_only(request, call_next):
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            if origin is not None and not _refs_origin(origin):
+                return PlainTextResponse("refs only takes changes from its own page.", status_code=403)
         return await call_next(request)
 
     # The page's own files change with every update of refs: tell the browser
@@ -254,6 +280,9 @@ def create_app(watch: bool = False) -> FastAPI:
                 contexts.setdefault(loc["context"], set()).add(item["work_id"])
             for tag in item["tags"][:2]:           # the first tags are the broad fields
                 fields[tag] = fields.get(tag, 0) + 1
+        # Each context's area and term, so the page groups without parsing keys.
+        about = {row["context"]: {"area": row["area"], "term": row["term"]} for row in conn.execute(
+            "SELECT context, MIN(area) AS area, MIN(term) AS term FROM paths GROUP BY context")}
         user = lambda i: (all_works.get(i["work_id"]) or {}).get("user", {})   # noqa: E731
         return {
             "presets": {
@@ -274,8 +303,13 @@ def create_app(watch: bool = False) -> FastAPI:
                     "SELECT COUNT(*) FROM files WHERE status IS NULL "
                     "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
             },
-            "contexts": [{"key": key, "count": len(ids)} for key, ids in sorted(contexts.items())],
+            "contexts": [{"key": key, "count": len(ids), **about.get(key, {})}
+                         for key, ids in sorted(contexts.items())],
+            # Areas the sidebar lists by name, in order (others go under "Other").
+            "areas": contexts_mod.layout_for(cfg).areas,
             "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
+            # The quick-add folder's name, for the page's hints ("save it into …").
+            "dump": cfg.dump,
         }
 
     @app.get("/api/work/{work_id}")
@@ -520,6 +554,120 @@ def create_app(watch: bool = False) -> FastAPI:
             raise HTTPException(404)
         subprocess.run(["open", *(["-R"] if reveal else []), str(cfg.absolute(path))])
         return {"ok": True}
+
+    # --- settings (settings.py) ---------------------------------------------------------
+
+    def apply_settings(new_cfg: config.Config) -> None:
+        """Use new settings from now on, without a restart. Every endpoint reads
+        `cfg` when it runs, so replacing it here is enough for them. The watcher
+        is told too; its next pass rescans (and reads new PDFs as auto_process
+        says). Without a watcher (--no-watch) a plain scan runs, which reads
+        nothing new."""
+        nonlocal cfg
+        cfg = new_cfg
+        if watcher is not None:
+            watcher.reconfigure(new_cfg)
+        else:
+            threading.Thread(target=lambda: scanner.scan(new_cfg, index.connect(new_cfg)),
+                             daemon=True).start()
+
+    @app.get("/api/settings")
+    def get_settings():
+        """The settings page: config.toml as refs reads it now, field by field."""
+        try:
+            return settings.current()
+        except SystemExit as error:                   # the file has a mistake in it
+            return JSONResponse({"error": str(error)}, status_code=400)
+
+    @app.post("/api/settings")
+    def save_settings(changes: dict = Body(embed=True), approve_reads: bool = Body(default=False, embed=True),
+                      x_refs: str | None = Header(default=None)):
+        """Check and save changed settings, then use them at once. `approve_reads`:
+        the first run's "read everything", whose cost the page showed, counts as
+        your OK for the batch it starts (budget.py)."""
+        guard(x_refs)
+        try:
+            new_cfg = settings.save(changes)
+        except settings.SettingError as error:
+            return JSONResponse({"error": str(error), "key": error.key}, status_code=400)
+        apply_settings(new_cfg)
+        if approve_reads and watcher is not None:
+            watcher.approve()
+        return settings.current(new_cfg)
+
+    @app.post("/api/read/approve")
+    def approve_reads(x_refs: str | None = Header(default=None)) -> dict:
+        """Yes to the batch of unread PDFs the page showed: read them now."""
+        guard(x_refs)
+        if watcher is not None:
+            watcher.approve()
+        return {"ok": watcher is not None}
+
+    @app.post("/api/settings/folder")
+    def choose_folder(prompt: str = Body(embed=True), kind: str = Body(default="folders", embed=True),
+                      x_refs: str | None = Header(default=None)) -> dict:
+        """Open the macOS folder dialog (it appears on this Mac, in front)."""
+        guard(x_refs)
+        start = cfg.obsidian_vault.parent if kind == "vault" and cfg.obsidian_vault \
+            else Path.home() if kind in {"vault", "library"} else cfg.dropbox_root
+        chosen = settings.choose_folder(prompt, start)
+        if chosen is None:
+            return {"path": None}
+        # Folders inside the library are shown and stored relative to it.
+        if kind in {"folders", "folder"}:
+            try:
+                return {"path": str(chosen.resolve().relative_to(cfg.dropbox_root))}
+            except ValueError:
+                return {"path": None, "error": f"{chosen} is not inside the library folder"}
+        return {"path": str(chosen)}
+
+    # --- first run (onboarding.py); the answers are saved through /api/settings ------------
+
+    @app.get("/api/onboarding")
+    def onboarding_state() -> dict:
+        """Whether refs still needs setting up, and what the first-run page offers."""
+        from .. import service
+        # The library folder refs was given (config.toml or REFS_DROPBOX_ROOT)
+        # comes first; your home folder only stands in when none was found.
+        libraries = onboarding.library_candidates()
+        if cfg.dropbox_root != Path.home().resolve() and \
+                all(lib["path"] != str(cfg.dropbox_root) for lib in libraries):
+            libraries.insert(0, {"label": "set now", "path": str(cfg.dropbox_root)})
+        return {
+            "needed": config.not_set_up(cfg) is not None,
+            "libraries": libraries,
+            "library": str(cfg.dropbox_root),
+            "dump": cfg.dump,
+            "vaults": settings.obsidian_vaults(),
+            "api_key": settings.api_key_status(),
+            "watching": watcher is not None,
+            "service": "running" if service.is_loaded() else "installed" if service.PLIST.exists() else "none",
+            "cost_per_pdf": onboarding.COST_PER_PDF,
+            "read_cap": cfg.read_monthly_cap,
+        }
+
+    @app.get("/api/onboarding/survey")
+    def onboarding_survey(root: str) -> dict:
+        """Folders of a would-be library folder, with PDF counts (only looks)."""
+        folder = Path(root).expanduser()
+        if not folder.is_dir():
+            return JSONResponse({"error": f"there is no folder {root}"}, status_code=400)
+        return onboarding.survey(folder.resolve())
+
+    @app.get("/api/settings/authors")
+    def found_authors() -> dict:
+        """Annotation author names in the library's PDFs (a few seconds)."""
+        return {"authors": settings.annotation_authors(cfg, index.connect(cfg))}
+
+    @app.post("/api/settings/key")
+    def save_key(key: str = Body(embed=True), x_refs: str | None = Header(default=None)):
+        """Store the Anthropic API key in the Keychain. It is never sent back."""
+        guard(x_refs)
+        key = key.strip()
+        if problem := keys.problem_with(key):         # checked with Anthropic first
+            return JSONResponse({"error": problem}, status_code=400)
+        keys.set_api_key(key)
+        return {"api_key": settings.api_key_status()}
 
     @app.post("/api/scan")
     def rescan(x_refs: str | None = Header(default=None)) -> dict:

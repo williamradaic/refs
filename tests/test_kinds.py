@@ -1,12 +1,15 @@
 """Provisional document kinds, guessed from names and folders only."""
 
-from refs.contexts import derive
+from refs.contexts import Layout
 from refs.index import guess_kind
 from refs.naming import parse_filename
 
+# The "phd" preset, with canvas-sync as course material (as in the test library).
+derive = Layout([], ["phd", "papers-dump"], "papers-dump", "phd").derive
+
 
 def kind(rel: str) -> str:
-    return guess_kind(rel, derive(rel), parse_filename(rel.rsplit("/", 1)[-1]))
+    return guess_kind(rel, derive(rel), parse_filename(rel.rsplit("/", 1)[-1]), ["canvas-sync"])
 
 
 def test_papers():
