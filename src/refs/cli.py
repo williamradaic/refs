@@ -1,6 +1,7 @@
 """The `refs` command.
 
     refs init                 set refs up (the first-run questions; the web page asks them too)
+    refs doctor               check that everything is in order
     refs scan                 bring the index in line with Dropbox
     refs status               what the library holds
     refs find blp             search; add filters like course:220a kind:paper
@@ -911,6 +912,47 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Check settings, library, index, key, spending, notes, model and service."""
+    from . import doctor
+
+    found = doctor.checks(online=not args.offline)
+    for check in found:
+        print(f"  {check.state} {check.name:<13} {check.detail}")
+        if check.fix:
+            print(f"    {'':<13} → {check.fix}")
+    bad = sum(c.state == doctor.BAD for c in found)
+    print("\nAll in order." if not bad else f"\n{bad} problem{'s' if bad > 1 else ''} above.")
+    return 1 if bad else 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Take refs off this Mac: service, index, caches, log, settings, key."""
+    from . import doctor
+
+    cfg = config.load()
+    items = doctor.leftovers(cfg, args.keep_settings, args.keep_key)
+    print("This removes from this Mac:")
+    for what, path in items:
+        print(f"  - {what}" + (f"  ({doctor._home(path)})" if path else ""))
+    print("It keeps your PDFs, your notes, and refs' records in "
+          f"{doctor._home(cfg.absolute(cfg.state_dir))} (a reinstall picks them up again;")
+    print("delete that folder yourself if you will not).")
+    if not items:
+        print("Nothing to remove.")
+    elif not args.yes:
+        if not sys.stdin.isatty():
+            print("Run again with --yes to go ahead.", file=sys.stderr)
+            return 1
+        if not input("Go ahead? [y/N] ").strip().lower().startswith("y"):
+            print("Nothing was removed.")
+            return 1
+    for line in doctor.uninstall(cfg, args.keep_settings, args.keep_key):
+        print(f"  removed {line}")
+    print("Last step, to remove the program itself: uv tool uninstall refs")
+    return 0
+
+
 def cmd_setup_key(args: argparse.Namespace) -> int:
     """Store the Anthropic API key in the macOS Keychain and check that it works."""
     import getpass
@@ -1044,6 +1086,16 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("setup-key", help="store the Anthropic API key in the Keychain")
     p.set_defaults(run=cmd_setup_key)
+
+    p = sub.add_parser("doctor", help="check that everything is in order (send this when asking for help)")
+    p.add_argument("--offline", action="store_true", help="skip the checks that use the network")
+    p.set_defaults(run=cmd_doctor)
+
+    p = sub.add_parser("uninstall", help="remove refs' service, index, caches, settings and key from this Mac")
+    p.add_argument("--keep-settings", action="store_true", help="keep ~/.config/refs/config.toml")
+    p.add_argument("--keep-key", action="store_true", help="keep the API key in the Keychain")
+    p.add_argument("--yes", action="store_true", help="do not ask before removing")
+    p.set_defaults(run=cmd_uninstall)
 
     p = sub.add_parser("init", help="set refs up: the first-run questions, in the terminal")
     p.add_argument("--again", action="store_true", help="ask again although refs is set up")
