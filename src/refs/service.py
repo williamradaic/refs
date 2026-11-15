@@ -15,6 +15,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 LABEL = "com.williamradaic.refs"
@@ -35,7 +36,11 @@ def definition() -> dict:
         "ProgramArguments": [str(Path(program).resolve()), "serve", "--port", str(PORT)],
         "RunAtLoad": True,               # start at login (and right after install)
         "KeepAlive": True,               # restart if it exits
-        "ProcessType": "Background",
+        # Not "Background": macOS would then run the whole server on the slow
+        # cores with throttled disk access, and the page waits on that too
+        # (about 5x slower to load). The watcher is mostly waiting on the
+        # network or on FSEvents, so normal priority costs little.
+        "ProcessType": "Standard",
         "StandardOutPath": str(LOG),
         "StandardErrorPath": str(LOG),
     }
@@ -61,8 +66,14 @@ def install() -> str:
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with PLIST.open("wb") as handle:
         plistlib.dump(definition(), handle)
-    done = subprocess.run(["launchctl", "bootstrap", _domain(), str(PLIST)],
-                          capture_output=True, text=True)
+    # Right after a bootout (a reinstall), launchd can still be stopping the old
+    # copy and refuses the new one ("Bootstrap failed: 5"). Give it a few seconds.
+    for attempt in range(10):
+        done = subprocess.run(["launchctl", "bootstrap", _domain(), str(PLIST)],
+                              capture_output=True, text=True)
+        if done.returncode == 0:
+            break
+        time.sleep(0.5)
     if done.returncode != 0:
         return f"launchd refused the service: {done.stderr.strip()}"
     return (f"Installed. refs now starts at login and is running at "
@@ -75,10 +86,26 @@ def uninstall() -> str:
     return "Removed. refs no longer starts at login and has been stopped."
 
 
+def outdated() -> bool:
+    """Was the installed service set up by an older refs (different launchd
+    settings)? The program path is left out: it differs between `uv run` and
+    the installed tool without anything being wrong."""
+    try:
+        with PLIST.open("rb") as handle:
+            installed = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException):
+        return False
+    wanted = definition()
+    return any(installed.get(key) != value for key, value in wanted.items()
+               if key != "ProgramArguments")
+
+
 def restart() -> str:
     """Stop and start the service, e.g. to pick up changes to the code."""
     if not is_loaded():
         return "The service is not installed. Run `refs service install`."
+    if outdated():                       # launchd keeps the old settings until reloaded
+        return install()
     # kickstart can hang when launchd has given up on a service that kept
     # failing to start (say, while `uv tool install` was replacing the program).
     # Unloading and loading it again always works, so fall back to that.

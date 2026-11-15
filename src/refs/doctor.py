@@ -128,7 +128,10 @@ def checks(online: bool = True) -> list[Check]:
     # The background service and the page.
     loaded = service.is_loaded()
     answering = _answers(service.PORT) if online else None
-    if loaded:
+    if loaded and service.outdated():
+        out.append(Check(WARN, "service", "set up by an older refs (runs slower than it should)",
+                         "`refs service restart` updates it"))
+    elif loaded:
         out.append(Check(OK if answering is not False else BAD, "service",
                          f"running at login; http://refs.localhost:{service.PORT}"
                          + (" answers" if answering else " does NOT answer" if answering is False else ""),

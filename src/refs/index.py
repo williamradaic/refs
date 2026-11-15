@@ -92,6 +92,12 @@ def connect(cfg: Config) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row            # rows behave like dictionaries
     conn.execute("PRAGMA journal_mode = WAL")  # lets a reader and a writer coexist
 
+    # The usual case: the index is already as this version wants it. Then
+    # nothing is written, so opening it never waits for a scan that holds the
+    # write lock (the web page opens the index on every request).
+    if _schema_current(conn):
+        return conn
+
     # An index from an older version of the program is thrown away, not migrated:
     # everything in it can be recomputed from the files on disk.
     has_meta = conn.execute(
@@ -131,6 +137,23 @@ def connect(cfg: Config) -> sqlite3.Connection:
 # Columns of `files` newer than the table itself (added by connect()).
 ADDED_COLUMNS = [("pages", "INTEGER"), ("marked_pages", "INTEGER"), ("marks", "INTEGER"),
                  ("read_status", "TEXT"), ("queued", "TEXT")]
+
+# What connect() creates, so it can tell, by reading only, that there is nothing to do.
+_TABLES = {"meta", "files", "paths", "events", "search", "vectors"}
+
+
+def _schema_current(conn: sqlite3.Connection) -> bool:
+    """Is this the current schema, with every table, index and added column?"""
+    names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+    if not (_TABLES | {"paths_hash"}) <= names:
+        return False
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    if row is None or row["value"] != str(SCHEMA_VERSION):
+        return False
+    if "notes" not in {r["name"] for r in conn.execute("PRAGMA table_info(search)")}:
+        return False
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(files)")}
+    return all(column in have for column, _ in ADDED_COLUMNS)
 
 
 def count_marks(cfg: Config, conn: sqlite3.Connection, local_paths: dict[str, str]) -> int:
