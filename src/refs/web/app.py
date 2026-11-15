@@ -34,6 +34,13 @@ from ..cli import _split_query
 STATIC = Path(__file__).parent / "static"
 
 
+def _refs_origin(origin: str) -> bool:
+    """Is this Origin header one of refs' own addresses (any port)?"""
+    from urllib.parse import urlsplit
+    host = (urlsplit(origin).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "::1", "refs.test"} or host.endswith(".localhost")
+
+
 def create_app(watch: bool = False) -> FastAPI:
     """The server. `watch=True` also follows Dropbox for changes (watch.py)
     for as long as the server runs, which is how `refs serve` starts it."""
@@ -62,6 +69,18 @@ def create_app(watch: bool = False) -> FastAPI:
         client = request.client.host if request.client else ""
         if client not in {"127.0.0.1", "::1", "testclient"}:
             return PlainTextResponse("refs only answers this computer.", status_code=403)
+        return await call_next(request)
+
+    # 3. Only from refs' own page. A browser names the site a request comes from
+    #    (Origin) on every POST; anything that changes something must come from a
+    #    refs address. Requests without an Origin (the command line, scripts) are
+    #    still held to the X-Refs header that guard() checks.
+    @app.middleware("http")
+    async def same_site_only(request, call_next):
+        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin")
+            if origin is not None and not _refs_origin(origin):
+                return PlainTextResponse("refs only takes changes from its own page.", status_code=403)
         return await call_next(request)
 
     # The page's own files change with every update of refs: tell the browser
@@ -556,15 +575,28 @@ def create_app(watch: bool = False) -> FastAPI:
             return JSONResponse({"error": str(error)}, status_code=400)
 
     @app.post("/api/settings")
-    def save_settings(changes: dict = Body(embed=True), x_refs: str | None = Header(default=None)):
-        """Check and save changed settings, then use them at once."""
+    def save_settings(changes: dict = Body(embed=True), approve_reads: bool = Body(default=False, embed=True),
+                      x_refs: str | None = Header(default=None)):
+        """Check and save changed settings, then use them at once. `approve_reads`:
+        the first run's "read everything", whose cost the page showed, counts as
+        your OK for the batch it starts (budget.py)."""
         guard(x_refs)
         try:
             new_cfg = settings.save(changes)
         except settings.SettingError as error:
             return JSONResponse({"error": str(error), "key": error.key}, status_code=400)
         apply_settings(new_cfg)
+        if approve_reads and watcher is not None:
+            watcher.approve()
         return settings.current(new_cfg)
+
+    @app.post("/api/read/approve")
+    def approve_reads(x_refs: str | None = Header(default=None)) -> dict:
+        """Yes to the batch of unread PDFs the page showed: read them now."""
+        guard(x_refs)
+        if watcher is not None:
+            watcher.approve()
+        return {"ok": watcher is not None}
 
     @app.post("/api/settings/folder")
     def choose_folder(prompt: str = Body(embed=True), kind: str = Body(default="folders", embed=True),
@@ -606,6 +638,7 @@ def create_app(watch: bool = False) -> FastAPI:
             "watching": watcher is not None,
             "service": "running" if service.is_loaded() else "installed" if service.PLIST.exists() else "none",
             "cost_per_pdf": onboarding.COST_PER_PDF,
+            "read_cap": cfg.read_monthly_cap,
         }
 
     @app.get("/api/onboarding/survey")

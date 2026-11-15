@@ -99,6 +99,10 @@ DEFAULTS: dict = {
     # Dollars per calendar month that asking may spend (about $0.0005 a question).
     # Once reached, searches stay local until the next month.
     "ask_monthly_cap": 1.0,
+    # Dollars per calendar month that reading new PDFs on its own (the folder
+    # watcher) may spend, about $0.001 a PDF (budget.py). Papers you add
+    # yourself are always read.
+    "read_monthly_cap": 10.0,
     # Annotation authors that mean you (reading.py). Your highlights and notes
     # in a PDF mark it as being read or read; marks by anyone else (an
     # instructor's highlights on a course reading) are not counted. Preview
@@ -136,6 +140,7 @@ class Config:
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     ask: str = "auto"
     ask_monthly_cap: float = 1.0
+    read_monthly_cap: float = 10.0
     annotation_authors: list[str] = field(default_factory=list)
     contact_email: str = ""     # also read on its own by contact_email() below
 
@@ -242,6 +247,7 @@ def load(config_file: Path | None = None) -> Config:
         embedding_model=str(settings["embedding_model"]),
         ask=_choice(settings["ask"], "ask", {"auto", "never"}),
         ask_monthly_cap=float(settings["ask_monthly_cap"]),
+        read_monthly_cap=float(settings["read_monthly_cap"]),
         annotation_authors=[str(name) for name in settings["annotation_authors"]],
         contact_email=str(settings["contact_email"]).strip(),
     )

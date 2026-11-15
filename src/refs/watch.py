@@ -33,7 +33,7 @@ from typing import Callable
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from . import index, ingest, notes
+from . import budget, index, ingest, notes
 from . import scan as scanner
 from .config import Config
 
@@ -96,6 +96,11 @@ class Watcher:
         self.last_message = ""
         # The pass in progress: {"stage": scanning|indexing|reading, "done", "total"}.
         self.progress: dict | None = None
+        # A large batch of unread PDFs waiting for your OK ({"pdfs", "dollars"}),
+        # whether you gave it, and whether the monthly limit stopped reading.
+        self.held: dict | None = None
+        self._approved = False
+        self.limit_reached = False
 
     def _use(self, cfg: Config) -> None:
         """Take these settings: what to watch, and what to ignore."""
@@ -119,6 +124,11 @@ class Watcher:
                 self._observer.schedule(handler, str(top), recursive=True)
         if self._notes and os.path.isdir(self._notes):
             self._observer.schedule(handler, self._notes, recursive=False)
+
+    def approve(self) -> None:
+        """You said yes to the batch the page showed: read it in the next pass."""
+        self._approved = True
+        self.poke()
 
     def reconfigure(self, cfg: Config) -> None:
         """Settings changed (the settings page): watch what they now say, and
@@ -222,7 +232,23 @@ class Watcher:
                 report = scanner.scan(cfg, conn, progress=self._scanning)
                 pending = ([] if cfg.auto_process == "none" else
                            ingest.unread_files(cfg, conn, dump_only=cfg.auto_process == "dump"))
-                results = ingest.ingest(cfg, conn, pending, progress=self._reading) if pending else []
+                # Papers in the quick-add folder (you added them) are read; a large
+                # batch anywhere else waits for your OK on the page (budget.py).
+                added = [p for p in pending if ingest.in_dump(cfg, p[0])]
+                others = [p for p in pending if not ingest.in_dump(cfg, p[0])]
+                if len(others) > budget.BULK and not self._approved:
+                    self.held = {"pdfs": len(others), "dollars": budget.estimate(len(others))}
+                    others = []
+                else:
+                    self.held = None
+                    if others:
+                        self._approved = False          # an OK covers one batch
+                pending = added + others
+                # Reading on its own stops at the monthly limit.
+                left = budget.left_this_month(cfg, conn)
+                results = (ingest.ingest(cfg, conn, pending, progress=self._reading, budget_left=left)
+                           if pending else [])
+                self.limit_reached = any(r.skipped and "reading limit" in r.skipped for r in results)
             finally:
                 conn.close()
                 self.progress = None
@@ -297,4 +323,5 @@ class Watcher:
     def status(self) -> dict:
         return {"watching": self._observer is not None, "generation": self.generation,
                 "last_pass": self.last_pass, "message": self.last_message,
-                "progress": self.progress, "pending": self._wake.is_set()}
+                "progress": self.progress, "pending": self._wake.is_set(),
+                "held": self.held, "limit_reached": self.limit_reached}

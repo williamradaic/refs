@@ -1585,6 +1585,9 @@ function drawOnboarding() {
         ${option("dump", "only papers I add from now on", "the others wait under “not identified”, free")}
         ${option("none", "nothing for now", "read later with `refs process`")}
       </div>
+      ${ob.read === "all" && cost > info.read_cap ? `<p class="where">That is above the monthly limit
+        for reading ($${info.read_cap}): reading stops there and goes on next month, or raise
+        the limit under settings.</p>` : ""}
       ${info.api_key === "missing" && ob.read !== "none" ? `<p class="bad">Without a key nothing can be read;
         PDFs are still indexed and found by file name.</p>` : ""}
       <div class="ob-nav">${back}${next(ob.saving ? "saving …" : "finish setup", ob.saving)}</div>
@@ -1693,8 +1696,10 @@ async function obFinish() {
     obsidian_vault: ob.vault, obsidian_folder: ob.vaultFolder, auto_process: ob.read,
     contexts: obRules(),
   };
+  // "Read everything" showed its cost: it is your OK for that batch (budget.py).
   const response = await fetch("/api/settings", { method: "POST",
-    headers: { "Content-Type": "application/json", "X-Refs": "1" }, body: JSON.stringify({ changes }) });
+    headers: { "Content-Type": "application/json", "X-Refs": "1" },
+    body: JSON.stringify({ changes, approve_reads: ob.read === "all" }) });
   const answer = await response.json();
   ob.saving = false;
   if (!response.ok) { ob.error = answer.error; return drawOnboarding(); }
@@ -1791,10 +1796,46 @@ maybeOnboard();
 // reload the list if so, keeping the selected row. Not while you are typing
 // or editing, so the list never shifts under you; it catches up afterwards.
 let seenGeneration = null;
+let noticeDismissed = null;       // the size of the held batch you said "not now" to
+
+// A large batch of new PDFs waits for your OK; the monthly limit can stop
+// reading (budget.py). Both are said in the footer until dealt with.
+function renderNotice(status) {
+  const held = status.held;
+  let html = "";
+  if (held && noticeDismissed !== held.pdfs) {
+    const cost = held.dollars < 0.01 ? "under $0.01" : `about $${held.dollars.toFixed(2)}`;
+    html = `${held.pdfs.toLocaleString()} new PDFs to read (${cost}):
+      <button class="act" data-notice="read">read them</button>
+      <button class="act" data-notice="later" data-pdfs="${held.pdfs}">not now</button>`;
+  } else if (status.limit_reached) {
+    html = `this month's reading limit is reached; new PDFs wait.
+      <button class="act" data-notice="settings">raise it</button>`;
+  }
+  $("notice").innerHTML = html;
+}
+
+$("notice").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-notice]");
+  if (!button) return;
+  if (button.dataset.notice === "read") {
+    await post("/api/read/approve");
+    $("notice").innerHTML = "";
+    say("reading the new PDFs in the background …", 8000);
+  } else if (button.dataset.notice === "later") {
+    noticeDismissed = Number(button.dataset.pdfs);
+    $("notice").innerHTML = "";
+  } else if (button.dataset.notice === "settings") {
+    state.context = null; state.tag = null; state.view = "settings";
+    markSidebar(); search();
+  }
+});
+
 async function checkChanges() {
   if (document.hidden) return;
   let status;
   try { status = await get("/api/changes"); } catch { return; }
+  renderNotice(status);
   if (seenGeneration === null) { seenGeneration = status.generation; return; }
   if (status.generation === seenGeneration) return;
   if (document.activeElement?.matches?.("input, textarea, select")) return;

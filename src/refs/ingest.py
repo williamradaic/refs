@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Callable, Iterator
 
-from . import llm, pipeline, records, rename, works
+from . import budget, llm, pipeline, records, rename, works
 from . import scan as scanner
 from .config import Config
 
@@ -113,16 +113,20 @@ def unread_files(cfg: Config, conn: sqlite3.Connection, *, dump_only: bool = Fal
 
 def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], *,
            source_url: str | None = None, check_complete: bool = True,
-           progress: Callable[[int, int], None] | None = None) -> list[Ingested]:
+           progress: Callable[[int, int], None] | None = None,
+           budget_left: float | None = None) -> list[Ingested]:
     """Process, file and (inside the dump) rename the given (path, hash) pairs.
 
     The caller holds `exclusive(cfg)` and has scanned, so every path is indexed.
     Files that already have a read record are not read again (no cost).
     `check_complete=False` skips the "still being written?" test, for a file
-    that was handed over explicitly (`refs add file.pdf`).
+    that was handed over explicitly (`refs add file.pdf`). `budget_left`, in
+    dollars, stops reading once this run has spent it (the monthly limit on
+    automatic reading, budget.py); None means no limit.
     """
     results = [Ingested(rel=rel, file_hash=h) for rel, h in files]
     api, no_key = None, False
+    spent = 0.0                                 # dollars this run, for budget_left
     topics = pipeline.known_topics(cfg)
 
     # 1. Read and look up each file that has no read record yet.
@@ -144,9 +148,16 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
         if api is None and not confidential:
             item.skipped = "no Anthropic API key (run `refs setup-key`)"
             continue
+        if budget_left is not None and not confidential and spent + budget.PER_PDF > budget_left:
+            item.skipped = "this month's reading limit is reached (read_monthly_cap)"
+            continue
         item.read = pipeline.process_file(cfg, api, item.file_hash, item.rel, topics)
         item.processed_now = True
         item.issues = list(item.read["issues"])
+        if not item.read.get("reused_reading"):
+            cost = llm.cost(item.read.get("usage") or {})
+            spent += cost
+            budget.record(conn, cost)
 
     # 2. File everything under its work (and attach PDFs that a "wanted" work awaited).
     file_to_work = works.sync(cfg)

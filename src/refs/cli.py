@@ -373,6 +373,16 @@ def cmd_process(args: argparse.Namespace) -> int:
     print(f"{_plural(len(files), 'file')} selected, {len(todo):,} to process.")
     if not todo:
         return 0
+    # A large run says what it costs first (budget.py); --yes skips the question.
+    from . import budget
+    if len(todo) > budget.BULK and not args.yes and not args.relookup:
+        question = f"Reading {len(todo):,} PDFs costs about ${budget.estimate(len(todo)):.2f}. Go ahead? [y/N] "
+        if not sys.stdin.isatty():
+            print(f"{question.split(' Go')[0]} Run again with --yes to go ahead.", file=sys.stderr)
+            return 1
+        if not input(question).strip().lower().startswith("y"):
+            print("Nothing was read.")
+            return 1
 
     api = llm.client()
     topics = pipeline.known_topics(cfg)
@@ -392,6 +402,7 @@ def cmd_process(args: argparse.Namespace) -> int:
             if not read["reused_reading"]:      # a reused reading costs nothing now
                 for key in totals:
                     totals[key] += read["usage"].get(key, 0)
+                budget.record(conn, llm.cost(read["usage"]))     # counts toward the month
             meta = pipeline.final_metadata(read)
             kind = (read.get("reading") or {}).get("kind") or "?"
             who = ", ".join(meta["surnames"][:3]) + (" et al." if len(meta["surnames"]) > 3 else "")
@@ -1001,6 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--relookup", action="store_true",
                    help="repeat only the registry lookup, reusing the saved reading (free)")
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--yes", action="store_true", help="do not ask before reading many PDFs")
     p.set_defaults(run=cmd_process)
 
     p = sub.add_parser("eval", help="check results against convention-style file names")

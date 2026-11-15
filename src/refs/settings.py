@@ -96,6 +96,10 @@ FIELDS = [
     Field("auto_process", "AI", "Read new PDFs", kind="choice", choices=["all", "dump", "none"],
           help='"all": any new PDF in a watched folder; "dump": only those in the quick-add '
                'folder; "none": leave it to `refs process`.'),
+    Field("read_monthly_cap", "AI", "Monthly limit for reading ($)", kind="number",
+          help="What reading new PDFs on its own may spend in a month (about $0.001 a PDF). "
+               "Papers you add yourself are always read; more than 25 new PDFs at once wait "
+               "for your OK on the page."),
     Field("ask", "AI", "Ask Claude when a search is unsure", kind="choice", choices=["auto", "never"],
           help="About $0.0005 a question; it sees titles, authors and summaries, never notes."),
     Field("ask_monthly_cap", "AI", "Monthly limit for asking ($)", kind="number",

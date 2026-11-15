@@ -360,3 +360,10 @@ details.kept > summary { cursor: pointer; }
 .ob-bar span { display: block; height: 100%; background: var(--accent); transition: width 0.4s; }
 .ob-list { padding-left: 2ch; margin: 6px 0; }
 .ob-list li { margin: 3px 0; }
+
+/* Footer notice: reading that waits for you (app.js renderNotice). */
+.notice { color: var(--warn); white-space: nowrap; flex: none; }
+/* With a notice showing, the key hints give way (they are also under "?"). */
+footer .keys { min-width: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+footer:has(.notice:not(:empty)) .keys { display: none; }
+.notice .act { margin-left: 1ch; }
