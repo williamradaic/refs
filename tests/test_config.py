@@ -27,7 +27,7 @@ def test_defaults_name_no_one_s_folders(cfg):
 
 
 def test_without_folders_refs_says_it_is_not_set_up(cfg):
-    assert "roots" in config.not_set_up(cfg)
+    assert "refs init" in config.not_set_up(cfg)
 
 
 def test_with_a_folder_it_is_set_up(tmp_path, monkeypatch, cfg):

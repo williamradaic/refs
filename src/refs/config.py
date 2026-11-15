@@ -257,9 +257,8 @@ def not_set_up(cfg: Config) -> str | None:
     """Why refs cannot do its job yet, or None when it can. With the generic
     defaults no folder is scanned until you choose some."""
     if not cfg.roots:
-        return ("refs has no folders to scan yet. Add the folders that hold your papers "
-                "(inside your Dropbox), e.g. `roots = [\"papers\", \"papers-dump\"]`, "
-                "to ~/.config/refs/config.toml.")
+        return ("refs is not set up yet: no folders to watch. Run `refs init`, or open "
+                "http://refs.localhost:8377 (or `refs serve --open`), to choose them.")
     return None
 
 

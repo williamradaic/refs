@@ -72,7 +72,8 @@ def checks(online: bool = True) -> list[Check]:
         unread = conn.execute("SELECT COUNT(*) FROM files WHERE status IS NULL "
                               "AND hash IN (SELECT hash FROM paths)").fetchone()[0]
         out.append(Check(OK if pdfs else WARN, "index",
-                         f"{pdfs:,} PDFs, {unread:,} not identified ({_home(cfg.index_db)})",
+                         f"{pdfs:,} PDF{'' if pdfs == 1 else 's'}, {unread:,} not identified "
+                         f"({_home(cfg.index_db)})",
                          "" if pdfs else "run `refs scan`"))
     except Exception as error:                          # noqa: BLE001 (report, do not crash)
         out.append(Check(BAD, "index", f"cannot open {_home(cfg.index_db)}: {error}",
@@ -129,8 +130,8 @@ def checks(online: bool = True) -> list[Check]:
     answering = _answers(service.PORT) if online else None
     if loaded:
         out.append(Check(OK if answering is not False else BAD, "service",
-                         f"running at login; http://refs.localhost:{service.PORT} "
-                         + ("answers" if answering else "does NOT answer" if answering is False else ""),
+                         f"running at login; http://refs.localhost:{service.PORT}"
+                         + (" answers" if answering else " does NOT answer" if answering is False else ""),
                          "" if answering is not False else f"see {_home(service.LOG)}; `refs service restart`"))
     else:
         out.append(Check(WARN, "service", "not running in the background",
