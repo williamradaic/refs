@@ -137,6 +137,7 @@ class Config:
     ask: str = "auto"
     ask_monthly_cap: float = 1.0
     annotation_authors: list[str] = field(default_factory=list)
+    contact_email: str = ""     # also read on its own by contact_email() below
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -162,8 +163,16 @@ def _find_dropbox_root() -> Path:
     )
 
 
-def load() -> Config:
+def config_path() -> Path:
+    """Where your settings file is: ~/.config/refs/config.toml, or REFS_CONFIG."""
+    return Path(os.environ.get("REFS_CONFIG", Path.home() / ".config" / "refs" / "config.toml"))
+
+
+def load(config_file: Path | None = None) -> Config:
     """Build the Config from defaults, then the optional file, then environment.
+
+    `config_file` reads another file instead of config_path() (settings.py
+    uses it to check a change before saving it).
 
     Environment variables (used mainly by the tests):
       REFS_CONFIG        path to a config file other than ~/.config/refs/config.toml
@@ -173,9 +182,7 @@ def load() -> Config:
     settings = dict(DEFAULTS)
 
     # Optional user file: only the keys present there replace the defaults.
-    config_file = Path(
-        os.environ.get("REFS_CONFIG", Path.home() / ".config" / "refs" / "config.toml")
-    )
+    config_file = config_file or config_path()
     if config_file.is_file():
         with config_file.open("rb") as handle:
             user = tomllib.load(handle)
@@ -222,6 +229,7 @@ def load() -> Config:
         ask=_choice(settings["ask"], "ask", {"auto", "never"}),
         ask_monthly_cap=float(settings["ask_monthly_cap"]),
         annotation_authors=[str(name) for name in settings["annotation_authors"]],
+        contact_email=str(settings["contact_email"]).strip(),
     )
 
 
@@ -254,8 +262,7 @@ def _choice(value: str, key: str, allowed: set[str]) -> str:
 
 def contact_email() -> str:
     """The email to show registries, if you chose to set one in config.toml."""
-    config_file = Path(
-        os.environ.get("REFS_CONFIG", Path.home() / ".config" / "refs" / "config.toml"))
+    config_file = config_path()
     try:
         with config_file.open("rb") as handle:
             return str(tomllib.load(handle).get("contact_email", "")).strip()

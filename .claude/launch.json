@@ -25,6 +25,23 @@
         "--no-watch"
       ],
       "port": 8378
+    },
+    {
+      "name": "refs-sandbox",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "REFS_CONFIG=local/sandbox/config.toml",
+        "REFS_DROPBOX_ROOT=local/sandbox/Dropbox",
+        "REFS_INDEX_DB=local/sandbox/index.db",
+        "uv",
+        "run",
+        "refs",
+        "serve",
+        "--port",
+        "8379",
+        "--no-watch"
+      ],
+      "port": 8379
     }
   ]
 }

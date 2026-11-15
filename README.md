@@ -182,6 +182,22 @@ watches at a time, and an ingest from `refs add` and one from the watcher
 never run together, so no file is paid for twice. The web page reloads its
 list by itself when something changed.
 
+## Settings
+
+Settings live in `~/.config/refs/config.toml`; the defaults in
+`src/refs/config.py` are generic. The web page edits the file too: **settings**
+at the bottom of the sidebar, or `,`. It covers the library folder, watched
+folders, quick-add folder, private folders, courses and projects, the Obsidian
+vault, the annotation names that are you ("find names in my PDFs" lists those
+in your PDFs), project `.bib` files, AI use and the Anthropic API key (stored
+in the Keychain). Every change is checked before it is written; comments in
+the file are kept and the previous version is saved as `config.toml.bak`.
+Saving applies at once: the watcher follows the new folders and rescans.
+
+To try the page on a fake library, start the `refs-sandbox` entry of
+`.claude/launch.json` (port 8379), which uses `local/sandbox/` for its
+library, settings and index.
+
 ## Courses and projects
 
 refs reads a PDF's course or project off its folders (`src/refs/contexts.py`),

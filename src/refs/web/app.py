@@ -20,11 +20,12 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import bib, config, index, ingest, notes, organize, reading, records, rename, resolve, venues, works
+from .. import (bib, config, index, ingest, keys, notes, organize, reading, records, rename, resolve,
+                settings, venues, works)
 from .. import ask as asking
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
 from .. import scan as scanner
@@ -529,6 +530,75 @@ def create_app(watch: bool = False) -> FastAPI:
             raise HTTPException(404)
         subprocess.run(["open", *(["-R"] if reveal else []), str(cfg.absolute(path))])
         return {"ok": True}
+
+    # --- settings (settings.py) ---------------------------------------------------------
+
+    def apply_settings(new_cfg: config.Config) -> None:
+        """Use new settings from now on, without a restart. Every endpoint reads
+        `cfg` when it runs, so replacing it here is enough for them. The watcher
+        is told too; its next pass rescans (and reads new PDFs as auto_process
+        says). Without a watcher (--no-watch) a plain scan runs, which reads
+        nothing new."""
+        nonlocal cfg
+        cfg = new_cfg
+        if watcher is not None:
+            watcher.reconfigure(new_cfg)
+        else:
+            threading.Thread(target=lambda: scanner.scan(new_cfg, index.connect(new_cfg)),
+                             daemon=True).start()
+
+    @app.get("/api/settings")
+    def get_settings():
+        """The settings page: config.toml as refs reads it now, field by field."""
+        try:
+            return settings.current()
+        except SystemExit as error:                   # the file has a mistake in it
+            return JSONResponse({"error": str(error)}, status_code=400)
+
+    @app.post("/api/settings")
+    def save_settings(changes: dict = Body(embed=True), x_refs: str | None = Header(default=None)):
+        """Check and save changed settings, then use them at once."""
+        guard(x_refs)
+        try:
+            new_cfg = settings.save(changes)
+        except settings.SettingError as error:
+            return JSONResponse({"error": str(error), "key": error.key}, status_code=400)
+        apply_settings(new_cfg)
+        return settings.current(new_cfg)
+
+    @app.post("/api/settings/folder")
+    def choose_folder(prompt: str = Body(embed=True), kind: str = Body(default="folders", embed=True),
+                      x_refs: str | None = Header(default=None)) -> dict:
+        """Open the macOS folder dialog (it appears on this Mac, in front)."""
+        guard(x_refs)
+        start = cfg.obsidian_vault.parent if kind == "vault" and cfg.obsidian_vault \
+            else Path.home() if kind in {"vault", "library"} else cfg.dropbox_root
+        chosen = settings.choose_folder(prompt, start)
+        if chosen is None:
+            return {"path": None}
+        # Folders inside the library are shown and stored relative to it.
+        if kind in {"folders", "folder"}:
+            try:
+                return {"path": str(chosen.resolve().relative_to(cfg.dropbox_root))}
+            except ValueError:
+                return {"path": None, "error": f"{chosen} is not inside the library folder"}
+        return {"path": str(chosen)}
+
+    @app.get("/api/settings/authors")
+    def found_authors() -> dict:
+        """Annotation author names in the library's PDFs (a few seconds)."""
+        return {"authors": settings.annotation_authors(cfg, index.connect(cfg))}
+
+    @app.post("/api/settings/key")
+    def save_key(key: str = Body(embed=True), x_refs: str | None = Header(default=None)):
+        """Store the Anthropic API key in the Keychain. It is never sent back."""
+        guard(x_refs)
+        key = key.strip()
+        if not key.startswith("sk-ant-") or len(key) < 40 or any(c.isspace() for c in key):
+            return JSONResponse({"error": "that does not look like an Anthropic API key (sk-ant-…)"},
+                                status_code=400)
+        keys.set_api_key(key)
+        return {"api_key": settings.api_key_status()}
 
     @app.post("/api/scan")
     def rescan(x_refs: str | None = Header(default=None)) -> dict:

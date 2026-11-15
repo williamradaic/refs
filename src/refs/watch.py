@@ -81,17 +81,9 @@ class Watcher:
 
     def __init__(self, cfg: Config, *, quiet: float = QUIET_SECONDS,
                  notifier: Callable[[str, str], None] | None = notify) -> None:
-        self.cfg = cfg
         self.quiet = quiet
         self.notifier = notifier
-        root = str(cfg.dropbox_root)
-        # Folders whose changes never matter: the app's own records (written
-        # by every pass, so watching them would loop) and excluded paths.
-        self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths]]
-        # Reading notes (in the Obsidian vault, outside Dropbox): an edited note
-        # changes what search finds, so it too starts a pass.
-        # None when no vault is set (notes off): then no note path is relevant.
-        self._notes = str(notes.folder(cfg)) if notes.folder(cfg) else None
+        self._use(cfg)
         self._wake = threading.Event()
         self._halt = threading.Event()
         self._first_event = self._last_event = 0.0
@@ -102,6 +94,39 @@ class Watcher:
         self.generation = 0
         self.last_pass: str | None = None
         self.last_message = ""
+
+    def _use(self, cfg: Config) -> None:
+        """Take these settings: what to watch, and what to ignore."""
+        self.cfg = cfg
+        root = str(cfg.dropbox_root)
+        # Folders whose changes never matter: the app's own records (written
+        # by every pass, so watching them would loop) and excluded paths.
+        self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths]]
+        # Reading notes (in the Obsidian vault, outside Dropbox): an edited note
+        # changes what search finds, so it too starts a pass.
+        # None when no vault is set (notes off): then no note path is relevant.
+        self._notes = str(notes.folder(cfg)) if notes.folder(cfg) else None
+
+    def _schedule(self) -> None:
+        """Ask FSEvents for changes in the watched folders and the notes folder."""
+        self._observer.unschedule_all()
+        handler = _Handler(self)
+        for root in self.cfg.roots:
+            top = self.cfg.absolute(root)
+            if top.is_dir():
+                self._observer.schedule(handler, str(top), recursive=True)
+        if self._notes and os.path.isdir(self._notes):
+            self._observer.schedule(handler, self._notes, recursive=False)
+
+    def reconfigure(self, cfg: Config) -> None:
+        """Settings changed (the settings page): watch what they now say, and
+        run a pass soon. The pass in progress, if any, finishes first: passes
+        run one at a time on the watcher's own thread."""
+        self._use(cfg)
+        if self._observer is not None:
+            self._schedule()
+            _log(f"settings changed: watching {', '.join(cfg.roots)} (reading new PDFs: {cfg.auto_process})")
+            self.poke()
 
     # --- events ----------------------------------------------------------------------
 
@@ -145,13 +170,7 @@ class Watcher:
             return False
 
         self._observer = Observer()
-        handler = _Handler(self)
-        for root in self.cfg.roots:
-            top = self.cfg.absolute(root)
-            if top.is_dir():
-                self._observer.schedule(handler, str(top), recursive=True)
-        if self._notes and os.path.isdir(self._notes):
-            self._observer.schedule(handler, self._notes, recursive=False)
+        self._schedule()
         self._observer.daemon = True
         self._observer.start()
         _log(f"watching {', '.join(self.cfg.roots)} (reading new PDFs: {self.cfg.auto_process})")
