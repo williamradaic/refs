@@ -94,6 +94,8 @@ class Watcher:
         self.generation = 0
         self.last_pass: str | None = None
         self.last_message = ""
+        # The pass in progress: {"stage": scanning|indexing|reading, "done", "total"}.
+        self.progress: dict | None = None
 
     def _use(self, cfg: Config) -> None:
         """Take these settings: what to watch, and what to ignore."""
@@ -217,15 +219,24 @@ class Watcher:
         with ingest.exclusive(cfg):
             conn = index.connect(cfg)
             try:
-                report = scanner.scan(cfg, conn)
+                report = scanner.scan(cfg, conn, progress=self._scanning)
                 pending = ([] if cfg.auto_process == "none" else
                            ingest.unread_files(cfg, conn, dump_only=cfg.auto_process == "dump"))
-                results = ingest.ingest(cfg, conn, pending) if pending else []
+                results = ingest.ingest(cfg, conn, pending, progress=self._reading) if pending else []
             finally:
                 conn.close()
+                self.progress = None
         self.last_pass = datetime.now().isoformat(timespec="seconds")
         self._report(report, results)
         return results
+
+    def _scanning(self, done: int, total: int) -> None:
+        # After the last file is hashed, the index and search vectors are
+        # rebuilt (the first time, the search model is downloaded).
+        self.progress = {"stage": "indexing" if done >= total else "scanning", "done": done, "total": total}
+
+    def _reading(self, done: int, total: int) -> None:
+        self.progress = {"stage": "reading", "done": done, "total": total}
 
     # --- telling you what happened ---------------------------------------------------------
 
@@ -285,4 +296,5 @@ class Watcher:
 
     def status(self) -> dict:
         return {"watching": self._observer is not None, "generation": self.generation,
-                "last_pass": self.last_pass, "message": self.last_message}
+                "last_pass": self.last_pass, "message": self.last_message,
+                "progress": self.progress, "pending": self._wake.is_set()}

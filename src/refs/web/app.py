@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import (bib, config, index, ingest, keys, notes, organize, reading, records, rename, resolve,
+from .. import (bib, config, index, ingest, keys, notes, onboarding, organize, reading, records, rename, resolve,
                 settings, venues, works)
 from .. import ask as asking
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
@@ -584,6 +584,38 @@ def create_app(watch: bool = False) -> FastAPI:
                 return {"path": None, "error": f"{chosen} is not inside the library folder"}
         return {"path": str(chosen)}
 
+    # --- first run (onboarding.py); the answers are saved through /api/settings ------------
+
+    @app.get("/api/onboarding")
+    def onboarding_state() -> dict:
+        """Whether refs still needs setting up, and what the first-run page offers."""
+        from .. import service
+        # The library folder refs was given (config.toml or REFS_DROPBOX_ROOT)
+        # comes first; your home folder only stands in when none was found.
+        libraries = onboarding.library_candidates()
+        if cfg.dropbox_root != Path.home().resolve() and \
+                all(lib["path"] != str(cfg.dropbox_root) for lib in libraries):
+            libraries.insert(0, {"label": "set now", "path": str(cfg.dropbox_root)})
+        return {
+            "needed": config.not_set_up(cfg) is not None,
+            "libraries": libraries,
+            "library": str(cfg.dropbox_root),
+            "dump": cfg.dump,
+            "vaults": settings.obsidian_vaults(),
+            "api_key": settings.api_key_status(),
+            "watching": watcher is not None,
+            "service": "running" if service.is_loaded() else "installed" if service.PLIST.exists() else "none",
+            "cost_per_pdf": onboarding.COST_PER_PDF,
+        }
+
+    @app.get("/api/onboarding/survey")
+    def onboarding_survey(root: str) -> dict:
+        """Folders of a would-be library folder, with PDF counts (only looks)."""
+        folder = Path(root).expanduser()
+        if not folder.is_dir():
+            return JSONResponse({"error": f"there is no folder {root}"}, status_code=400)
+        return onboarding.survey(folder.resolve())
+
     @app.get("/api/settings/authors")
     def found_authors() -> dict:
         """Annotation author names in the library's PDFs (a few seconds)."""
@@ -594,9 +626,8 @@ def create_app(watch: bool = False) -> FastAPI:
         """Store the Anthropic API key in the Keychain. It is never sent back."""
         guard(x_refs)
         key = key.strip()
-        if not key.startswith("sk-ant-") or len(key) < 40 or any(c.isspace() for c in key):
-            return JSONResponse({"error": "that does not look like an Anthropic API key (sk-ant-…)"},
-                                status_code=400)
+        if problem := keys.problem_with(key):         # checked with Anthropic first
+            return JSONResponse({"error": problem}, status_code=400)
         keys.set_api_key(key)
         return {"api_key": settings.api_key_status()}
 

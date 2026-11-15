@@ -19,7 +19,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Iterator
+from typing import Callable, Iterator
 
 from . import llm, pipeline, records, rename, works
 from . import scan as scanner
@@ -112,7 +112,8 @@ def unread_files(cfg: Config, conn: sqlite3.Connection, *, dump_only: bool = Fal
 
 
 def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], *,
-           source_url: str | None = None, check_complete: bool = True) -> list[Ingested]:
+           source_url: str | None = None, check_complete: bool = True,
+           progress: Callable[[int, int], None] | None = None) -> list[Ingested]:
     """Process, file and (inside the dump) rename the given (path, hash) pairs.
 
     The caller holds `exclusive(cfg)` and has scanned, so every path is indexed.
@@ -125,7 +126,9 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
     topics = pipeline.known_topics(cfg)
 
     # 1. Read and look up each file that has no read record yet.
-    for item in results:
+    for done, item in enumerate(results):
+        if progress is not None:
+            progress(done, len(results))           # `progress(done, total)`, for the page
         item.read = pipeline.load_read(cfg, item.file_hash)
         if item.read is not None:
             continue

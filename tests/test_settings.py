@@ -14,7 +14,8 @@ ORIGINAL = """\
 # My refs settings.
 
 # Where my papers are.
-roots = ["papers"]   # just one for now
+roots = ["papers", "inbox"]   # papers, and the quick-add folder
+dump = "inbox"
 contact_email = "jane@example.edu"
 """
 
@@ -34,13 +35,22 @@ def lib(tmp_path, monkeypatch):
 
 
 def test_saving_changes_only_those_keys_and_keeps_comments(lib):
-    cfg = settings.save({"roots": ["papers", "classes"], "auto_process": "dump"})
+    cfg = settings.save({"roots": ["papers", "classes", "inbox"], "auto_process": "dump"})
     text = lib.path.read_text()
     assert "# Where my papers are." in text and "# My refs settings." in text
     assert 'contact_email = "jane@example.edu"' in text
-    assert cfg.roots == ["papers", "classes"] and cfg.auto_process == "dump"
+    assert cfg.roots == ["papers", "classes", "inbox"] and cfg.auto_process == "dump"
     assert (lib.path.parent / "config.toml.bak").read_text() == ORIGINAL
-    assert config.load().roots == ["papers", "classes"]
+    assert config.load().roots == ["papers", "classes", "inbox"]
+
+
+def test_the_quick_add_folder_is_always_watched(lib):
+    # Left out of the watched folders, it is added back; a new one is created.
+    assert settings.save({"roots": ["papers"]}).roots == ["papers", "inbox"]
+    cfg = settings.save({"dump": "to-read"})
+    assert cfg.roots == ["papers", "inbox", "to-read"] and (lib.root / "to-read").is_dir()
+    # Inside a watched folder already: nothing to add.
+    assert settings.save({"dump": "papers/new", "roots": ["papers"]}).roots == ["papers"]
 
 
 def test_a_new_file_starts_with_a_header(lib):
@@ -51,13 +61,13 @@ def test_a_new_file_starts_with_a_header(lib):
 
 def test_folders_from_the_dialog_are_stored_inside_the_library(lib, tmp_path):
     cfg = settings.save({"roots": [str(lib.root / "papers"), "classes/"]})
-    assert cfg.roots == ["papers", "classes"]
+    assert cfg.roots == ["papers", "classes", "inbox"]
     with pytest.raises(settings.SettingError, match="not inside the library folder") as error:
         settings.save({"roots": [str(tmp_path)]})
     assert error.value.key == "roots"
     with pytest.raises(settings.SettingError, match="no folder 'paper'"):
         settings.save({"roots": ["paper"]})          # a typo is caught, not saved
-    assert config.load().roots == ["papers", "classes"]
+    assert config.load().roots == ["papers", "classes", "inbox"]
 
 
 def test_protective_lists_store_only_additions(lib):
@@ -132,6 +142,9 @@ def test_api_saves_and_uses_new_settings_at_once(lib):
 def test_api_key_is_stored_never_shown(lib, monkeypatch):
     stored = []
     monkeypatch.setattr(keys, "set_api_key", stored.append)
+    # Checked with Anthropic in real use; here, any well-formed key passes.
+    monkeypatch.setattr(keys, "problem_with",
+                        lambda key: None if key.startswith("sk-ant-") else "not a key")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     client = TestClient(create_app())
     assert client.post("/api/settings/key", json={"key": "hello"}, headers=H).status_code == 400

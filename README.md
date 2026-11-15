@@ -11,6 +11,29 @@ learned from project `.bib` files, and an agent skill. Dropped: first-page
 thumbnails and a Raycast "add the front tab" command (the bookmarklet covers
 it). What remains is the plan's "Later" list, in `local/admin/plan.md`.
 
+## First run
+
+refs runs on macOS. Install it with [uv](https://docs.astral.sh/uv/), then start it
+in the background (it then also starts at login):
+
+```sh
+uv tool install git+https://github.com/williamradaic/refs
+refs service install
+```
+
+The page opens at `http://refs.localhost:8377` and, while refs is not set up,
+asks the first-run questions: the library folder (Dropbox, iCloud Drive, Google
+Drive, OneDrive or any folder), which folders hold papers (a tree with PDF
+counts), the quick-add folder, private folders (suggested from folder names
+such as `visa` or `referee`), an Obsidian vault for notes, and the Anthropic
+API key with how much to read (with the cost). Folders of term folders
+(`Fall 2026`, `2025-spring`) get a rule that groups the courses inside them by
+term. `refs init` asks the same questions in the terminal. Everything can be
+changed later on the settings page.
+
+The `refs-first-run` entry of `.claude/launch.json` (port 8380) serves an
+unconfigured library in `local/first-run/`, for working on these screens.
+
 ## Use
 
 ```sh

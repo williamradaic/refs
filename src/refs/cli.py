@@ -1,5 +1,6 @@
 """The `refs` command.
 
+    refs init                 set refs up (the first-run questions; the web page asks them too)
     refs scan                 bring the index in line with Dropbox
     refs status               what the library holds
     refs find blp             search; add filters like course:220a kind:paper
@@ -761,6 +762,141 @@ def cmd_service(args: argparse.Namespace) -> int:
     actions = {"install": service.install, "uninstall": service.uninstall,
                "restart": service.restart, "status": service.status}
     print(actions[args.action]())
+    # Not set up yet: the page's first-run screens ask the questions.
+    if args.action == "install" and service.is_loaded() and config.not_set_up(config.load()):
+        url = f"http://refs.localhost:{service.PORT}"
+        print(f"Opening {url} to set refs up (or run `refs init` here).")
+        subprocess.Popen(["open", url])
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """Set refs up in the terminal: the questions of the first-run page."""
+    import getpass
+    from pathlib import Path
+
+    from . import keys, onboarding, service, settings
+
+    cfg = config.load()
+    if config.not_set_up(cfg) is None and not args.again:
+        print(f"refs is already set up (watching {', '.join(cfg.roots)}). Change settings on the "
+              "settings page (key `,`), or start over with `refs init --again`.")
+        return 0
+
+    def ask(prompt: str, default: str = "") -> str:
+        shown = f" [{default}]" if default else ""
+        return input(f"{prompt}{shown}: ").strip() or default
+
+    def pick(answer: str, options: list[str]) -> list[str]:
+        """Numbers from a printed list, or the texts themselves."""
+        chosen = []
+        for token in answer.replace(",", " ").split():
+            chosen.append(options[int(token) - 1] if token.isdigit() and 0 < int(token) <= len(options)
+                          else token.strip("/"))
+        return chosen
+
+    print("Set up refs. Enter takes the [default]; Ctrl-C stops without saving anything.\n")
+    try:
+        # 1. The library folder.
+        libraries = onboarding.library_candidates()
+        if cfg.dropbox_root != Path.home().resolve() and all(l["path"] != str(cfg.dropbox_root) for l in libraries):
+            libraries.insert(0, {"label": "set now", "path": str(cfg.dropbox_root)})
+        print("Where do you keep your papers? (the library folder)")
+        for i, lib in enumerate(libraries, 1):
+            print(f"  {i}. {lib['label']:<13} {lib['path']}")
+        library = pick(ask("Number, or a path", "1"), [lib["path"] for lib in libraries])[0]
+        library = str(Path(library).expanduser().resolve())
+
+        # 2. The folders with papers.
+        print("\nCounting PDFs …")
+        found = onboarding.survey(Path(library))
+        top = sorted((c for c in found["tree"]["children"] if c["pdfs"]), key=lambda c: -c["pdfs"])
+        for i, c in enumerate(top, 1):
+            print(f"  {i:>2}. {c['pdfs']:>7,}  {c['name']}")
+        roots: list[str] = []
+        while not roots:
+            roots = pick(ask("Which hold papers? Numbers like `1 3`, or paths inside the library"),
+                         [c["path"] for c in top])
+
+        # 3. The quick-add folder.
+        print("\nPapers you add in refs are saved in the quick-add folder (created if new).")
+        dump = ask("Quick-add folder", cfg.dump).strip("/")
+
+        # 4. Private folders: suggestions from folder names, then any others.
+        exclude: list[str] = []
+        no_llm: list[str] = []
+        offered = [s for s in found["suggestions"] if onboarding._under(s["path"], roots)]
+        if offered:
+            print("\nFolders whose names suggest they are private:")
+            for i, s in enumerate(offered, 1):
+                what = "never send to Claude" if s["kind"] == "no_llm" else "leave out entirely"
+                print(f"  {i}. [{'x' if s['ticked'] else ' '}] {s['path']}  ({what})")
+            ticked = " ".join(str(i) for i, s in enumerate(offered, 1) if s["ticked"])
+            answer = ask("Which to use (numbers; `none` for none)", ticked or "none")
+            for path in pick("" if answer == "none" else answer, [s["path"] for s in offered]):
+                kind = next((s["kind"] for s in offered if s["path"] == path), "exclude")
+                (no_llm if kind == "no_llm" else exclude).append(path)
+        exclude += pick(ask("Other folders to leave out entirely (paths, or Enter)"), [])
+        no_llm += pick(ask("Other folders to keep from Claude (paths, or Enter)"), [])
+
+        # 5. Reading notes in Obsidian.
+        vaults = settings.obsidian_vaults()
+        print("\nReading notes can be Markdown files in an Obsidian vault.")
+        for i, vault in enumerate(vaults, 1):
+            print(f"  {i}. {vault}")
+        answer = ask("Vault (number or path; `none` for no notes)", "1" if vaults else "none")
+        vault = "" if answer == "none" else pick(answer, vaults)[0]
+
+        # 6. The API key and what to read.
+        print("\nTo tell what each PDF is, refs sends the text of its first three pages (an image of")
+        print("page one for scans) to Claude Haiku, then checks Crossref and OpenAlex. Never file")
+        print("names, notes or private folders. About $0.001 a PDF, on your own Anthropic API key.")
+        if settings.api_key_status() == "missing":
+            for _ in range(2):
+                key = getpass.getpass("Anthropic API key (hidden; Enter to skip for now): ").strip()
+                if not key:
+                    break
+                if problem := keys.problem_with(key):
+                    print(f"  {problem}.")
+                    continue
+                keys.set_api_key(key)
+                print("  Saved in the macOS Keychain.")
+                break
+        n = onboarding.pdfs_in(found["tree"], roots, exclude)
+        cost = onboarding.estimate(n)
+        answer = ask(f"Read [a]ll {n:,} PDFs now (about ${cost['dollars']:.2f}), only papers [d]umped "
+                     "from now on, or [n]othing", "d").lower()[:1]
+        auto = {"a": "all", "n": "none"}.get(answer, "dump")
+    except (KeyboardInterrupt, EOFError):
+        print("\nStopped; nothing was saved.")
+        return 1
+
+    changes = {"dropbox_root": library, "roots": roots, "dump": dump, "exclude_paths": exclude,
+               "no_llm": no_llm, "obsidian_vault": vault, "auto_process": auto,
+               "contexts": onboarding.rules_for(found, roots)}
+    try:
+        saved = settings.save(changes)
+    except settings.SettingError as error:
+        print(f"Not saved: {error}. Run `refs init` again.")
+        return 1
+    print(f"\nSaved {config.config_path()}.")
+    for rule in saved.contexts:
+        print(f"  Courses: {rule} (term folders found)")
+
+    # 7. Running in the background: a running refs must restart to see the new settings.
+    # The login service reads the default settings file only; with another one
+    # (REFS_CONFIG), it is left alone.
+    import os
+    if os.environ.get("REFS_CONFIG"):
+        print("These settings are not the default file, so the background service was left alone.")
+    elif service.is_loaded():
+        print(service.restart(), "refs is following your folders at", f"http://refs.localhost:{service.PORT}")
+    elif ask("\nStart refs in the background now and at login? [Y/n]", "y").lower().startswith("y"):
+        print(service.install())
+    else:
+        print("Start it with `refs serve --open`, or index now with `refs scan`.")
+    if auto == "all":
+        print("Reading happens in the background; the page shows each paper as it is read.")
     return 0
 
 
@@ -768,22 +904,11 @@ def cmd_setup_key(args: argparse.Namespace) -> int:
     """Store the Anthropic API key in the macOS Keychain and check that it works."""
     import getpass
 
-    import anthropic
-
-    from . import keys, llm
+    from . import keys
 
     key = getpass.getpass("Paste your Anthropic API key (it will not be shown): ").strip()
-    if not key.startswith("sk-ant-"):
-        print("That does not look like an Anthropic API key (it should start with sk-ant-).")
-        return 1
-    try:
-        # A free request that only succeeds with a valid key.
-        anthropic.Anthropic(api_key=key).models.retrieve(llm.MODEL)
-    except anthropic.AuthenticationError:
-        print("Anthropic rejected that key. Nothing was saved.")
-        return 1
-    except anthropic.APIConnectionError:
-        print("Could not reach Anthropic to check the key. Nothing was saved; try again.")
+    if problem := keys.problem_with(key):
+        print(f"{problem[0].upper()}{problem[1:]}. Nothing was saved.")
         return 1
     keys.set_api_key(key)
     print("Key saved to the macOS Keychain (item \"refs\") and verified.")
@@ -907,6 +1032,10 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("setup-key", help="store the Anthropic API key in the Keychain")
     p.set_defaults(run=cmd_setup_key)
+
+    p = sub.add_parser("init", help="set refs up: the first-run questions, in the terminal")
+    p.add_argument("--again", action="store_true", help="ask again although refs is set up")
+    p.set_defaults(run=cmd_init)
 
     args = parser.parse_args(argv)
     return args.run(args)

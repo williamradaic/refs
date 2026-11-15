@@ -146,7 +146,7 @@ class Config:
 
 # --- Loading ----------------------------------------------------------------
 
-def _find_dropbox_root() -> Path:
+def find_dropbox() -> Path | None:
     """Locate the Dropbox folder: modern macOS location first, then the classic one."""
     candidates = [
         Path.home() / "Library" / "CloudStorage" / "Dropbox",
@@ -157,9 +157,22 @@ def _find_dropbox_root() -> Path:
             # resolve() follows symlinks, so ~/Dropbox and the CloudStorage path
             # end up as the same string. Every stored path is relative to this.
             return candidate.resolve()
+    return None
+
+
+def _library_root(watched: list[str]) -> Path:
+    """No library folder set: Dropbox if there is one. Before setup (nothing
+    watched yet) your home folder stands in, so refs starts and onboarding can
+    ask; once folders are watched, a missing library is an error, because
+    scanning the wrong folder would make the whole library look deleted."""
+    found = find_dropbox()
+    if found is not None:
+        return found
+    if not watched:
+        return Path.home().resolve()
     raise SystemExit(
-        "Could not find a Dropbox folder. Set REFS_DROPBOX_ROOT or add "
-        "`dropbox_root = \"/path/to/Dropbox\"` to ~/.config/refs/config.toml."
+        "Could not find the library folder (no Dropbox found). Set it on the settings page, "
+        "or add `dropbox_root = \"/path/to/folder\"` to ~/.config/refs/config.toml."
     )
 
 
@@ -195,7 +208,8 @@ def load(config_file: Path | None = None) -> Config:
         settings.update(user)
 
     root_setting = os.environ.get("REFS_DROPBOX_ROOT") or settings.get("dropbox_root")
-    dropbox_root = Path(root_setting).expanduser().resolve() if root_setting else _find_dropbox_root()
+    dropbox_root = (Path(root_setting).expanduser().resolve() if root_setting
+                    else _library_root(list(settings["roots"])))
 
     # The index is a cache and stays OUT of Dropbox: syncing a live SQLite file
     # between machines corrupts it.

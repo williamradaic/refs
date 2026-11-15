@@ -215,12 +215,8 @@ def normalize(key: str, value, root: Path):
             raise SettingError(key, f"there is no folder {value!r}")
         return _home(folder.resolve())
 
-    if kind == "folders":
+    if kind == "folders":                        # (save() checks that watched folders exist)
         folders = [_inside(key, v, root) for v in _strings(key, value) if v]
-        if key == "roots":
-            for folder in folders:
-                if not (root / folder).is_dir():
-                    raise SettingError(key, f"there is no folder {folder!r} in the library folder")
         return _without_builtin(key, folders)
 
     if kind == "folder":
@@ -300,6 +296,17 @@ def save(changes: dict, path: Path | None = None) -> config.Config:
     for key, value in changes.items():
         if key != "dropbox_root":
             clean[key] = normalize(key, value, root)
+
+    # The quick-add folder is always watched: a paper saved there must be found.
+    # (It is created below if new, so it need not exist yet.)
+    roots = clean.get("roots", before.roots)
+    dump = clean.get("dump", before.dump)
+    if roots and not any(dump == r or dump.startswith(r + "/") for r in roots):
+        clean["roots"] = roots = [*roots, dump]
+    if "roots" in clean or "dropbox_root" in clean:
+        for folder in roots:
+            if folder != dump and not (root / folder).is_dir():
+                raise SettingError("roots", f"there is no folder {folder!r} in the library folder")
 
     text = path.read_text(encoding="utf-8") if path.is_file() else HEADER
     try:
