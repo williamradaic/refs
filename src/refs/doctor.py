@@ -135,6 +135,18 @@ def checks(online: bool = True) -> list[Check]:
     else:
         out.append(Check(WARN, "service", "not running in the background",
                          "`refs service install` starts it now and at login"))
+    # The agent skill (optional): a copy older than this refs should be refreshed.
+    from . import agents
+    states = agents.status()
+    old = [name for name, _, state in states if state == "old"]
+    have = [name for name, _, state in states if state in {"current", "linked"}]
+    if old:
+        out.append(Check(WARN, "agent skill", f"out of date for {', '.join(old)}", "`refs skill install`"))
+    elif have:
+        out.append(Check(OK, "agent skill", f"installed for {', '.join(have)}"))
+    else:
+        out.append(Check(OK, "agent skill", "not installed (optional): `refs skill install` "
+                                            "teaches Claude Code and Codex to use refs"))
     out.append(Check(OK, "log", _home(service.LOG)))
     if conn is not None:
         conn.close()

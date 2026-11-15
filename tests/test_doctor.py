@@ -80,3 +80,24 @@ def test_uninstall_can_keep_settings_and_key(mac):
     config.config_path().write_text('roots = ["papers"]\n')
     assert cli.main(["uninstall", "--yes", "--keep-settings", "--keep-key"]) == 0
     assert config.config_path().exists() and mac.stored["key"] == "sk-ant-test"
+
+
+# --- the agent skill (agents.py) ----------------------------------------------------
+
+def test_skill_is_copied_to_each_agent_present_and_links_are_left_alone(tmp_path, monkeypatch):
+    from refs import agents
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex" / "skills").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    # Codex already has refs as a link (a developer's setup): it stays a link.
+    (home / ".codex" / "skills" / "refs").symlink_to(agents.SOURCE.parent)
+    lines = agents.install()
+    copy = home / ".claude" / "skills" / "refs" / "SKILL.md"
+    assert copy.read_bytes() == agents.SOURCE.read_bytes()
+    assert (home / ".codex" / "skills" / "refs").is_symlink() and any("left as it is" in l for l in lines)
+    assert not (home / ".agents").exists()                  # an agent that is not here
+    copy.write_text("an older skill")
+    assert ("Claude Code", copy.parent, "old") in agents.status()
+    agents.install()
+    assert ("Claude Code", copy.parent, "current") in agents.status()

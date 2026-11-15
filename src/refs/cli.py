@@ -129,6 +129,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     data = {
         "dropbox_root": str(cfg.dropbox_root),
         "roots": cfg.roots,
+        "dump": cfg.dump,                       # the quick-add folder
+        "never_sent_to_ai": cfg.no_llm,         # confidential folders (no_llm)
         "index": str(cfg.index_db),
         "last_scan": (conn.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone() or [None])[0],
         "locations": one("SELECT COUNT(*) FROM paths"),
@@ -156,8 +158,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     if data["last_scan"] is None:
         print("The index is empty. Run `refs scan` first.")
         return 0
-    print(f"Dropbox     {data['dropbox_root']}")
+    print(f"Library at  {data['dropbox_root']}")
     print(f"Scanning    {', '.join(data['roots'])}")
+    print(f"Quick-add   {data['dump']}")
+    if data["never_sent_to_ai"]:
+        print(f"Private     {', '.join(data['never_sent_to_ai'])} (never sent to an AI)")
     print(f"Last scan   {data['last_scan']}")
     print(f"Library     {_plural(data['files'], 'distinct file')} in "
           f"{_plural(data['locations'], 'location')} "
@@ -953,6 +958,20 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_skill(args: argparse.Namespace) -> int:
+    """Install the agent skill, or say where it is installed."""
+    from . import agents
+
+    if args.action == "install":
+        for line in agents.install():
+            print(line)
+        print("Agents now know to look papers up with refs (start a new agent session).")
+    else:
+        for name, dest, state in agents.status():
+            print(f"{name:<13} {state:<8} {dest}")
+    return 0
+
+
 def cmd_setup_key(args: argparse.Namespace) -> int:
     """Store the Anthropic API key in the macOS Keychain and check that it works."""
     import getpass
@@ -1096,6 +1115,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--keep-key", action="store_true", help="keep the API key in the Keychain")
     p.add_argument("--yes", action="store_true", help="do not ask before removing")
     p.set_defaults(run=cmd_uninstall)
+
+    p = sub.add_parser("skill", help="teach coding agents (Claude Code, Codex) to use refs")
+    p.add_argument("action", choices=["install", "status"], nargs="?", default="status")
+    p.set_defaults(run=cmd_skill)
 
     p = sub.add_parser("init", help="set refs up: the first-run questions, in the terminal")
     p.add_argument("--again", action="store_true", help="ask again although refs is set up")
