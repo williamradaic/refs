@@ -46,7 +46,7 @@ class Field:
     group: str
     label: str
     help: str
-    kind: str        # library | folders | folder | names | globs | rules | vault | text | number | choice | authors
+    kind: str        # library | folders | folder | local | names | globs | rules | vault | text | number | choice | authors
     choices: list[str] = field(default_factory=list)
     placeholder: str = ""
 
@@ -65,6 +65,11 @@ FIELDS = [
           help="Your university library's proxy address. When the bookmarklet meets a paywall, it "
                "opens the page through the proxy (sign in there if asked), then click + refs again. "
                "The page's address goes after it, encoded when it ends in qurl=. Empty = none."),
+    Field("downloads_folder", "Library", "Downloads folder", kind="local",
+          placeholder="~/Downloads",
+          help="A folder on this Mac where your browser saves PDFs. The Downloads view lists the "
+               "ones that look like papers, to take into refs in a batch. Only that view reads it, "
+               "on this Mac; nothing there is sent anywhere until you take it in. Empty = off."),
     Field("exclude_paths", "Private", "Left out entirely", kind="folders",
           help="Folders or files never read, indexed or sent anywhere: visa, tax or insurance "
                "paperwork that sits inside a watched folder."),
@@ -144,7 +149,7 @@ def _value(cfg: config.Config, key: str):
         return [v for v in value if str(v).lower() not in builtin]
     if key == "dropbox_root":
         return _home(value)
-    if key == "obsidian_vault":
+    if key in {"obsidian_vault", "downloads_folder"}:
         return _home(value) if value else ""
     if isinstance(value, frozenset):
         return sorted(value)
@@ -247,6 +252,17 @@ def normalize(key: str, value, root: Path):
         folder = Path(text).expanduser()
         if not (folder / ".obsidian").is_dir():
             raise SettingError(key, f"{text} is not an Obsidian vault (it has no .obsidian folder)")
+        return _home(folder.resolve())
+
+    if kind == "local":                          # a folder on this Mac, outside the library
+        text = str(value).strip()
+        if not text:
+            return ""                            # off
+        folder = Path(text).expanduser()
+        if not folder.is_dir():
+            raise SettingError(key, f"{text} is not a folder on this Mac")
+        if folder.resolve().is_relative_to(Path(root).resolve()):
+            raise SettingError(key, "that folder is inside the library; pick one outside it")
         return _home(folder.resolve())
 
     if kind == "number":

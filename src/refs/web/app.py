@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import (bib, capture, config, index, ingest, keys, notes, onboarding, organize, reading, records, rename,
+from .. import (bib, capture, config, downloads, index, ingest, keys, notes, onboarding, organize, reading, records, rename,
                 resolve, settings, venues, works)
 from .. import ask as asking
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
@@ -111,10 +111,12 @@ def create_app(watch: bool = False) -> FastAPI:
     # and the page asks how the job is doing until it finishes.
     jobs: dict[str, dict] = {}
 
-    def start_add(thing: str, label: str, queue: bool = False, hints: dict | None = None) -> dict:
+    def start_add(thing: str | list[str], label: str, queue: bool = False, hints: dict | None = None) -> dict:
         """`hints`: what the browser read off the paper's page (doi, pdf_url,
         source_url), passed on as `refs add` options; with them, refs does
-        not fetch the page again."""
+        not fetch the page again. A list of `thing`s (PDFs taken in from
+        Downloads) is one job: `refs add` for each in turn, with "2 of 5" as
+        the message while it runs."""
         job_id = secrets.token_hex(4)
         jobs[job_id] = {"state": "running", "label": label, "message": "", "started": time.time()}
         options = ["--queue"] if queue else []
@@ -123,15 +125,29 @@ def create_app(watch: bool = False) -> FastAPI:
                 options += [flag, str(hints[key])]
         if hints and (hints.get("doi") or hints.get("pdf_url")):
             options.append("--no-page")
+        things = [thing] if isinstance(thing, str) else list(thing)
 
         def run() -> None:
-            try:
-                done = subprocess.run([sys.executable, "-m", "refs.cli", "add", thing, *options],
-                                      capture_output=True, text=True, timeout=1800)
-                jobs[job_id].update(state="done" if done.returncode == 0 else "failed",
-                                    message=(done.stdout or done.stderr).strip())
-            except Exception as error:                     # timeout, or could not start
-                jobs[job_id].update(state="failed", message=f"{type(error).__name__}: {error}")
+            failed, last = [], ""
+            for n, one in enumerate(things, 1):
+                if len(things) > 1:
+                    jobs[job_id]["message"] = f"{n} of {len(things)}: {Path(one).name}"
+                try:
+                    done = subprocess.run([sys.executable, "-m", "refs.cli", "add", one, *options],
+                                          capture_output=True, text=True, timeout=1800)
+                    last = (done.stdout or done.stderr).strip()
+                    if done.returncode != 0:
+                        failed.append(f"{Path(one).name}: {last.splitlines()[0] if last else 'failed'}")
+                except Exception as error:                 # timeout, or could not start
+                    last = f"{type(error).__name__}: {error}"
+                    failed.append(f"{Path(one).name}: {last}")
+            if len(things) == 1:
+                jobs[job_id].update(state="failed" if failed else "done", message=last)
+            else:
+                summary = f"read {len(things) - len(failed)} of {len(things)} PDFs"
+                jobs[job_id].update(state="failed" if len(failed) == len(things) else "done",
+                                    message="\n".join([summary + (f"; {len(failed)} failed" if failed else ""),
+                                                       *failed]))
 
         threading.Thread(target=run, daemon=True).start()
         return {"job": job_id}
@@ -308,6 +324,14 @@ def create_app(watch: bool = False) -> FastAPI:
             items.sort(key=lambda i: i["queued"] or "")
         return {"items": items[:800], "asked": outcome.asked, "message": outcome.message}
 
+    def downloads_waiting(conn) -> int | None:
+        if downloads.folder(cfg) is None:
+            return None
+        count, unseen = downloads.waiting(cfg, conn)
+        if unseen:
+            warm_downloads()
+        return count
+
     @app.get("/api/sidebar")
     def sidebar() -> dict:
         """Counts for the left pane: presets, then works per course and project."""
@@ -340,6 +364,9 @@ def create_app(watch: bool = False) -> FastAPI:
                 "wanted": sum(not w["files"] for w in all_works.values()),
                 "renames": len(rename.plan(cfg, conn, everything, all_works)[0]),
                 "copies": len(organize.copies(cfg, conn)),
+                # PDFs in Downloads that look like papers and are not in refs
+                # (None = no Downloads folder: the entry is hidden).
+                "downloads": downloads_waiting(conn),
                 "unprocessed": conn.execute(
                     "SELECT COUNT(*) FROM files WHERE status IS NULL "
                     "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
@@ -608,6 +635,60 @@ def create_app(watch: bool = False) -> FastAPI:
                 scanner.scan(cfg, conn)
         return {"folder": folder, "done": [{"from": a, "to": b} for a, b in done],
                 "refused": [{"path": p, "why": why} for p, why in failed]}
+
+    # --- PDFs in Downloads, outside the library (downloads.py) ---------------------------
+
+    warming = threading.Lock()
+
+    def warm_downloads() -> None:
+        """Look at new PDFs in Downloads in the background (one pass at a time),
+        so the sidebar count and the view are ready without making either wait."""
+        if not warming.acquire(blocking=False):
+            return
+
+        def run() -> None:
+            try:
+                downloads.warm(cfg)
+            finally:
+                warming.release()
+        threading.Thread(target=run, daemon=True).start()
+
+    @app.get("/api/downloads")
+    def downloads_list() -> dict:
+        """The PDFs directly in the Downloads folder, newest first, each with
+        whether it looks like a paper and whether refs has it already."""
+        found = downloads.listing(cfg, index.connect(cfg))
+        return found | {"setting": str(cfg.downloads_folder or ""), "dump": cfg.dump,
+                        "where": settings._home(found["folder"]) if found["folder"] else ""}
+
+    @app.post("/api/downloads/take")
+    def downloads_take(names: list[str] = Body(embed=True), folder: str | None = Body(default=None, embed=True),
+                       mode: str = Body(default="move", embed=True), create: bool = Body(default=False, embed=True),
+                       queue: bool = Body(default=False, embed=True),
+                       x_refs: str | None = Header(default=None)) -> dict:
+        """Move (or copy) PDFs from Downloads into the quick-add folder (no
+        `folder`) or into a library folder (`create` makes it first), then
+        read them, as one job. PDFs refs has already are left in Downloads
+        and reported in `known`. Names only: nothing outside Downloads, and
+        nothing in its subfolders, can be named."""
+        guard(x_refs)
+        with ingest.exclusive(cfg):              # the watcher must not read them half-moved
+            conn = index.connect(cfg)
+            try:
+                if create and folder:
+                    folder = organize.make_folder(cfg, folder)
+                result = downloads.take(cfg, conn, names, folder, mode)
+            except organize.Refused as error:     # downloads.Refused is one too
+                raise refused(error)
+        taken = result["taken"]
+        job = None
+        if taken:
+            label = taken[0][1].split("/")[-1] if len(taken) == 1 else f"{len(taken)} PDFs from Downloads"
+            job = start_add([str(cfg.absolute(rel)) for _, rel in taken], label, queue)["job"]
+        return {"folder": result["folder"], "job": job, "mode": mode,
+                "taken": [{"name": n, "to": rel} for n, rel in taken],
+                "known": [{"name": n, "path": p} for n, p in result["known"]],
+                "refused": [{"name": n, "why": why} for n, why in result["refused"]]}
 
     @app.post("/api/open")
     def open_file(path: str = Body(embed=True), reveal: bool = Body(default=False, embed=True),

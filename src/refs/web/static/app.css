@@ -277,7 +277,7 @@ header .act { white-space: nowrap; }
 .row .da { color: var(--dim); }
 
 /* --- review views and the "file to…" picker --- */
-.bar { position: sticky; top: 0; z-index: 1; display: flex; gap: 0 2ch; padding: 4px 2ch;
+.bar { position: sticky; top: 0; z-index: 1; display: flex; flex-wrap: wrap; gap: 0 2ch; padding: 4px 2ch;
        background: var(--bg); border-bottom: 1px solid var(--line); }
 .topic.folder .act, .copyset .topic .act { margin-left: 1ch; }
 .prop { display: grid; grid-template-columns: 3ch minmax(0, 2fr) minmax(0, 3fr); column-gap: 1ch;
@@ -287,6 +287,16 @@ header .act { white-space: nowrap; }
 .prop .old { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prop .new { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prop .who { grid-column: 2 / 4; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* downloads view: name and date on one line, the verdict below */
+.prop.dl { grid-template-columns: 3ch minmax(10ch, 1fr) minmax(0, max-content); }
+.prop.dl .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prop.dl .about { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prop.dl .who.paper { color: var(--dim); }
+.prop.dl.off { cursor: default; }
+.prop.dl.off .name { color: var(--faint); }
+.bar .act, .bar .where { white-space: nowrap; }
+.dlopts { display: flex; flex-wrap: wrap; gap: 0 2ch; margin-top: 6px; color: var(--dim); }
+.dlopts input { accent-color: var(--accent); }
 details.kept { margin-top: 1.5em; }
 details.kept > summary { cursor: pointer; }
 .copy { display: flex; justify-content: space-between; gap: 2ch; padding: 1px 2ch 1px 4ch; }
