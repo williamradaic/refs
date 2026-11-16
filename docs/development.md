@@ -56,6 +56,7 @@ there unless you mean to pay for it.
 | `reading.py`, `notes.py` | read status from your markup; Obsidian notes |
 | `bib.py`, `bibkeys.py` | BibTeX; keys learned from project `.bib` files |
 | `rename.py`, `organize.py` | tidy names, file to / copy to (one or many, new folders), copies (journaled, undoable) |
+| `downloads.py` | PDFs in ~/Downloads: which look like papers (read on this Mac, free), taking them into the library |
 | `capture.py` | quick add: reading links and identifiers, finding a PDF, the bookmarklet's key |
 | `ask.py` | Claude Haiku ranks a shortlist when local search is unsure |
 | `doctor.py`, `agents.py`, `service.py`, `keys.py` | `refs doctor` and `uninstall`, the agent skill, the login service, the Keychain |

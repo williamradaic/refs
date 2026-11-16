@@ -3,14 +3,17 @@
 
 const state = {
   query: "",          // what is typed in the search bar
-  view: "all",        // sidebar preset: all | queue | unread | reading | read | review | wanted | renames | copies
+  view: "all",        // sidebar preset: all | queue | unread | reading | read | review | wanted | renames | copies | downloads
   context: null,      // selected course or project key, e.g. "coursework/2026-fall/220a"
   tag: null,          // selected field tag
   scope: "library",   // "library" = papers only, "all" = course material too
   items: [],          // current search results
   selected: 0,        // index of the highlighted row
   adding: false,      // true while the bar is in "add a paper" mode
-  picked: new Set(),  // renames view: paths ticked for renaming
+  picked: new Set(),  // renames view: paths ticked for renaming; downloads view: file names ticked
+  dlOthers: false,    // downloads view: also list the PDFs that do not look like papers
+  dlMode: "move",     // downloads view: "move" out of Downloads, or "copy" (the original stays)
+  dlQueue: false,     // downloads view: also put what is taken in on the reading queue
   marked: new Map(),  // rows selected for a batch action (⌘-click, ⇧-click, x): id → item.
                       //   Kept across searches, so a selection can be gathered from several.
   lastFiled: 0,       // how many files the last file to… / copy to… moved (u undoes them)
@@ -158,6 +161,8 @@ async function loadSidebar() {
   html += nav("needs review", data.presets.review, `data-view="review"`);
   html += nav("renames", data.presets.renames, `data-view="renames"`);
   html += nav("copies", data.presets.copies, `data-view="copies"`);
+  // PDFs in ~/Downloads that look like papers (null: no Downloads folder set).
+  if (data.presets.downloads != null) html += nav("downloads", data.presets.downloads, `data-view="downloads"`);
   // PDFs that are on disk but were never read (an interrupted add, or a file
   // that arrived through Finder). Shown only when there are some.
   if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
@@ -840,8 +845,9 @@ $("detail").addEventListener("click", (event) => {
   else if (el.closest(".choice")) {
     const choice = el.closest(".choice");
     if (el.dataset.inside) pickerInside(choice.dataset.folder);
-    else fileTo(picker.paths, choice.dataset.folder, picker.mode, choice.dataset.create === "1");
+    else pickerChoose(choice.dataset.folder, choice.dataset.create === "1");
   }
+  else if (el.dataset.dl) takeDownloads(el.dataset.dl);
   else if (el.dataset.act === "edit") showEditor();
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
   else if (el.dataset.act === "note-reload") renderDetail();
@@ -951,7 +957,10 @@ async function follow(start, label) {
     for (;;) {
       await new Promise((resolve) => setTimeout(resolve, 1500));
       const job = await get(`/api/job/${begun.job}`);
-      if (job.state === "running") { say(`adding ${label} … ${job.seconds}s`, 0); continue; }
+      if (job.state === "running") {
+        say(`adding ${label} … ${job.message ? `${job.message} · ` : ""}${job.seconds}s`, 0);
+        continue;
+      }
       say((job.state === "failed" ? "failed: " : "") + (job.message.split("\n")[0] || job.state), 12000);
       break;
     }
@@ -1064,6 +1073,129 @@ async function undoBatch(count) {
   state.lastFiled = 0;
   say(`undone: ${result.restored} of ${count}`);
   loadSidebar(); search();
+}
+
+// --- review: PDFs in Downloads ----------------------------------------------------------
+
+// The PDFs directly in ~/Downloads (the setting), newest first. The server sorts
+// each into paper / maybe / other from what is printed in it (downloads.py), on
+// this Mac and for free; papers and maybes are listed, the rest on request.
+// Ticked files are moved (or copied) into the quick-add folder or a folder you
+// pick, then read as one job. Files refs already has stay where they are.
+const DL_KIND = { paper: "paper", maybe: "maybe", other: "not a paper?", unreadable: "unreadable",
+  incomplete: "downloading?" };
+const fileSize = (bytes) => bytes < 1e6 ? `${Math.max(1, Math.round(bytes / 1e3))} kB` : `${(bytes / 1e6).toFixed(1)} MB`;
+const fileDate = (t) => new Date(t * 1000).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+
+async function showDownloads(token) {
+  const data = await get("/api/downloads");
+  if (token !== listToken) return;
+  state.items = [];
+  state.dl = data;
+  if (!data.folder) {
+    $("count").textContent = "downloads";
+    $("list").innerHTML = `<div class="empty">no Downloads folder${data.setting ? ` at ${esc(data.setting)}` : ""}.
+      Set one under settings (Library → Downloads folder).</div>`;
+    $("detail").innerHTML = "";
+    return;
+  }
+  const papers = (i) => ["paper", "maybe"].includes(i.kind);
+  const waiting = data.items.filter((i) => !i.in_refs);
+  const shown = data.items.filter((i) => state.dlOthers || papers(i) || i.in_refs);
+  const hidden = data.items.length - shown.length;
+  const takeable = new Set(waiting.filter((i) => i.kind !== "incomplete").map((i) => i.name));
+  for (const name of [...state.picked]) if (!takeable.has(name)) state.picked.delete(name);
+  $("count").textContent = `${waiting.filter(papers).length} papers in Downloads`;
+  // The sidebar's count was taken before the server had looked at new files.
+  const nav = $("side").querySelector('.nav[data-view="downloads"] .n');
+  if (nav) nav.textContent = waiting.filter(papers).length;
+
+  let html = `<div class="bar">
+    <button class="act" data-pick="all">select all</button>
+    <button class="act" data-pick="none">select none</button>
+    <span class="where"><span id="npicked">${state.picked.size}</span> ticked</span>
+    <button class="act" data-dl-others="1">${state.dlOthers ? "hide the other PDFs" : `show ${hidden} other PDFs`}</button>
+  </div>`;
+  if (!shown.length) html += `<div class="empty">no PDFs that look like papers in ${esc(data.folder)}.</div>`;
+  for (const item of shown) {
+    const can = takeable.has(item.name);
+    const about = `${fileDate(item.modified)} · ${fileSize(item.size)}${item.pages ? ` · ${item.pages} p.` : ""}`;
+    const why = item.in_refs ? `already in refs: ${item.in_refs}` : `${DL_KIND[item.kind] ?? item.kind}: ${item.why}`;
+    html += `<label class="prop dl${can ? "" : " off"}"><input type="checkbox" data-path="${esc(item.name)}"${
+      state.picked.has(item.name) ? " checked" : ""}${can ? "" : " disabled"}>
+      <span class="name" title="${esc(item.name)}">${esc(item.name)}</span>
+      <span class="about">${esc(about)}</span>
+      <span class="who ${item.kind}" title="${esc(why)}">${esc(why)}</span></label>`;
+  }
+  if (data.older) html += `<div class="where" style="padding: 4px 2ch">${data.older} older PDFs are not listed.</div>`;
+  $("list").innerHTML = html;
+  drawDownloadsDetail();
+}
+
+function drawDownloadsDetail() {
+  const data = state.dl;
+  const copy = state.dlMode === "copy";
+  $("detail").innerHTML = `<div class="label">Downloads</div>
+    <p>PDFs saved in <code>${esc(data.where)}</code>, newest first. Tick the ones to bring into refs.</p>
+    <div class="acts" style="margin-top:8px">
+      <button class="act" data-dl="dump">take into ${esc(data.dump)} (<span class="dln">${state.picked.size}</span>)</button>
+      <button class="act" data-dl="folder">take into folder…</button>
+    </div>
+    <div class="dlopts">
+      <label><input type="radio" name="dlmode" value="move"${copy ? "" : " checked"}> move out of Downloads</label>
+      <label><input type="radio" name="dlmode" value="copy"${copy ? " checked" : ""}> copy (the original stays)</label>
+      <label><input type="checkbox" name="dlqueue"${state.dlQueue ? " checked" : ""}> also queue them</label>
+    </div>
+    <div class="picker" id="dlpicker"></div>
+    <p class="where" style="margin-top:8px">Each one is then read like any new paper (about $0.001 a PDF).
+    A PDF refs already has, byte for byte, is left in Downloads.</p>
+    <p class="where" style="margin-top:8px"><b>paper</b> and <b>maybe</b> come from what is printed in
+    the PDF (an identifier, an abstract, references, its length), read on this Mac; nothing is sent
+    anywhere before you take a file in. Receipts, tickets and statements are under
+    <b>show other PDFs</b>.</p>`;
+  for (const input of $("detail").querySelectorAll("input[name=dlmode]")) {
+    input.addEventListener("change", () => { state.dlMode = input.value; });
+  }
+  $("detail").querySelector("input[name=dlqueue]").addEventListener("change", (event) => {
+    state.dlQueue = event.target.checked;
+  });
+}
+
+function dlCount() {
+  for (const el of $("detail").querySelectorAll(".dln")) el.textContent = state.picked.size;
+}
+
+async function takeDownloads(where) {
+  const names = [...state.picked];
+  if (!names.length) { say("tick the PDFs to take in first"); return; }
+  if (where === "folder") {
+    openPicker(names, state.dlMode, $("dlpicker"), (folder, create) => sendDownloads(names, folder, create));
+    return;
+  }
+  sendDownloads(names, null, false);
+}
+
+async function sendDownloads(names, folder, create) {
+  const copying = state.dlMode === "copy";
+  say(`${copying ? "copying" : "moving"} ${names.length} PDFs …`, 0);
+  const response = await fetch("/api/downloads/take", { method: "POST",
+    headers: { "Content-Type": "application/json", "X-Refs": "1" },
+    body: JSON.stringify({ names, folder, create, mode: state.dlMode, queue: state.dlQueue }) });
+  const result = await response.json();
+  if (!response.ok) { say(result.detail ?? "could not take them in", 9000); return; }
+  folderList = null;                          // a new folder may have been made
+  picker.box?.replaceChildren();
+  state.picked.clear();
+  const { taken, known, refused } = result;
+  const parts = [];
+  if (taken.length) parts.push(`${copying ? "copied" : "moved"} ${taken.length} into ${result.folder}`);
+  if (known.length) parts.push(`${known.length} already in refs (left in Downloads)`);
+  if (refused.length) parts.push(`${refused.length} not taken (${refused[0].name}: ${refused[0].why})`);
+  search();                                   // the list without what left
+  if (!result.job) { say(parts.join("; ") || "nothing taken in", 12000); loadSidebar(); return; }
+  say(parts.join("; ") + "; reading …", 0);
+  await follow(Promise.resolve({ job: result.job }), taken.length === 1 ? taken[0].to.split("/").pop()
+    : `${taken.length} PDFs`);
 }
 
 // --- review: identical copies -------------------------------------------------------------
@@ -1321,19 +1453,20 @@ $("detail").addEventListener("click", async (event) => {
   drawSettings();
 });
 
-const REVIEW_VIEWS = { renames: showRenames, copies: showCopies, settings: showSettings };
+const REVIEW_VIEWS = { renames: showRenames, copies: showCopies, downloads: showDownloads, settings: showSettings };
 
 $("list").addEventListener("change", (event) => {
   const path = event.target.dataset?.path;
   if (!path) return;
   event.target.checked ? state.picked.add(path) : state.picked.delete(path);
   $("npicked").textContent = state.picked.size;
+  dlCount();
 });
 
 $("list").addEventListener("click", async (event) => {
   const el = event.target.closest("button");
   if (!el) return;
-  const boxes = [...$("list").querySelectorAll("input[data-path]")];
+  const boxes = [...$("list").querySelectorAll("input[data-path]:not(:disabled)")];
   const tick = (filter, on) => boxes.filter(filter).forEach((box) => {
     box.checked = on; on ? state.picked.add(box.dataset.path) : state.picked.delete(box.dataset.path);
   });
@@ -1344,6 +1477,7 @@ $("list").addEventListener("click", async (event) => {
     const inFolder = (box) => box.dataset.path.slice(0, box.dataset.path.lastIndexOf("/")) === folder;
     tick(inFolder, !boxes.filter(inFolder).every((box) => box.checked));   // toggles the folder
   }
+  else if (el.dataset.dlOthers) { state.dlOthers = !state.dlOthers; search(); return; }
   else if (el.dataset.apply) await applyRenames();
   else if (el.dataset.undo) await undoBatch(Number(el.dataset.undo));
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
@@ -1367,6 +1501,7 @@ $("list").addEventListener("click", async (event) => {
   }
   const counter = $("npicked");
   if (counter) counter.textContent = state.picked.size;
+  dlCount();
 });
 
 // --- file to… / copy to… --------------------------------------------------------------------------------
@@ -1378,12 +1513,14 @@ $("list").addEventListener("click", async (event) => {
 // `paths` are one or many PDFs; `mode` is "move" (file to…) or "copy" (copy
 // to…: the originals stay put).
 let folderList = null;
-let picker = { paths: [], mode: "move", box: null, at: 0 };
+let picker = { paths: [], mode: "move", box: null, at: 0, onPick: null };
 
-async function openPicker(paths, mode = "move", box = null) {
+// `onPick(folder, create)`: what choosing a folder does, when it is not filing
+// library PDFs (the downloads view takes files in from outside the library).
+async function openPicker(paths, mode = "move", box = null, onPick = null) {
   box ??= [...$("detail").querySelectorAll(".picker")].find((el) => el.dataset.for === paths[0]);
   if (!box) return;
-  picker = { paths, mode, box, at: 0 };
+  picker = { paths, mode, box, at: 0, onPick };
   // The box takes the keyboard at once, before the folder list has loaded:
   // otherwise quick typing would land on the page's single-key shortcuts.
   const what = paths.length > 1 ? `${paths.length} PDFs` : "";
@@ -1405,11 +1542,16 @@ async function openPicker(paths, mode = "move", box = null) {
       pickerInside(choices[picker.at].dataset.folder);
     } else if (event.key === "Enter" && choices[picker.at]) {
       const choice = choices[picker.at];
-      fileTo(picker.paths, choice.dataset.folder, picker.mode, choice.dataset.create === "1");
+      pickerChoose(choice.dataset.folder, choice.dataset.create === "1");
     }
   });
   drawPicker();
   input.focus();
+}
+
+function pickerChoose(folder, create) {
+  if (picker.onPick) picker.onPick(folder, create);
+  else fileTo(picker.paths, folder, picker.mode, create);
 }
 
 // Fill the box with a folder's path and a slash: what follows is a new folder's name.

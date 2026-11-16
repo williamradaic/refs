@@ -108,6 +108,10 @@ DEFAULTS: dict = {
     # address goes after it, URL-encoded when it ends in "qurl=" (EZproxy).
     # UC Berkeley: "https://libproxy.berkeley.edu/login?qurl=". "" = none.
     "library_proxy": "",
+    # Where your browser saves downloads, a folder on this Mac ("~/..."), not
+    # in the library. The page lists the PDFs in it that look like papers, to
+    # bring into refs in a batch. "" = off: refs never looks there.
+    "downloads_folder": "~/Downloads",
     # Annotation authors that mean you (reading.py). Your highlights and notes
     # in a PDF mark it as being read or read; marks by anyone else (an
     # instructor's highlights on a course reading) are not counted. Preview
@@ -149,6 +153,7 @@ class Config:
     annotation_authors: list[str] = field(default_factory=list)
     contact_email: str = ""     # also read on its own by contact_email() below
     library_proxy: str = ""     # e.g. EZproxy's ".../login?qurl="; "" = none
+    downloads_folder: Path | None = None   # None = off: the Downloads view is hidden
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -257,6 +262,9 @@ def load(config_file: Path | None = None) -> Config:
         annotation_authors=[str(name) for name in settings["annotation_authors"]],
         contact_email=str(settings["contact_email"]).strip(),
         library_proxy=str(settings["library_proxy"]).strip(),
+        # Expanded now, so "~" means the HOME of this run (the tests use a fake one).
+        downloads_folder=(Path(settings["downloads_folder"]).expanduser()
+                          if str(settings["downloads_folder"]).strip() else None),
     )
 
 

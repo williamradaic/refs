@@ -71,6 +71,18 @@ is saved without one and attaches itself when you save the PDF into the
 quick-add folder later. Shift+Enter in the add bar also puts the paper on your
 reading queue.
 
+**From Downloads, in a batch.** After a literature search that left a pile of
+PDFs in `~/Downloads`, open **downloads** (sidebar, under Review). It lists the
+PDFs saved there, newest first, sorted into *paper*, *maybe* and the rest
+(receipts, tickets, statements, behind "show other PDFs"). The sorting reads the
+PDFs' first and last pages on your Mac, for free: an identifier, an abstract,
+a reference list, the length. Tick the ones you want (or "select all"), then
+**take into the quick-add folder**, or **take into folder…** to put them
+straight into a course or project folder (a new one if you type a path).
+They are moved out of Downloads, or copied if you choose copy, then read like
+any new paper. A PDF refs already has is left where it is and reported. The
+folder is a setting (Library → Downloads folder); empty turns the view off.
+
 **The bookmarklet** (`/bookmarklet`, drag "+ refs" to the bookmarks bar) adds
 the paper whose page you are on, in one click. It reads the page's citation
 details and fetches the PDF in your browser, signed in as you, so it works
