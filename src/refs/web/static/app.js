@@ -11,6 +11,9 @@ const state = {
   selected: 0,        // index of the highlighted row
   adding: false,      // true while the bar is in "add a paper" mode
   picked: new Set(),  // renames view: paths ticked for renaming
+  marked: new Map(),  // rows selected for a batch action (⌘-click, ⇧-click, x): id → item.
+                      //   Kept across searches, so a selection can be gathered from several.
+  lastFiled: 0,       // how many files the last file to… / copy to… moved (u undoes them)
   lastBatch: 0,       // how many renames the last "rename selected" did (for undo)
   dump: "papers-dump", // the quick-add folder's name (config.toml `dump`), from the sidebar
 };
@@ -71,9 +74,13 @@ const COLUMNS = {
              text: (i) => i.added ?? "" },
   modified: { label: "modified", width: 10, cls: "da", sort: (i) => i.modified ?? "",
              text: (i) => i.modified ?? "" },
+  // When the paper entered refs (its record was made), as opposed to the
+  // PDF's own dates above: useful for "what did I collect last week".
+  in_refs: { label: "in refs", name: "added to refs", width: 10, cls: "da", sort: (i) => i.in_refs ?? "",
+             text: (i) => i.in_refs ?? "" },
 };
 COLUMNS.st.name = "status"; COLUMNS.abbr.name = "journal abbreviation"; COLUMNS.rd.name = "queue / reading";
-const DEFAULT_LAYOUT = { order: ["rd", "st", "authors", "year", "title", "abbr", "venue", "added", "modified"],
+const DEFAULT_LAYOUT = { order: ["rd", "st", "authors", "year", "title", "abbr", "venue", "added", "in_refs", "modified"],
   hidden: [], widths: {}, sort: null, side: null, detail: null };
 
 // Column order, widths, sort and pane sizes are remembered in this browser.
@@ -135,6 +142,7 @@ function say(text, ms = 4000) {
 async function loadSidebar() {
   const data = await get("/api/sidebar");
   state.dump = data.dump || state.dump;
+  state.proxy = data.proxy ?? "";     // the library proxy (settings), "" = none
   const nav = (label, count, attrs, sub = false) =>
     `<div class="nav${sub ? " sub" : ""}" ${attrs}><span>${esc(label)}</span><span class="n">${count}</span></div>`;
 
@@ -258,6 +266,7 @@ async function search(keepId = null, ask = "off") {
   else if (data.message) say(`✦ ${data.message}`, 9000);
   else if (ask !== "off") say("");
   sortItems();
+  for (const item of state.items) if (state.marked.has(item.id)) state.marked.set(item.id, item);
   const kept = keepId ? state.items.findIndex((i) => i.id === keepId) : -1;
   state.selected = Math.max(0, kept);
   renderList();
@@ -317,7 +326,7 @@ function renderList() {
       const number = loc.topic_order != null ? String(loc.topic_order).padStart(2, "0") + " " : "";
       html += `<div class="topic">${esc(number + (loc.topic ?? loc.section ?? "unfiled"))}</div>`;
     }
-    const cls = ["row", i === state.selected ? "sel" : ""].join(" ");
+    const cls = ["row", i === state.selected ? "sel" : "", state.marked.has(item.id) ? "mk" : ""].join(" ");
     html += `<div class="${cls}" data-i="${i}">` + visibleColumns().map((id) => {
       const column = COLUMNS[id];
       return column.cell ? column.cell(item)
@@ -451,16 +460,110 @@ function select(i, scroll = true) {
   renderDetail();
 }
 
+// Plain click: select one row (and drop any batch selection, as in Finder).
+// ⌘-click: add or remove a row; ⇧-click: add the range from the selected row.
 $("list").addEventListener("click", (event) => {
   const row = event.target.closest(".row");
-  if (row) select(Number(row.dataset.i), false);
+  if (!row || !state.items.length) return;
+  const i = Number(row.dataset.i);
+  if (event.metaKey || event.ctrlKey) {
+    if (!state.marked.size) markRow(state.selected, true);   // the row you were on counts too
+    markRow(i);
+  } else if (event.shiftKey) {
+    const [from, to] = [state.selected, i].sort((a, b) => a - b);
+    for (let n = from; n <= to; n++) markRow(n, true);
+  } else if (state.marked.size) {
+    state.marked.clear();
+  }
+  select(i, false);
+  if (event.metaKey || event.ctrlKey || event.shiftKey || !state.marked.size) paintMarks();
+});
+// ⇧-click would otherwise select the text between the two rows.
+$("list").addEventListener("mousedown", (event) => {
+  if (event.shiftKey && event.target.closest(".row")) event.preventDefault();
 });
 $("list").addEventListener("dblclick", (event) => { if (event.target.closest(".row")) act("open"); });
+
+// --- batch selection ------------------------------------------------------------------
+// Marked rows (state.marked) get one set of actions in the detail pane: file
+// to… / copy to… a folder (a new one too), queue, mark read.
+
+function markRow(i, on) {
+  const item = state.items[i];
+  if (!item) return;
+  if (on ?? !state.marked.has(item.id)) state.marked.set(item.id, item);
+  else state.marked.delete(item.id);
+}
+function paintMarks() {
+  for (const row of $("list").querySelectorAll(".row")) {
+    row.classList.toggle("mk", state.marked.has(state.items[Number(row.dataset.i)]?.id));
+  }
+  renderDetail();
+}
+function clearMarks() { state.marked.clear(); paintMarks(); }
+
+// The PDF a batch action moves for each paper: the copy in the quick-add folder
+// if there is one (the usual "file it from the dump"), else the one in the
+// course or project you are looking at, else its first.
+function primaryPath(item) {
+  const locs = item.locations ?? [];
+  const inDump = (l) => l.path === state.dump || l.path.startsWith(state.dump + "/");
+  return (locs.find(inDump) ?? locs.find((l) => l.context === state.context) ?? locs[0])?.path ?? null;
+}
+
+function renderBatch() {
+  const items = [...state.marked.values()];
+  const withPdf = items.filter(primaryPath);
+  let html = `<h1>${items.length} selected</h1>
+    <p class="where">⌘-click or <kbd>x</kbd> adds or removes a row, ⇧-click a range, <kbd>esc</kbd> clears.
+    The selection stays while you search, so you can gather papers from several searches.</p>
+    <div class="acts" style="margin-top:6px">
+      <button class="act" data-batch="move" ${withPdf.length ? "" : "disabled"}>file to…</button>
+      <button class="act" data-batch="copy" ${withPdf.length ? "" : "disabled"}>copy to…</button>
+      <button class="act" data-batch="queue">queue all</button>
+      <button class="act" data-batch="read">mark read</button>
+      <button class="act" data-batch="clear">clear</button>
+    </div><div class="picker" id="batchpicker"></div>`;
+  if (withPdf.length < items.length) {
+    html += `<p class="where">${items.length - withPdf.length} of them have no PDF yet and are left out of filing.</p>`;
+  }
+  html += `<div class="label">Selected</div>`;
+  for (const item of items) {
+    const path = primaryPath(item);
+    const who = item.authors?.length ? `${authorsShort(item.authors)} (${item.year ?? "n.d."}) ` : "";
+    html += `<div class="loc"><div>${esc(who + (item.title ?? path?.split("/").pop() ?? ""))}</div>
+      <div class="path">${esc(path ? path.slice(0, path.lastIndexOf("/")) : "no pdf")}</div></div>`;
+  }
+  $("detail").innerHTML = html;
+  $("detail").dataset.bibtex = "";
+  currentWork = null;
+}
+
+async function batchAct(name) {
+  const items = [...state.marked.values()];
+  if (name === "clear") { clearMarks(); return; }
+  if (name === "move" || name === "copy") {
+    const paths = items.map(primaryPath).filter(Boolean);
+    if (paths.length) openPicker(paths, name, $("batchpicker"));
+    return;
+  }
+  // Queue or mark read, one paper at a time (each is a small write).
+  const works = items.filter((i) => i.work_id);
+  for (const item of works) {
+    const done = name === "queue"
+      ? await post(`/api/work/${item.work_id}/queue`, { on: true })
+      : await post(`/api/work/${item.work_id}/read`, { status: "read" });
+    if (!done.detail) Object.assign(item, done);
+  }
+  say(`${name === "queue" ? "queued" : "marked read"}: ${works.length} papers`);
+  loadSidebar(); search(state.items[state.selected]?.id ?? null);
+}
 
 // --- detail ------------------------------------------------------------------------
 
 let detailToken = 0;
 async function renderDetail() {
+  if (state.marked.size) { ++detailToken; renderBatch(); return; }
   const item = state.items[state.selected];
   if (!item) { $("detail").innerHTML = ""; return; }
   const token = ++detailToken;        // ignore a slow answer for a row we already left
@@ -503,6 +606,7 @@ async function renderDetail() {
   }
   if (item.queued) html += `<dt>queue</dt><dd><span class="rd q">▸</span> since ${esc(item.queued.slice(0, 10))}</dd>`;
   if (item.added) html += `<dt>added</dt><dd>${esc(item.added)}</dd>`;
+  if (item.in_refs) html += `<dt>in refs</dt><dd>${esc(item.in_refs)}</dd>`;
   if (item.modified) html += `<dt>modified</dt><dd>${esc(item.modified)}</dd>`;
   html += `</dl>`;
   if (work) {
@@ -532,7 +636,15 @@ async function renderDetail() {
       <div class="acts"><button class="act" data-identify="${esc(item.locations[0].path)}">identify it now</button></div>`;
   }
   html += `<div class="label">Files</div>`;
-  if (!item.locations.length) html += `<p class="where">no pdf yet. Save it into ${esc(state.dump)} and it attaches itself.</p>`;
+  if (!item.locations.length) {
+    html += `<p class="where">no pdf yet. Save it into ${esc(state.dump)} and it attaches itself.</p>`;
+    // Paywalled? Open its page through the library proxy (settings), signed in as you.
+    const page = work?.user?.source_url || (meta.doi ? `https://doi.org/${meta.doi}` : "");
+    if (state.proxy && page) {
+      const via = state.proxy + (/qurl=$/i.test(state.proxy) ? encodeURIComponent(page) : page);
+      html += `<div class="acts"><a class="act" href="${esc(via)}" target="_blank" rel="noreferrer">through the library</a></div>`;
+    }
+  }
   for (const loc of item.locations) {
     const place = [loc.context, loc.topic ?? loc.section].filter(Boolean).join(" · ");
     html += `<div class="loc"><div>${esc(place)}</div>
@@ -722,11 +834,13 @@ $("detail").addEventListener("click", (event) => {
   }
   else if (el.dataset.open) post("/api/open", { path: el.dataset.open });
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
-  else if (el.dataset.fileto) openPicker(el.dataset.fileto, "move");
-  else if (el.dataset.copyto) openPicker(el.dataset.copyto, "copy");
-  else if (el.dataset.folder) {
-    const box = el.closest(".picker");
-    fileTo(box.dataset.for, el.dataset.folder, box.dataset.mode);
+  else if (el.dataset.fileto) openPicker([el.dataset.fileto], "move");
+  else if (el.dataset.copyto) openPicker([el.dataset.copyto], "copy");
+  else if (el.dataset.batch) batchAct(el.dataset.batch);
+  else if (el.closest(".choice")) {
+    const choice = el.closest(".choice");
+    if (el.dataset.inside) pickerInside(choice.dataset.folder);
+    else fileTo(picker.paths, choice.dataset.folder, picker.mode, choice.dataset.create === "1");
   }
   else if (el.dataset.act === "edit") showEditor();
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
@@ -947,7 +1061,8 @@ async function applyRenames() {
 async function undoBatch(count) {
   const result = await post("/api/undo", { count });
   state.lastBatch = 0;
-  say(`restored ${result.restored} names`);
+  state.lastFiled = 0;
+  say(`undone: ${result.restored} of ${count}`);
   loadSidebar(); search();
 }
 
@@ -1257,52 +1372,106 @@ $("list").addEventListener("click", async (event) => {
 // --- file to… / copy to… --------------------------------------------------------------------------------
 
 // A filter box over every folder refs knows (where PDFs already are, and the
-// folders above them). Type words of the path, then Enter or click.
-// `mode` is "move" (file to…) or "copy" (copy to…: the original stays put).
+// folders above them). Type words of the path; ↑/↓ choose, Enter files.
+// A new folder: Tab (or "+" on a folder) fills in that folder's path, then
+// type the new name after it; the first choice becomes "new folder …".
+// `paths` are one or many PDFs; `mode` is "move" (file to…) or "copy" (copy
+// to…: the originals stay put).
 let folderList = null;
-async function openPicker(path, mode = "move") {
-  const box = [...$("detail").querySelectorAll(".picker")].find((el) => el.dataset.for === path);
+let picker = { paths: [], mode: "move", box: null, at: 0 };
+
+async function openPicker(paths, mode = "move", box = null) {
+  box ??= [...$("detail").querySelectorAll(".picker")].find((el) => el.dataset.for === paths[0]);
   if (!box) return;
-  box.dataset.mode = mode;
+  picker = { paths, mode, box, at: 0 };
   // The box takes the keyboard at once, before the folder list has loaded:
   // otherwise quick typing would land on the page's single-key shortcuts.
-  const verb = mode === "copy" ? "copy into" : "file into";
-  box.innerHTML = `<input class="pick" placeholder="${verb}: type to find a folder, e.g. 101 readings demand" spellcheck="false" autocomplete="off">
+  const what = paths.length > 1 ? `${paths.length} PDFs` : "";
+  const verb = mode === "copy" ? `copy ${what} into` : `file ${what} into`;
+  box.innerHTML = `<input class="pick" placeholder="${verb}: type to find a folder; Tab, then a name, for a new one" spellcheck="false" autocomplete="off">
     <div class="choices"><div class="where">loading folders …</div></div>`;
   const input = box.querySelector("input");
   input.focus();
   folderList ??= (await get("/api/folders")).folders;
-  const draw = () => {
-    const words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
-    const hits = folderList.filter((f) => words.every((w) => f.toLowerCase().includes(w))).slice(0, 14);
-    // A first folder every choice shares ("phd/") says nothing: leave it out.
-    const first = folderList[0]?.split("/")[0];
-    const shared = first && folderList.every((f) => f.startsWith(first + "/")) ? first.length + 1 : 0;
-    box.querySelector(".choices").innerHTML = hits.map((f) =>
-      `<div class="choice" data-folder="${esc(f)}">${esc(f.slice(shared))}</div>`).join("")
-      || `<div class="where">no folder matches</div>`;
-  };
-  input.addEventListener("input", draw);
+  input.addEventListener("input", () => { picker.at = 0; drawPicker(); });
   input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      const first = box.querySelector(".choice");
-      if (first) fileTo(path, first.dataset.folder, mode);
+    const choices = [...box.querySelectorAll(".choice")];
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      picker.at = Math.max(0, Math.min(choices.length - 1, picker.at + (event.key === "ArrowDown" ? 1 : -1)));
+      drawPicker();
+    } else if (event.key === "Tab" && choices[picker.at] && choices[picker.at].dataset.create !== "1") {
+      event.preventDefault();
+      pickerInside(choices[picker.at].dataset.folder);
+    } else if (event.key === "Enter" && choices[picker.at]) {
+      const choice = choices[picker.at];
+      fileTo(picker.paths, choice.dataset.folder, picker.mode, choice.dataset.create === "1");
     }
   });
-  draw();
+  drawPicker();
   input.focus();
 }
 
-async function fileTo(path, folder, mode = "move") {
+// Fill the box with a folder's path and a slash: what follows is a new folder's name.
+function pickerInside(folder) {
+  const input = picker.box.querySelector("input");
+  input.value = folder + "/";
+  input.focus();
+  picker.at = 0;
+  drawPicker();
+}
+
+function drawPicker() {
+  const box = picker.box, input = box.querySelector("input");
+  const typed = input.value.trim();
+  const words = typed.toLowerCase().split(/\s+/).filter(Boolean);
+  const hits = folderList.filter((f) => words.every((w) => f.toLowerCase().includes(w))).slice(0, 14);
+  // A path with a slash that is not a folder yet can be created (the server
+  // checks it: inside the scanned folders, not a managed one).
+  const asPath = typed.replace(/\/+$/, "");
+  const known = new Set(folderList);
+  const offerNew = typed.includes("/") && !/\s/.test(asPath) && asPath && !known.has(asPath)
+    && !asPath.split("/").some((part) => !part || part.startsWith("."));
+  // A first folder every choice shares ("phd/") says nothing: leave it out.
+  const first = folderList[0]?.split("/")[0];
+  const shared = first && folderList.every((f) => f.startsWith(first + "/")) ? first.length + 1 : 0;
+  const rows = [];
+  if (offerNew) {
+    rows.push(`<div class="choice new" data-folder="${esc(asPath)}" data-create="1">+ new folder ${esc(asPath)}</div>`);
+  }
+  for (const f of hits) {
+    rows.push(`<div class="choice" data-folder="${esc(f)}"><span>${esc(f.slice(shared))}</span>` +
+      `<button class="act inside" data-inside="1" title="a new folder inside this one (Tab)">+</button></div>`);
+  }
+  picker.at = Math.min(picker.at, Math.max(0, rows.length - 1));
+  box.querySelector(".choices").innerHTML = rows.map((r, n) =>
+    n === picker.at ? r.replace('class="choice', 'class="choice at') : r).join("")
+    || `<div class="where">no folder matches${typed.includes("/") ? "" : " (for a new one: Tab on a folder, or type a path with /)"}</div>`;
+}
+
+async function fileTo(paths, folder, mode = "move", create = false) {
   const copying = mode === "copy";
-  const response = await fetch(copying ? "/api/copy" : "/api/move", { method: "POST",
+  const response = await fetch("/api/file-many", { method: "POST",
     headers: { "Content-Type": "application/json", "X-Refs": "1" },
-    body: JSON.stringify({ path, folder }) });
+    body: JSON.stringify({ paths, folder, mode, create }) });
   const result = await response.json();
-  if (!response.ok) { say(result.detail ?? (copying ? "could not copy it" : "could not move it")); return; }
-  folderList = null;                          // the new location may add a folder
-  say(copying ? `copied into ${folder}; the original stays. undo (trashes the copy): refs rename --undo`
-              : `filed into ${folder}. undo: refs rename --undo`, 9000);
+  if (!response.ok) { say(result.detail ?? (copying ? "could not copy" : "could not move")); return; }
+  folderList = null;                          // a new folder, or the new location, may add one
+  const done = result.done, refused = result.refused;
+  if (!done.length) { say(`nothing ${copying ? "copied" : "filed"}: ${refused[0]?.why ?? "?"}`, 9000); return; }
+  // Marked papers that moved now live at their new path (a later copy to… needs it).
+  if (!copying) {
+    const moved = new Map(done.map((d) => [d.from, d.to]));
+    for (const item of state.marked.values()) {
+      for (const loc of item.locations) if (moved.has(loc.path)) loc.path = moved.get(loc.path);
+    }
+  }
+  state.lastFiled = done.length;
+  const what = done.length === 1 ? done[0].to.split("/").pop() : `${done.length} PDFs`;
+  const left = refused.length ? `; ${refused.length} left where they were (${refused[0].why})` : "";
+  say(`${copying ? "copied" : "filed"} ${what} into ${result.folder}${left}. u: undo`
+      + (copying ? " (trashes the copies)" : ""), 12000);
+  picker.box?.replaceChildren();
   loadSidebar();
   search(state.items[state.selected]?.id ?? null);
 }
@@ -1319,6 +1488,16 @@ const HELP = `keys
   f                    show in Finder
   F                    file to… (move the PDF into a course or project folder)
   C                    copy to… (same, but the original stays where it is)
+                       in the box: ↑/↓ choose, Tab then a name = new folder
+  u                    undo the last file to… / copy to…
+
+selecting many
+
+  x                    select / unselect this row (and move down)
+  ⌘-click  ⇧-click     add one row / a range
+  ⌘A                   select every row in the list
+  esc                  clear the selection
+  F  C                 file / copy the whole selection (buttons: queue all, mark read)
   y                    copy citekey
   b                    copy BibTeX
   r                    toggle read / unread
@@ -1367,6 +1546,12 @@ document.addEventListener("keydown", async (event) => {
     }
     return;                                   // typing in a field: no shortcuts
   }
+  if ((event.metaKey || event.ctrlKey) && event.key === "a" && state.items.length) {
+    event.preventDefault();                   // select every row, not the page's text
+    state.items.forEach((_, i) => markRow(i, true));
+    paintMarks();
+    return;
+  }
   if (event.metaKey || event.ctrlKey || event.altKey) return;
   const key = event.key;
   const moves = { j: 1, ArrowDown: 1, k: -1, ArrowUp: -1 };
@@ -1380,9 +1565,17 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "f") act("reveal");
   else if (key === "F" || key === "C") {
     event.preventDefault();
+    if (state.marked.size) { batchAct(key === "C" ? "copy" : "move"); return; }
     const p = state.items[state.selected]?.locations[0]?.path;
-    if (p) openPicker(p, key === "C" ? "copy" : "move");
+    if (p) openPicker([p], key === "C" ? "copy" : "move");
   }
+  else if (key === "x" && state.items.length) {
+    markRow(state.selected);
+    select(state.selected + 1);              // also redraws the detail pane
+    paintMarks();
+  }
+  else if (key === "u" && state.lastFiled) undoBatch(state.lastFiled);
+  else if (key === "Escape" && state.marked.size) clearMarks();
   else if (key === "y") act("citekey");
   else if (key === "b") act("bibtex");
   else if (key === "r") act("read");

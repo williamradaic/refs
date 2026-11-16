@@ -5,9 +5,12 @@
     refs add 10.1257/aer.20220276
     refs add ~/Downloads/some-paper.pdf
 
-Only openly available PDFs can be fetched: the app has no library login. When
-no open copy exists, the paper is still saved as a work without a file, and
-the PDF attaches itself when you later drop it into the dump.
+The command line can fetch only PDFs it may download itself (open access, or
+what this Mac's network address gives it). The "+ refs" bookmarklet does
+better: it reads the page and fetches the PDF in your browser, signed in as
+you, and hands both over (the /capture page). When no PDF can be had, the
+paper is still saved as a work without a file, and the PDF attaches itself
+when you later drop it into the dump.
 """
 
 from __future__ import annotations
@@ -29,8 +32,21 @@ class Target:
     """What a quick-add input refers to."""
 
     ids: dict[str, str] = field(default_factory=dict)
-    pdf_url: str | None = None
+    pdf_url: str | None = None          # the first place to try; see `pdf_urls`
     page_url: str | None = None
+    pdf_urls: list[str] = field(default_factory=list)   # every candidate, best first
+
+    def offer(self, url: str | None) -> None:
+        """Add a place a PDF may be downloaded from (each once, in order)."""
+        if url and url not in self.pdf_urls:
+            self.pdf_urls.append(url)
+            self.pdf_url = self.pdf_urls[0]
+
+
+# NBER's own address forms: the paper page, its PDF link, and the DOI NBER
+# registers every working paper under (10.3386/w32515).
+NBER_RE = re.compile(r"nber\.org/(?:papers|system/files/working_papers)/w(\d{3,5})"
+                     r"|\b10\.3386/w(\d{3,5})\b", re.I)
 
 
 def parse(thing: str) -> Target:
@@ -42,58 +58,92 @@ def parse(thing: str) -> Target:
     if m := re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", thing, re.I) or \
             re.fullmatch(r"(?:arxiv:)?(\d{4}\.\d{4,5})(?:v\d+)?", thing, re.I):
         target.ids["arxiv"] = m.group(1)
-    elif m := re.search(r"nber\.org/papers/w(\d{3,5})", thing, re.I) or \
-            re.fullmatch(r"w(\d{4,5})", thing, re.I):
-        target.ids["nber"] = m.group(1)
+    elif m := NBER_RE.search(thing) or re.fullmatch(r"w(\d{4,5})", thing, re.I):
+        target.ids["nber"] = next(g for g in m.groups() if g)
     elif m := extract.DOI_RE.search(thing):
         target.ids["doi"] = extract.clean_doi(m.group(1))
 
     if is_url:
         if re.search(r"\.pdf($|[?#])", thing, re.I):
-            target.pdf_url = thing
+            target.offer(thing)
         else:
             target.page_url = thing
     return target
 
 
-def discover(target: Target) -> Target:
-    """Find where an open PDF can be downloaded, filling in `pdf_url`."""
-    if target.pdf_url:
-        return target
-    if arxiv := target.ids.get("arxiv"):
-        target.pdf_url = f"https://arxiv.org/pdf/{arxiv}"
-        return target
-    if nber := target.ids.get("nber"):
-        target.pdf_url = f"https://www.nber.org/system/files/working_papers/w{nber}/w{nber}.pdf"
-        return target
+def hinted(target: Target, *, doi: str | None = None, pdf_url: str | None = None) -> Target:
+    """Add what the browser read off the page (the bookmarklet): the page's
+    own DOI beats one guessed from its address, and its PDF link comes first."""
+    if doi and (m := extract.DOI_RE.search(doi)):
+        found = extract.clean_doi(m.group(1))
+        if nber := NBER_RE.search(found):
+            target.ids.setdefault("nber", next(g for g in nber.groups() if g))
+        target.ids["doi"] = found
+    if pdf_url and pdf_url.lower().startswith(("http://", "https://")):
+        if pdf_url in target.pdf_urls:
+            target.pdf_urls.remove(pdf_url)
+        target.pdf_urls.insert(0, pdf_url)
+        target.pdf_url = pdf_url
+    return target
 
-    # A web page: publishers and repositories describe the paper in <meta> tags
-    # (the same ones Google Scholar reads).
-    if target.page_url:
+
+def page_meta(html: str) -> dict[str, list[str]]:
+    """The <meta name=… content=…> tags of a page (either attribute order),
+    lower-case name → every value. Publishers describe a paper in them (the
+    citation_* tags Google Scholar reads)."""
+    found: dict[str, list[str]] = {}
+    for tag in re.findall(r"<meta\b[^>]*>", html, re.I):
+        attrs = dict((k.lower(), v) for k, _, v in
+                     re.findall(r'([\w:.-]+)\s*=\s*(["\'])(.*?)\2', tag, re.S))
+        name, content = attrs.get("name") or attrs.get("property"), attrs.get("content")
+        if name and content:
+            found.setdefault(name.lower(), []).append(content.strip())
+    return found
+
+
+def discover(target: Target, *, fetch_page: bool = True) -> Target:
+    """List where a PDF can be downloaded (`pdf_urls`, best first). An
+    open-access copy elsewhere is looked up only if these fail (open_copies).
+
+    `fetch_page=False` when the browser already read the page (the
+    bookmarklet): publishers such as OUP refuse programs like this one, and
+    the page would only say what the browser already passed on.
+    """
+    if arxiv := target.ids.get("arxiv"):
+        target.offer(f"https://arxiv.org/pdf/{arxiv}")
+    if nber := target.ids.get("nber"):
+        target.offer(f"https://www.nber.org/system/files/working_papers/w{nber}/w{nber}.pdf")
+
+    # A web page: read its <meta> tags.
+    if target.page_url and fetch_page and not target.pdf_urls:
         try:
-            html = httpx.get(target.page_url, headers=HEADERS, timeout=30, follow_redirects=True).text
+            html = httpx.get(target.page_url, headers=HEADERS, timeout=15, follow_redirects=True).text
         except httpx.HTTPError:
             html = ""
-        def meta(name: str) -> str | None:
-            m = re.search(rf'<meta[^>]+name=["\']{name}["\'][^>]+content=["\']([^"\']+)', html, re.I)
-            return m.group(1) if m else None
-        target.pdf_url = meta("citation_pdf_url")
-        if doi := meta("citation_doi"):
-            target.ids.setdefault("doi", extract.clean_doi(doi))
-        if arxiv := meta("citation_arxiv_id"):
+        meta = page_meta(html)
+        first = lambda name: (meta.get(name) or [None])[0]   # noqa: E731
+        target.offer(first("citation_pdf_url"))
+        if doi := first("citation_doi"):
+            hinted(target, doi=doi)
+        if arxiv := first("citation_arxiv_id"):
             target.ids.setdefault("arxiv", arxiv)
 
-    # A DOI: ask OpenAlex whether an open-access copy exists anywhere.
-    if not target.pdf_url and (doi := target.ids.get("doi")):
-        try:
-            response = resolve._get(f"https://api.openalex.org/works/doi:{doi}")
-        except (httpx.HTTPError, resolve.Unavailable):
-            response = None
-        if response is not None:
-            work = response.json()
-            target.pdf_url = ((work.get("best_oa_location") or {}).get("pdf_url")
-                              or (work.get("open_access") or {}).get("oa_url"))
     return target
+
+
+def open_copies(doi: str) -> list[str]:
+    """Open-access copies of a DOI that OpenAlex knows (an author's site, a
+    repository): the fallback when the publisher's own link is paywalled."""
+    try:
+        response = resolve._get(f"https://api.openalex.org/works/doi:{doi}")
+    except (httpx.HTTPError, resolve.Unavailable):
+        return []
+    if response is None:
+        return []
+    work = response.json()
+    urls = [(work.get("best_oa_location") or {}).get("pdf_url"),
+            (work.get("open_access") or {}).get("oa_url")]
+    return [u for u in dict.fromkeys(urls) if u]
 
 
 def download(url: str, folder: Path) -> Path | None:
@@ -105,7 +155,41 @@ def download(url: str, folder: Path) -> Path | None:
     # Paywalls and login pages answer with HTML: every real PDF starts with "%PDF".
     if response.status_code != 200 or not response.content.startswith(b"%PDF"):
         return None
-    # A temporary name; the file is renamed properly once it has been identified.
+    return save(response.content, folder)
+
+
+def download_first(urls: list[str], folder: Path) -> Path | None:
+    """The first of `urls` that gives a real PDF (the next one is tried when
+    a link turns out to be a paywall or login page)."""
+    for url in urls:
+        if path := download(url, folder):
+            return path
+    return None
+
+
+def save(content: bytes, folder: Path) -> Path:
+    """Write a PDF into `folder` under a temporary name; the file is renamed
+    properly once it has been identified (ingest.py renames "added-" files)."""
     path = folder / f"added-{secrets.token_hex(4)}.pdf"
-    path.write_bytes(response.content)
+    path.write_bytes(content)
     return path
+
+
+# --- the bookmarklet's key --------------------------------------------------------------------
+
+def token(cfg) -> str:
+    """The secret built into this Mac's "+ refs" bookmarklet. Only a page that
+    knows it can make refs add a paper without you pressing Enter (another
+    website could open the refs window, but cannot read your bookmarks).
+    Kept next to the index, outside the synced library: one per Mac."""
+    path = cfg.index_db.parent / "bookmarklet-token"
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        value = ""
+    if len(value) < 20:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        value = secrets.token_urlsafe(24)
+        path.write_text(value + "\n")
+        path.chmod(0o600)
+    return value

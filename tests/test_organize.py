@@ -169,3 +169,43 @@ def test_bib_append_skips_papers_already_there_under_another_key(tmp_path):
     assert text.count("@article{nevo2001measuring,") == 1 and "}\n\n@article{nevo" in text
     # Running it again adds nothing.
     assert bib.append(target, [work, other])[0] == []
+
+
+def test_file_many_moves_a_selection_and_one_undo_step_per_file(lib):
+    (lib.root / "papers-dump/other.pdf").write_bytes(b"%PDF other")
+    scan.scan(lib.cfg, index.connect(lib.cfg))
+    target = "phd/research/bets/lit"
+    r = lib.client.post("/api/file-many", headers=H, json={
+        "paths": [DUMP_NAME, "papers-dump/other.pdf"], "folder": target, "mode": "move", "create": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["folder"] == target and body["refused"] == []
+    assert {d["to"] for d in body["done"]} == {f"{target}/w4264.pdf", f"{target}/other.pdf"}
+    assert (lib.root / target / "other.pdf").exists() and not (lib.root / DUMP_NAME).exists()
+    # The new folder is now somewhere a PDF can be filed.
+    assert target in lib.client.get("/api/folders").json()["folders"]
+    assert lib.client.post("/api/undo", json={"count": 2}, headers=H).json() == {"restored": 2}
+    assert (lib.root / DUMP_NAME).exists() and (lib.root / "papers-dump/other.pdf").exists()
+
+
+def test_file_many_copies_and_reports_refusals_one_by_one(lib):
+    r = lib.client.post("/api/file-many", headers=H, json={
+        "paths": [DUMP_NAME, "papers-dump/unknown.pdf"], "folder": "phd/research/bets", "mode": "copy"})
+    body = r.json()
+    assert [d["to"] for d in body["done"]] == ["phd/research/bets/w4264.pdf"]
+    assert [x["path"] for x in body["refused"]] == ["papers-dump/unknown.pdf"]
+    assert (lib.root / DUMP_NAME).exists()                       # a copy leaves the original
+
+
+@pytest.mark.parametrize("folder", ["phd/research/bets/overleaf/x", "phd/../escape", "phd/.hidden",
+                                    "elsewhere/new", "phd/tools/refs/x", "phd//x"])
+def test_new_folders_only_where_filing_is_allowed(lib, folder):
+    r = lib.client.post("/api/file-many", headers=H, json={
+        "paths": [DUMP_NAME], "folder": folder, "mode": "move", "create": True})
+    assert r.status_code == 409
+    assert (lib.root / DUMP_NAME).exists()
+
+
+def test_search_results_say_when_a_paper_entered_refs(lib):
+    [item] = [i for i in lib.client.get("/api/search").json()["items"] if i["work_id"]]
+    assert len(item["in_refs"]) == 10 and item["in_refs"][:2] == "20"

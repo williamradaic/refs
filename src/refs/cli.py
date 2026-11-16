@@ -501,7 +501,10 @@ def cmd_add(args: argparse.Namespace) -> int:
     cfg = config.load()
     conn = index.connect(cfg)
     dump = cfg.absolute(cfg.dump)
-    thing, source_url, target = args.thing, None, None
+    thing, source_url, target = args.thing, args.source_url, None
+    # What the browser read off the page (the bookmarklet), if anything: the
+    # page's DOI, which also helps identify a PDF that does not print one.
+    hint_ids = capture.hinted(capture.Target(), doi=args.doi).ids
 
     # 1. Get a PDF into the dump: copy a local file, or download an open copy.
     local = Path(thing).expanduser()
@@ -512,9 +515,15 @@ def cmd_add(args: argparse.Namespace) -> int:
         elif not path.exists():
             shutil.copy2(local, path)
     else:
-        target = capture.discover(capture.parse(thing))
-        source_url = target.page_url or target.pdf_url
-        path = capture.download(target.pdf_url, dump) if target.pdf_url else None
+        # Each candidate link in turn (the page's PDF link, arXiv, NBER), then
+        # an open-access copy elsewhere if those are paywalled.
+        target = capture.hinted(capture.parse(thing), doi=args.doi, pdf_url=args.pdf_url)
+        target = capture.discover(target, fetch_page=not args.no_page)
+        source_url = source_url or target.page_url or target.pdf_url
+        path = capture.download_first(target.pdf_urls, dump)
+        if path is None and (doi := target.ids.get("doi")):
+            path = capture.download_first(capture.open_copies(doi), dump)
+        hint_ids = {**target.ids, **hint_ids}
 
     # 2. No PDF could be fetched: save the paper itself, to be completed later.
     if path is None:
@@ -542,7 +551,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             print(f"The file was saved to {rel} but could not be indexed.")
             return 1
         [item] = ingest.ingest(cfg, conn, [(rel, row["hash"])], source_url=source_url,
-                               check_complete=False)
+                               check_complete=False, hint_ids=hint_ids)
     if item.read is None:
         print(f"Saved to {item.rel}, but not read: {item.skipped}.")
         return 1
@@ -1048,6 +1057,11 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("add", help="quick add: a URL, DOI, arXiv id, NBER number or PDF file")
     p.add_argument("thing")
     p.add_argument("--queue", action="store_true", help="also put it on the reading queue")
+    # Passed by the page when the bookmarklet has read the paper's page already.
+    p.add_argument("--doi", help="the paper's DOI, as its page gives it")
+    p.add_argument("--pdf-url", help="a link to the PDF, tried first")
+    p.add_argument("--source-url", help="the page the paper came from (kept with the work)")
+    p.add_argument("--no-page", action="store_true", help="do not fetch the page itself")
     p.set_defaults(run=cmd_add)
 
     p = sub.add_parser("queue", help="the reading queue: list it, or `refs queue blp` to queue a paper")

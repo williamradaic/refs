@@ -113,6 +113,7 @@ def unread_files(cfg: Config, conn: sqlite3.Connection, *, dump_only: bool = Fal
 
 def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], *,
            source_url: str | None = None, check_complete: bool = True,
+           hint_ids: dict[str, str] | None = None,
            progress: Callable[[int, int, str], None] | None = None,
            on_result: Callable[[Ingested], None] | None = None,
            budget_left: float | None = None) -> list[Ingested]:
@@ -121,7 +122,9 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
     The caller holds `exclusive(cfg)` and has scanned, so every path is indexed.
     Files that already have a read record are not read again (no cost).
     `check_complete=False` skips the "still being written?" test, for a file
-    that was handed over explicitly (`refs add file.pdf`). `budget_left`, in
+    that was handed over explicitly (`refs add file.pdf`). `hint_ids`:
+    identifiers known from elsewhere (the DOI on the page a PDF came from),
+    used when the PDF itself prints none. `budget_left`, in
     dollars, stops reading once this run has spent it (the monthly limit on
     automatic reading, budget.py); None means no limit.
 
@@ -158,7 +161,9 @@ def ingest(cfg: Config, conn: sqlite3.Connection, files: list[tuple[str, str]], 
             item.skipped = "this month's reading limit is reached (read_monthly_cap)"
             _tell(on_result, item)
             continue
-        item.read = pipeline.process_file(cfg, api, item.file_hash, item.rel, topics)
+        # The hint only when there is one: the folder watcher's call stays as it was.
+        item.read = pipeline.process_file(cfg, api, item.file_hash, item.rel, topics,
+                                          **({"hint_ids": hint_ids} if hint_ids else {}))
         item.processed_now = True
         item.issues = list(item.read["issues"])
         if not item.read.get("reused_reading"):

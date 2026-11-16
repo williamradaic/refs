@@ -44,16 +44,19 @@ def _match_dict(match: resolve.Match, via: str) -> dict:
 
 def process_file(cfg: Config, api, file_hash: str, rel: str,
                  known_topics: list[str] | None = None,
-                 previous: dict | None = None) -> dict:
+                 previous: dict | None = None, hint_ids: dict[str, str] | None = None) -> dict:
     """Run the whole pipeline for one file and save its read record.
 
     If `previous` (an earlier read record) already holds the model's reading,
     that reading is reused and only the registry lookup is redone, at no cost.
+    `hint_ids` (the DOI of the page a PDF was saved from) fill in identifiers
+    the PDF does not print; like printed ones, they are dropped if the record
+    they lead to has a different title.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     info = extract.read_pdf(cfg.absolute(rel))
     # Identifiers: those printed on the pages, plus any in the file name ("w32515.pdf").
-    ids = {**naming.parse_filename(rel.rsplit("/", 1)[-1]).ids, **info.ids}
+    ids = {**(hint_ids or {}), **naming.parse_filename(rel.rsplit("/", 1)[-1]).ids, **info.ids}
 
     result: dict = {
         "hash": file_hash, "path": rel, "processed_at": now,

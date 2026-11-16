@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>refs: add</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/app.css">
+  <style>
+    body { display: block; overflow: auto; }
+    .page { max-width: 80ch; margin: 1.5em auto; padding: 0 16px; line-height: 1.6; }
+    .page h1 { font-size: 15px; margin: 0 0 .3em; overflow-wrap: anywhere; }
+    .dim { color: var(--dim); overflow-wrap: anywhere; }
+    .state { margin: 1em 0; padding: 6px 1.5ch; border-left: 2px solid var(--accent); white-space: pre-wrap; }
+    .state.ok { border-left-color: var(--ok); }
+    .state.bad { border-left-color: var(--bad); }
+    .row2 { display: flex; gap: 1.5ch; align-items: center; flex-wrap: wrap; margin-top: .6em; }
+    label { color: var(--dim); cursor: pointer; }
+    input[type=checkbox] { accent-color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1 id="title">adding to refs</h1>
+    <div class="dim" id="from"></div>
+    <div class="state" id="state">waiting for the page …</div>
+    <div class="row2">
+      <button class="act" id="go" hidden>add it (Enter)</button>
+      <button class="act" id="lib" hidden>open it through the library</button>
+      <label><input type="checkbox" id="queue"> also put it on the reading queue</label>
+      <button class="act" id="stay" hidden>keep this window open</button>
+      <a class="act" href="/" target="refs-main">open refs</a>
+    </div>
+  </div>
+  <script>
+    // The window the "+ refs" bookmarklet opens (bookmarklet.html builds it).
+    // The bookmarklet, running in the paper's page, reads its citation tags and
+    // fetches the PDF there, signed in as you; it hands both over with
+    // postMessage. With the bookmarklet's key the add starts at once. Without
+    // a message (an old bookmarklet, or a site that cuts the link between
+    // windows) this falls back to adding the address, after Enter.
+    const $ = (id) => document.getElementById(id);
+    const params = new URLSearchParams(location.search);
+    const pageUrl = params.get("add") ?? "";
+    let started = false, closing = null, pending = false;
+    let heard = false;              // the page has answered: stop saying "ready"
+    let stage = "adding";           // what the job is doing, for the progress line
+    let proxy = "";                 // the library proxy (settings), "" = none
+    const ready = fetch("/api/bookmarklet").then((r) => r.json())
+      .then((data) => { proxy = data.proxy ?? ""; }).catch(() => {});
+
+    // A page's address through the proxy (EZproxy wants it encoded after
+    // "qurl=", as is after "url="), and whether a page already came through it.
+    const viaProxy = (url) => proxy + (/qurl=$/i.test(proxy) ? encodeURIComponent(url) : url);
+    const proxied = (url) => {
+      try {
+        const host = new URL(proxy).hostname, here = new URL(url).hostname;
+        return here === host || here.endsWith("." + host);
+      } catch { return false; }
+    };
+
+    // Send the paper's tab through the library proxy; the bookmarklet's next
+    // click there finds the PDF. The tab is the one that opened this window.
+    function throughLibrary(url) {
+      try { window.opener.location.href = viaProxy(url); }
+      catch { window.open(viaProxy(url), "_blank"); }
+    }
+
+    $("from").textContent = pageUrl;
+    try { $("queue").checked = localStorage.getItem("refs-capture-queue") === "1"; } catch {}
+    $("queue").addEventListener("change", () => {
+      try { localStorage.setItem("refs-capture-queue", $("queue").checked ? "1" : "0"); } catch {}
+    });
+
+    function show(text, kind = "") {
+      $("state").textContent = text;
+      $("state").className = "state " + kind;
+    }
+    const mb = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+
+    async function postJson(url, body) {
+      const response = await fetch(url, { method: "POST",
+        headers: { "Content-Type": "application/json", "X-Refs": "1" }, body: JSON.stringify(body) });
+      return { ok: response.ok, status: response.status, data: await response.json().catch(() => ({})) };
+    }
+
+    // An ArrayBuffer as base64, without building a huge string by hand.
+    function base64(buffer) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(new Blob([buffer], { type: "application/pdf" }));
+      });
+    }
+
+    // Follow the background job (the server runs `refs add`) until it ends.
+    async function follow(begun) {
+      if (begun.data.message) { show(begun.data.message, "ok"); closeSoon(); return; }
+      if (!begun.data.job) { show(begun.data.detail ?? "could not start", "bad"); return; }
+      for (;;) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        let job;
+        try { job = await (await fetch(`/api/job/${begun.data.job}`)).json(); }
+        catch { show("lost contact with refs. If the PDF was saved, it is in the quick-add folder.", "bad"); return; }
+        if (job.state === "running") { show(`${stage} … ${job.seconds}s\n(reading the PDF and looking it up takes 10 to 30 seconds; you can close this window, the add carries on)`); continue; }
+        const failed = job.state === "failed";
+        // Saved without a PDF: the publisher's PDF sits on another site (OUP
+        // and other Silverchair journals) or behind a sign-in. Opening the PDF
+        // itself and clicking + refs there hands it over.
+        const noPdf = /without a PDF/i.test(job.message ?? "");
+        show((job.message || job.state) + (noPdf
+          ? "\n\nIf your browser can open the PDF, open it and click + refs on the PDF itself: it attaches to this record."
+          : ""), failed ? "bad" : "ok");
+        if (noPdf && proxy && !proxied(pageUrl)) {
+          $("lib").hidden = false;
+          $("lib").onclick = () => throughLibrary(pageUrl);
+        }
+        if (noPdf) return;                   // leave the hint up
+        if (!failed) closeSoon();
+        return;
+      }
+    }
+
+    // Close by itself a few seconds after success, unless asked not to.
+    function closeSoon() {
+      $("stay").hidden = false;
+      closing = setTimeout(() => window.close(), 6000);
+    }
+    $("stay").addEventListener("click", () => { clearTimeout(closing); $("stay").hidden = true; });
+
+    async function fromBookmarklet(message) {
+      if (started) return;
+      started = heard = true;
+      const meta = message.meta ?? {};
+      $("title").textContent = meta.title || "adding to refs";
+      const pdf = message.pdf instanceof ArrayBuffer && message.pdf.byteLength ? message.pdf : null;
+      await ready;
+      const url = message.url ?? pageUrl;
+      // Paywalled here, and not yet through the library: go through it first,
+      // instead of saving the paper without its PDF.
+      if (!pdf && meta.pdf_problem === "paywall" && proxy && !proxied(url)) {
+        show("Paywalled here. Opening the page through your library's proxy …\n\n" +
+             "Sign in there if asked, then click + refs again on that page.");
+        throughLibrary(url);
+        offerEnter("Paywalled here; the page is opening through your library's proxy. Sign in there " +
+                   "if asked, then click + refs again on it.\n\nOr press Enter to save the paper without its PDF.", meta);
+        $("go").textContent = "save without the PDF (Enter)";
+        started = false;
+        return;
+      }
+      stage = pdf ? `got the PDF from the page (${mb(pdf.byteLength)}); adding`
+        : meta.pdf_url ? "the page's PDF needs another site or a sign-in; refs tries the link, then an open copy"
+        : "no PDF on the page; refs looks for an open copy";
+      show(stage + " …");
+      const body = { token: message.token ?? "", url: message.url ?? pageUrl, meta, queue: $("queue").checked,
+                     pdf: pdf ? await base64(pdf) : null };
+      const begun = await postJson("/api/capture", body);
+      if (begun.status === 403) {          // an old bookmarklet: its key is not this Mac's
+        started = false;
+        offerEnter(`${begun.data.detail}\n\nPress Enter to add it anyway.`, meta);
+        return;
+      }
+      await follow(begun);
+    }
+
+    // The fallback: add the address (and whatever the link said), after Enter.
+    function offerEnter(text, meta = {}) {
+      show(text);
+      $("go").hidden = false;
+      $("go").focus();
+      $("go").onclick = async () => {
+        if (started) return;
+        started = true;
+        $("go").hidden = true;
+        show("adding …");
+        await follow(await postJson("/api/add", { thing: pageUrl, queue: $("queue").checked,
+          doi: meta.doi || params.get("doi") || null, pdf_url: meta.pdf_url || null }));
+      };
+    }
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !$("go").hidden) $("go").click();
+      if (event.key === "Escape") window.close();
+    });
+
+    // Only the window that opened this one may hand over a paper.
+    window.addEventListener("message", (event) => {
+      if (event.source !== window.opener) return;
+      if (event.data?.type === "refs-pending" && !started) {   // still downloading the PDF there
+        pending = true;
+        show(`the page is downloading the PDF … ${event.data.mb ? mb(event.data.mb * 1048576) : ""}`);
+      }
+      if (event.data?.type === "refs-capture") fromBookmarklet(event.data);
+    });
+
+    if (!pageUrl) {
+      show("Nothing to add. Use the + refs bookmarklet on a paper's page.", "bad");
+    } else if (window.opener) {
+      // Say "ready" until the page answers: the bookmarklet may still be
+      // fetching the PDF. Its origin is not known here, hence "*" (the message
+      // carries nothing private).
+      let tries = 0;
+      const hello = setInterval(() => {
+        if (started || heard) { clearInterval(hello); return; }
+        try { window.opener.postMessage({ type: "refs-ready" }, "*"); } catch {}
+        if (++tries > (pending ? 240 : 40)) {   // 20 s without an answer (2 min while it downloads)
+          clearInterval(hello);
+          offerEnter("The page did not hand anything over. Press Enter to add its address.");
+        }
+      }, 500);
+    } else {
+      offerEnter("Press Enter to add it.");
+    }
+  </script>
+</body>
+</html>

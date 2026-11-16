@@ -146,6 +146,10 @@ main > * { overflow-y: auto; min-height: 0; scrollbar-width: thin; scrollbar-col
 .row > span { overflow: hidden; text-overflow: ellipsis; }
 .row:hover { background: color-mix(in srgb, var(--sel) 55%, transparent); }
 .row.sel { background: var(--sel); border-left-color: var(--accent); }
+/* Rows picked for a batch action: a tint of the accent, so they stay visible
+   next to the (single) highlighted row. */
+.row.mk { background: color-mix(in srgb, var(--accent) 14%, transparent); border-left-color: var(--accent); }
+.row.mk.sel { background: color-mix(in srgb, var(--accent) 24%, var(--sel)); }
 .row .au { color: var(--fg); }
 .row .yr { color: var(--dim); }
 .row .ve, .row .ab { color: var(--dim); }
@@ -292,7 +296,14 @@ details.kept > summary { cursor: pointer; }
                 border: 0; border-bottom: 1px solid var(--line); outline: 0; padding: 2px 0; }
 .picker .pick:focus { border-bottom-color: var(--accent); }
 .picker .choice { color: var(--link); cursor: pointer; overflow-wrap: anywhere; }
-.picker .choice:hover { text-decoration: underline; }
+.picker .choice:hover > span, .picker .choice.new:hover { text-decoration: underline; }
+/* The choice Enter takes (moved with ↑/↓), and the "+" for a new folder inside one. */
+.picker .choice { display: flex; gap: 1ch; align-items: baseline; padding-left: 1ch; border-left: 2px solid transparent; }
+.picker .choice > span { flex: 1; }
+.picker .choice.at { border-left-color: var(--accent); background: var(--sel); }
+.picker .choice.new { color: var(--accent); }
+.picker .choice .inside { visibility: hidden; padding: 0 .6ch; }
+.picker .choice:hover .inside, .picker .choice.at .inside { visibility: visible; }
 #detail code { color: var(--fg); }
 
 /* Haiku's reason for ranking the selected paper (search answered by ask.py). */

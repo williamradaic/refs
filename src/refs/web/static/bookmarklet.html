@@ -14,28 +14,100 @@
     .page p, .page ol { color: var(--dim); }
     .grab { display: inline-block; margin: 1em 0; padding: 4px 1.5ch; border: 1px solid var(--accent);
             color: var(--accent); font-weight: 700; cursor: grab; }
+    .grab.off { opacity: .4; pointer-events: none; }
   </style>
 </head>
 <body>
   <div class="page">
     <h1>refs bookmarklet</h1>
-    <p>Drag this to your bookmarks bar:</p>
-    <a class="grab" id="grab" href="#">+ refs</a>
+    <p>Drag this to your bookmarks bar (if you have an older <b>+ refs</b> there, replace it):</p>
+    <a class="grab off" id="grab" href="#">+ refs</a>
     <ol>
-      <li>On a paper's page (NBER, arXiv, a journal, an author's site, or a PDF open in the browser), click <b>+ refs</b> in the bookmarks bar.</li>
-      <li>A small refs window opens with the page's address in the add bar. Press Enter.</li>
-      <li>refs finds the paper, downloads the PDF when it is openly available, and saves it in your quick-add folder (papers-dump unless you chose another). A paywalled paper is saved without a PDF; it attaches itself when you download it into that folder later.</li>
+      <li>On a paper's page (a journal such as the AEA's or OUP's, NBER, arXiv, an author's site) or on a PDF open in the browser, click <b>+ refs</b>.</li>
+      <li>It reads the page's citation details and, if your browser can open the PDF (open access, or signed in through the library), takes the PDF from the page itself. No downloading, no Enter.</li>
+      <li>A small refs window shows the paper being added, and closes itself when it is done. The PDF lands in your quick-add folder, renamed; you can close the window early, the add carries on.</li>
+      <li>Paywalled? With a library proxy in the settings (UC Berkeley: <code>https://libproxy.berkeley.edu/login?qurl=</code>), refs opens the page through it: sign in if asked, then click <b>+ refs</b> again. Without one, refs looks for an open copy, and otherwise saves the paper without a file; save the PDF into the quick-add folder later and it attaches itself.</li>
+      <li>Some journals (OUP's, for one) serve the PDF from another site, which the page may not read. Open the PDF and click <b>+ refs</b> on it.</li>
     </ol>
+    <p>The bookmarklet carries a key that belongs to this Mac's refs, so only it, not some other website, can add papers without your Enter. Another browser or Mac needs its own copy from its own refs.</p>
     <p><a href="/">back to refs</a></p>
   </div>
   <script>
+    // What the bookmarklet runs, in the paper's page. It is turned into the
+    // link's code below (grab.toString()), so it may use only what it is
+    // given: the refs address and key. Block comments only inside it.
+    function grab(refs, token) {
+      var d = document;
+      /* A <meta name=…> or <meta property=…> value; all of them for authors. */
+      var one = function (n) {
+        var e = d.querySelector('meta[name="' + n + '" i],meta[property="' + n + '" i]');
+        return e && e.content ? e.content.trim() : "";
+      };
+      var all = function (n) {
+        return [].map.call(d.querySelectorAll('meta[name="' + n + '" i]'), function (e) { return e.content.trim(); });
+      };
+      var isPdf = d.contentType === "application/pdf";
+      var doi = one("citation_doi") || one("dc.identifier") || one("prism.doi") || one("bepress_citation_doi");
+      if (!/10\.\d{4,9}\//.test(doi)) {
+        /* Some pages (NBER, AEA) show the DOI only as a doi.org link. */
+        var a = d.querySelector('a[href*="doi.org/10."]');
+        doi = a ? a.href : "";
+      }
+      var meta = {
+        doi: doi,
+        title: one("citation_title") || one("dc.title") || one("og:title") || d.title,
+        authors: all("citation_author"),
+        year: (one("citation_publication_date") || one("citation_date") || one("citation_online_date")).slice(0, 4),
+        venue: one("citation_journal_title") || one("citation_conference_title"),
+        pdf_url: isPdf ? location.href : one("citation_pdf_url")
+      };
+      var win = window.open(refs + "/capture?add=" + encodeURIComponent(location.href) +
+        (doi ? "&doi=" + encodeURIComponent(doi) : ""), "refs-add", "width=720,height=420");
+      var pdf = null, fetched = !meta.pdf_url, ready = false, sent = false;
+      function send() {
+        if (sent || !ready || !win) return;
+        if (!fetched) { win.postMessage({ type: "refs-pending" }, refs); return; }
+        sent = true;
+        var message = { type: "refs-capture", token: token, url: location.href, meta: meta, pdf: pdf };
+        try { win.postMessage(message, refs, pdf ? [pdf] : []); }
+        catch (e) { message.pdf = null; win.postMessage(message, refs); }
+      }
+      window.addEventListener("message", function hear(e) {
+        if (e.origin !== refs || !e.data || e.data.type !== "refs-ready") return;
+        ready = true;
+        send();
+        if (sent) window.removeEventListener("message", hear);
+      });
+      if (!fetched) {
+        /* Fetched here, as you: the site sees your cookies and your library
+           access. A PDF served by another site (a redirect elsewhere) is
+           refused by the browser; refs then tries the link itself. */
+        var stop = new AbortController();
+        setTimeout(function () { stop.abort(); }, 90000);
+        /* Why there is no PDF, for the refs window: "paywall" = the site
+           answered with something else (a sign-in or purchase page), which
+           the library proxy can fix; "elsewhere" = another site serves it. */
+        fetch(meta.pdf_url, { credentials: "include", signal: stop.signal })
+          .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+          .then(function (b) {
+            var head = b ? new Uint8Array(b, 0, Math.min(4, b.byteLength)) : [];
+            if (head[0] === 37 && head[1] === 80 && head[2] === 68 && head[3] === 70) pdf = b;   /* %PDF */
+            else meta.pdf_problem = "paywall";
+          })
+          .catch(function () { meta.pdf_problem = stop.signal.aborted ? "slow" : "elsewhere"; })
+          .then(function () { fetched = true; send(); });
+      }
+    }
+
     // Built from this page's own address, so it points at whichever name you
-    // use for refs (refs.localhost, 127.0.0.1, refs.test). The bookmarklet
-    // only opens refs with the link filled in; nothing is added until you
-    // press Enter there.
-    const code = `(()=>{window.open('${location.origin}/?add='+encodeURIComponent(location.href),` +
-      `'refs-add','width=1100,height=720')})()`;
-    document.getElementById("grab").href = "javascript:" + code;
+    // use for refs (refs.localhost, 127.0.0.1, refs.test), with this Mac's key.
+    fetch("/api/bookmarklet").then((r) => r.json()).then(({ token }) => {
+      const code = `(${grab})(${JSON.stringify(location.origin)},${JSON.stringify(token)})`;
+      const link = document.getElementById("grab");
+      // Percent-encoded, so line breaks and % signs survive as a bookmark.
+      link.href = "javascript:" + encodeURIComponent(`void ${code}`);
+      link.classList.remove("off");
+    });
     document.getElementById("grab").addEventListener("click", (event) => {
       event.preventDefault();
       alert("Drag this to the bookmarks bar instead of clicking it.");

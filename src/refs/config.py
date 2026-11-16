@@ -103,6 +103,11 @@ DEFAULTS: dict = {
     # watcher) may spend, about $0.001 a PDF (budget.py). Papers you add
     # yourself are always read.
     "read_monthly_cap": 10.0,
+    # Your library's proxy, for paywalled papers (the bookmarklet sends a
+    # paywalled page through it, signed in as you in the browser). The
+    # address goes after it, URL-encoded when it ends in "qurl=" (EZproxy).
+    # UC Berkeley: "https://libproxy.berkeley.edu/login?qurl=". "" = none.
+    "library_proxy": "",
     # Annotation authors that mean you (reading.py). Your highlights and notes
     # in a PDF mark it as being read or read; marks by anyone else (an
     # instructor's highlights on a course reading) are not counted. Preview
@@ -143,6 +148,7 @@ class Config:
     read_monthly_cap: float = 10.0
     annotation_authors: list[str] = field(default_factory=list)
     contact_email: str = ""     # also read on its own by contact_email() below
+    library_proxy: str = ""     # e.g. EZproxy's ".../login?qurl="; "" = none
 
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
@@ -250,6 +256,7 @@ def load(config_file: Path | None = None) -> Config:
         read_monthly_cap=float(settings["read_monthly_cap"]),
         annotation_authors=[str(name) for name in settings["annotation_authors"]],
         contact_email=str(settings["contact_email"]).strip(),
+        library_proxy=str(settings["library_proxy"]).strip(),
     )
 
 

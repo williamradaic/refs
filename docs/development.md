@@ -55,10 +55,11 @@ there unless you mean to pay for it.
 | `budget.py` | the reading ledger, the monthly limit, approval of large batches |
 | `reading.py`, `notes.py` | read status from your markup; Obsidian notes |
 | `bib.py`, `bibkeys.py` | BibTeX; keys learned from project `.bib` files |
-| `rename.py`, `organize.py` | tidy names, file to / copy to, copies (journaled, undoable) |
+| `rename.py`, `organize.py` | tidy names, file to / copy to (one or many, new folders), copies (journaled, undoable) |
+| `capture.py` | quick add: reading links and identifiers, finding a PDF, the bookmarklet's key |
 | `ask.py` | Claude Haiku ranks a shortlist when local search is unsure |
 | `doctor.py`, `agents.py`, `service.py`, `keys.py` | `refs doctor` and `uninstall`, the agent skill, the login service, the Keychain |
-| `web/app.py`, `web/static/` | the local server and JSON API; the page (plain HTML, CSS and JavaScript, no build step) |
+| `web/app.py`, `web/static/` | the local server and JSON API; the page (plain HTML, CSS and JavaScript, no build step); `bookmarklet.html` builds the bookmarklet, `capture.html` is the window it opens |
 | `cli.py` | the `refs` command |
 
 ## How it identifies files
@@ -119,3 +120,22 @@ others: the similarity cut-offs for semantic search and for asking
 field vocabulary given to the model (`llm.py`, economics).
 `scripts/measure_identifiers.py` reports how many papers carry an identifier a
 registry can resolve (about a third, on the first run).
+
+## The bookmarklet
+
+Publishers turn refs' own requests away (OUP answers 403) or answer with a
+paywall page, while the browser is signed in and on the library's network. So
+the bookmarklet does the reading in the page: the `citation_*` meta tags, and
+`fetch` of `citation_pdf_url` with your cookies (same site only; a PDF that
+redirects to another site, as OUP's does, is refused by the browser). It
+opens `/capture` and hands the result over with `postMessage` once that window
+says it is ready. `/api/capture` starts `refs add` at once only with the key
+built into the bookmarklet (`capture.token`, one per Mac, next to the index):
+any website can open the window, none can read your bookmarks. Without the key,
+or without a message (a site whose Cross-Origin-Opener-Policy cuts the link),
+the window falls back to adding the address after Enter. With a library proxy
+set, a paywall answer sends the page's tab through it.
+
+The built-in browser pane of the Claude app cannot open popups, so it only
+exercises that fallback; the handover itself is tested by calling the capture
+page's `fromBookmarklet` with a message (tests/test_capture.py covers the API).

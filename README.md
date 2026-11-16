@@ -64,13 +64,24 @@ The page is keyboard-driven: `j`/`k` move, `/` searches, `⏎` opens the PDF,
 `a` adds a paper, `,` opens settings, `?` lists every key.
 
 **Adding papers.** Paste a link, DOI, arXiv id or NBER number into the add bar
-(`a`), or drop a PDF on the page. The bookmarklet (`/bookmarklet`, drag
-"+ refs" to the bookmarks bar) opens refs with the current page filled in. A
-PDF you save into the quick-add folder yourself (from the browser, Finder, or
-Dropbox on the phone) is picked up on its own. refs downloads the PDF when it
-is openly available; a paywalled paper is saved without one and attaches
-itself when you save the PDF into the quick-add folder later. Shift+Enter in
-the add bar also puts the paper on your reading queue.
+(`a`), or drop PDFs on the page. A PDF you save into the quick-add folder
+yourself (from the browser, Finder, or Dropbox on the phone) is picked up on
+its own. refs downloads the PDF when it is openly available; a paywalled paper
+is saved without one and attaches itself when you save the PDF into the
+quick-add folder later. Shift+Enter in the add bar also puts the paper on your
+reading queue.
+
+**The bookmarklet** (`/bookmarklet`, drag "+ refs" to the bookmarks bar) adds
+the paper whose page you are on, in one click. It reads the page's citation
+details and fetches the PDF in your browser, signed in as you, so it works
+where refs alone is turned away (AEA and OUP pages, library access); a small
+window follows the add and closes itself. On a paywall, with a **library
+proxy** set under settings (UC Berkeley:
+`https://libproxy.berkeley.edu/login?qurl=`), it reopens the page through the
+proxy: sign in if asked and click "+ refs" again. Journals that serve the PDF
+from another site (OUP's) need the PDF open: click "+ refs" on the PDF itself.
+The bookmarklet carries a key belonging to this Mac's refs; after updating refs
+from an older version, drag it to the bookmarks bar again.
 
 **Search** combines two free rankings and, when unsure, asks Claude:
 
@@ -112,8 +123,16 @@ Obsidian.
 **Review**, in the sidebar: *needs review* (correct a record, fetch it by DOI,
 or accept it), *renames* (tidy file names, `surname-year-short-title.pdf`,
 only for files you tick; undo is offered), *copies* (the same PDF in several
-places: trash a copy or keep them on purpose). **File to…** (`F`) moves a PDF
-into another folder, **Copy to…** (`C`) copies it; both can be undone.
+places: trash a copy or keep them on purpose).
+
+**Filing into courses and projects.** **File to…** (`F`) moves a PDF into
+another folder, **Copy to…** (`C`) copies it (the original stays, say in a
+shared project folder). For many papers at once, select them first: `x` or
+⌘-click adds a row, ⇧-click a range, ⌘A everything listed; the selection
+survives searches, so you can gather papers from several. In the folder box,
+↑/↓ choose and Tab on a folder, then a name, makes a new folder inside it.
+`u` undoes the last filing. Besides *added* (the PDF's own date), the *in refs*
+column says when a paper entered refs.
 
 **Citing.** `b` copies the BibTeX of the selected paper; `refs bib` does the
 same at the terminal, for one paper or a whole project, and `--append` adds

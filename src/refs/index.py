@@ -441,6 +441,7 @@ def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
         "tags": json.loads(row["tags"] or "[]"),
         "read_status": row["read_status"],
         "queued": row["queued"],
+        "first_seen": row["first_seen"],      # when refs first indexed this content
         "locations": [
             {
                 "path": loc["path"], "context": loc["context"], "area": loc["area"],

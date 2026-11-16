@@ -7,6 +7,8 @@ the endpoints below, which reuse the same index and work files as the CLI.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 import re
@@ -24,8 +26,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import (bib, config, index, ingest, keys, notes, onboarding, organize, reading, records, rename, resolve,
-                settings, venues, works)
+from .. import (bib, capture, config, index, ingest, keys, notes, onboarding, organize, reading, records, rename,
+                resolve, settings, venues, works)
 from .. import ask as asking
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
 from .. import scan as scanner
@@ -109,14 +111,22 @@ def create_app(watch: bool = False) -> FastAPI:
     # and the page asks how the job is doing until it finishes.
     jobs: dict[str, dict] = {}
 
-    def start_add(thing: str, label: str, queue: bool = False) -> dict:
+    def start_add(thing: str, label: str, queue: bool = False, hints: dict | None = None) -> dict:
+        """`hints`: what the browser read off the paper's page (doi, pdf_url,
+        source_url), passed on as `refs add` options; with them, refs does
+        not fetch the page again."""
         job_id = secrets.token_hex(4)
         jobs[job_id] = {"state": "running", "label": label, "message": "", "started": time.time()}
+        options = ["--queue"] if queue else []
+        for key, flag in (("doi", "--doi"), ("pdf_url", "--pdf-url"), ("source_url", "--source-url")):
+            if (hints or {}).get(key):
+                options += [flag, str(hints[key])]
+        if hints and (hints.get("doi") or hints.get("pdf_url")):
+            options.append("--no-page")
 
         def run() -> None:
             try:
-                done = subprocess.run([sys.executable, "-m", "refs.cli", "add", thing,
-                                       *(["--queue"] if queue else [])],
+                done = subprocess.run([sys.executable, "-m", "refs.cli", "add", thing, *options],
                                       capture_output=True, text=True, timeout=1800)
                 jobs[job_id].update(state="done" if done.returncode == 0 else "failed",
                                     message=(done.stdout or done.stderr).strip())
@@ -178,13 +188,30 @@ def create_app(watch: bool = False) -> FastAPI:
             candidates.append(work["created"][:10])
         return (min(candidates) if candidates else None), (day(max(changed)) if changed else None)
 
+    def local_day(stamp: str | None) -> str | None:
+        """An ISO time stamp (UTC, as refs stores them) as this Mac's YYYY-MM-DD."""
+        if not stamp:
+            return None
+        try:
+            return datetime.fromisoformat(stamp).astimezone().strftime("%Y-%m-%d")
+        except ValueError:
+            return stamp[:10]
+
+    def in_refs(item: dict | None, work: dict | None) -> str | None:
+        """When the paper entered refs: the day its work was made (for a Zotero
+        import, the day it was added to Zotero), else the day refs first
+        indexed the PDF. Unlike "added", this ignores the file's own dates."""
+        if work and work.get("created"):
+            return local_day(work["created"])
+        return local_day((item or {}).get("first_seen"))
+
     def shape(item: dict, all_works: dict) -> dict:
         """One search result as the page needs it."""
         work = all_works.get(item["work_id"] or "")
         meta = (work or {}).get("meta") or {}
         added, modified = dates(item["locations"], work)
         return {
-            "added": added, "modified": modified,
+            "added": added, "modified": modified, "in_refs": in_refs(item, work),
             # Venue column: the journal for articles, otherwise what the item is.
             "venue_label": venues.label(meta) if meta else item["kind"],
             "abbr": venues.abbreviation(meta.get("venue")) if meta else None,
@@ -208,7 +235,7 @@ def create_app(watch: bool = False) -> FastAPI:
         """A work saved without a PDF, shaped like a search result."""
         meta = work["meta"]
         return {
-            "added": dates([], work)[0], "modified": None,
+            "added": dates([], work)[0], "modified": None, "in_refs": in_refs(None, work),
             "venue_label": venues.label(meta), "abbr": venues.abbreviation(meta.get("venue")),
             "id": work["id"], "work_id": work["id"], "citekey": work["citekey"],
             "title": meta.get("title"), "year": meta.get("year"), "venue": meta.get("venue"),
@@ -228,6 +255,19 @@ def create_app(watch: bool = False) -> FastAPI:
     def bookmarklet() -> FileResponse:
         """A page with the "+ refs" bookmarklet to drag to the bookmarks bar."""
         return FileResponse(STATIC / "bookmarklet.html")
+
+    @app.get("/capture")
+    def capture_page() -> FileResponse:
+        """The small window the bookmarklet opens: it receives the paper from
+        the page and follows the add."""
+        return FileResponse(STATIC / "capture.html")
+
+    @app.get("/api/bookmarklet")
+    def bookmarklet_token() -> dict:
+        """The key built into the bookmarklet (capture.token). Another website
+        cannot read this answer: the browser keeps it from them (no CORS), and
+        TrustedHostMiddleware stops one that points its own name at 127.0.0.1."""
+        return {"token": capture.token(cfg), "proxy": cfg.library_proxy}
 
     # --- reading the library --------------------------------------------------------
 
@@ -311,6 +351,8 @@ def create_app(watch: bool = False) -> FastAPI:
             "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
             # The quick-add folder's name, for the page's hints ("save it into …").
             "dump": cfg.dump,
+            # The library proxy, for a "through the library" link on papers without a PDF.
+            "proxy": cfg.library_proxy,
         }
 
     @app.get("/api/work/{work_id}")
@@ -545,6 +587,28 @@ def create_app(watch: bool = False) -> FastAPI:
             scanner.scan(cfg, conn)
         return {"path": new_path}
 
+    @app.post("/api/file-many")
+    def file_many(paths: list[str] = Body(embed=True), folder: str = Body(embed=True),
+                  mode: str = Body(default="move", embed=True), create: bool = Body(default=False, embed=True),
+                  x_refs: str | None = Header(default=None)) -> dict:
+        """File (mode "move") or copy many PDFs into one folder, in one go;
+        `create` makes the folder first. One scan at the end, however many
+        files. `done` is also the number of undo steps that reverse it."""
+        guard(x_refs)
+        if mode not in {"move", "copy"}:
+            raise HTTPException(400, "mode is move or copy")
+        with ingest.exclusive(cfg):
+            conn = index.connect(cfg)
+            try:
+                folder = organize.make_folder(cfg, folder) if create else folder.strip("/")
+            except organize.Refused as error:
+                raise refused(error)
+            done, failed = organize.file_many(cfg, conn, paths, folder, mode)
+            if done:
+                scanner.scan(cfg, conn)
+        return {"folder": folder, "done": [{"from": a, "to": b} for a, b in done],
+                "refused": [{"path": p, "why": why} for p, why in failed]}
+
     @app.post("/api/open")
     def open_file(path: str = Body(embed=True), reveal: bool = Body(default=False, embed=True),
                   x_refs: str | None = Header(default=None)) -> dict:
@@ -678,12 +742,57 @@ def create_app(watch: bool = False) -> FastAPI:
 
     @app.post("/api/add")
     def add(thing: str = Body(embed=True), queue: bool = Body(default=False, embed=True),
+            doi: str | None = Body(default=None, embed=True), pdf_url: str | None = Body(default=None, embed=True),
             x_refs: str | None = Header(default=None)) -> dict:
         """Quick add. Runs the same code as `refs add`, as a separate process,
         because it can take a while (download, model, registry). `queue` also
-        puts the paper on the reading queue."""
+        puts the paper on the reading queue; `doi` and `pdf_url` are what a
+        page said about itself (the bookmarklet's window, without its key)."""
         guard(x_refs)
-        return start_add(thing, thing, queue)
+        hints = {"doi": doi, "pdf_url": pdf_url,
+                 "source_url": thing if thing.lower().startswith("http") else None}
+        return start_add(thing, thing, queue, hints if doi or pdf_url else None)
+
+    @app.post("/api/capture")
+    def capture_add(token: str = Body(embed=True), url: str = Body(embed=True),
+                    meta: dict = Body(default={}, embed=True), pdf: str | None = Body(default=None, embed=True),
+                    queue: bool = Body(default=False, embed=True),
+                    x_refs: str | None = Header(default=None)) -> dict:
+        """What the bookmarklet read in your browser: the page address, its
+        citation tags (`meta`: doi, title, pdf_url) and, when the browser could
+        fetch it signed in as you, the PDF itself (`pdf`, base64).
+
+        Starts at once, without Enter, but only with the bookmarklet's key:
+        any website can open the refs window, none can know the key."""
+        guard(x_refs)
+        if not secrets.compare_digest(token.encode(), capture.token(cfg).encode()):
+            raise HTTPException(403, "this bookmarklet is out of date: drag it to the bookmarks bar "
+                                     "again from the refs bookmarklet page")
+        hints = {"doi": meta.get("doi") or None, "pdf_url": meta.get("pdf_url") or None,
+                 "source_url": url if url.lower().startswith(("http://", "https://")) else None}
+        label = str(meta.get("title") or url)[:160]
+        if not pdf:
+            # No PDF from the browser (paywalled, or another site serves it):
+            # refs tries the page's PDF link, then an open copy, else saves
+            # the paper without a file. It never re-fetches the page.
+            if not (hints["doi"] or hints["pdf_url"] or capture.parse(url).ids):
+                hints = {"source_url": hints["source_url"]}       # nothing read: let refs read the page
+            return start_add(url, label, queue, hints)
+        try:
+            body = base64.b64decode(pdf, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(400, "the PDF did not arrive intact")
+        if not body.startswith(b"%PDF"):
+            raise HTTPException(400, "what the page gave is not a PDF")
+        known = index.connect(cfg).execute(
+            "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
+            (hashlib.sha256(body).hexdigest(),)).fetchone()
+        if known is not None and known["status"] is not None:
+            return {"ok": True, "message": f"Already in the library: {known['path']}"}
+        if known is not None:                       # on disk but never identified
+            return start_add(str(cfg.absolute(known["path"])), label, queue, hints | {"pdf_url": None})
+        path = capture.save(body, cfg.absolute(cfg.dump))
+        return start_add(str(path), label, queue, hints | {"pdf_url": None})
 
     @app.post("/api/identify")
     def identify(path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:

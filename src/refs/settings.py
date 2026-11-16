@@ -60,6 +60,11 @@ FIELDS = [
     Field("dump", "Library", "Quick-add folder", kind="folder",
           help="Where added papers and the bookmarklet's downloads go, and the one folder refs "
                "renames freely. Created if it does not exist."),
+    Field("library_proxy", "Library", "Library proxy (for paywalls)", kind="text",
+          placeholder="e.g. https://libproxy.berkeley.edu/login?qurl=",
+          help="Your university library's proxy address. When the bookmarklet meets a paywall, it "
+               "opens the page through the proxy (sign in there if asked), then click + refs again. "
+               "The page's address goes after it, encoded when it ends in qurl=. Empty = none."),
     Field("exclude_paths", "Private", "Left out entirely", kind="folders",
           help="Folders or files never read, indexed or sent anywhere: visa, tax or insurance "
                "paperwork that sits inside a watched folder."),
@@ -261,6 +266,8 @@ def normalize(key: str, value, root: Path):
     text = str(value).strip()                    # kind == "text"
     if key == "obsidian_folder":
         text = text.strip("/") or "refs"
+    if key == "library_proxy" and text and not text.lower().startswith("https://"):
+        raise SettingError(key, "a proxy address starts with https://")
     if key == "contact_email" and text and "@" not in text:
         raise SettingError(key, f"{text!r} is not an email address")
     return text
