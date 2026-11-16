@@ -37,7 +37,7 @@ from pathlib import Path, PurePosixPath
 
 import pymupdf
 
-from . import extract, naming, organize
+from . import extract, naming, organize, rename
 from .config import Config
 
 # How many PDFs the view lists, newest first. Each is read once (about 20 ms)
@@ -312,6 +312,17 @@ def _free_name(target_dir: Path, name: str) -> Path:
     return target
 
 
+def _source(where: Path, name: str) -> Path | str:
+    """The file `name` directly in Downloads, or why it cannot be used."""
+    if not _safe_name(name):
+        return "not a PDF directly in Downloads"
+    source = where / name
+    # The name was checked; this also catches a link pointing elsewhere.
+    if source.is_symlink() or not source.is_file() or source.resolve().parent != where:
+        return "no longer in Downloads"
+    return source
+
+
 def take(cfg: Config, conn: sqlite3.Connection, names: list[str], folder_rel: str | None,
          mode: str = "move") -> dict:
     """Move (or copy) the named PDFs from Downloads into the library.
@@ -331,13 +342,9 @@ def take(cfg: Config, conn: sqlite3.Connection, names: list[str], folder_rel: st
     taken, known, refused = [], [], []
     batch: dict[str, str] = {}                      # hash -> name, within this batch
     for name in dict.fromkeys(names):               # each name once, in order
-        if not _safe_name(name):
-            refused.append((name, "not a PDF directly in Downloads"))
-            continue
-        source = where / name
-        # The name was checked; this also catches a link pointing elsewhere.
-        if source.is_symlink() or not source.is_file() or source.resolve().parent != where:
-            refused.append((name, "no longer in Downloads"))
+        source = _source(where, name)
+        if isinstance(source, str):
+            refused.append((name, source))
             continue
         if not _complete(source):
             refused.append((name, "not a whole PDF (still downloading?)"))
@@ -361,3 +368,37 @@ def take(cfg: Config, conn: sqlite3.Connection, names: list[str], folder_rel: st
         batch[file_hash] = name
         taken.append((name, f"{rel_dir}/{target.name}"))
     return {"folder": rel_dir, "taken": taken, "known": known, "refused": refused}
+
+
+# --- Clearing out what refs has -----------------------------------------------------------
+
+def trash_known(cfg: Config, conn: sqlite3.Connection, names: list[str]) -> dict:
+    """Move to the macOS Trash the named PDFs in Downloads that the library
+    already has, byte for byte (typically after "copy" took them in).
+
+    Each file is hashed again here, so only a file whose exact content is in
+    the index can go: anything else (a different version, a file never taken
+    in) is refused and stays. The Trash keeps the name, so a file can be
+    dragged back. Returns {"trashed": [(name, library path)], "refused":
+    [(name, why)]}.
+    """
+    where = folder(cfg)
+    if where is None:
+        raise Refused("no Downloads folder is set (settings)")
+    trashed, refused = [], []
+    for name in dict.fromkeys(names):
+        source = _source(where, name)
+        if isinstance(source, str):
+            refused.append((name, source))
+            continue
+        try:
+            path = _known(conn, _hash(source))
+            if path is None:
+                refused.append((name, "refs does not have this file; it stays"))
+                continue
+            rename.to_trash(source)
+        except OSError as error:
+            refused.append((name, f"{type(error).__name__}: {error}"))
+            continue
+        trashed.append((name, path))
+    return {"trashed": trashed, "refused": refused}

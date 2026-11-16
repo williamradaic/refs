@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
@@ -180,12 +180,28 @@ def create_app(watch: bool = False) -> FastAPI:
         if marker != "1":
             raise HTTPException(403, "missing X-Refs header")
 
-    def dates(locations: list[dict], work: dict | None) -> tuple[str | None, str | None]:
-        """(date added, date modified) as YYYY-MM-DD.
+    # Dates: each is worked out as a moment (seconds since 1970) so the list
+    # can sort by time of day as well, and shown as this Mac's YYYY-MM-DD.
+    def moment(stamp: str | None) -> float | None:
+        """An ISO time stamp as seconds. refs, Zotero ("2023-04-05 12:34:56")
+        and the index all store UTC, so a stamp without a zone is UTC."""
+        if not stamp:
+            return None
+        try:
+            when = datetime.fromisoformat(stamp)
+        except ValueError:
+            return None
+        return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()
 
-        Added: when the earliest PDF of the work appeared on disk, or the date
-        it was added to Zotero if that is earlier; a work with no PDF uses the
-        day it entered the library. Modified: the newest change to any of its PDFs.
+    def local_day(t: float | None) -> str | None:
+        return datetime.fromtimestamp(t).strftime("%Y-%m-%d") if t is not None else None
+
+    def dates(locations: list[dict], work: dict | None) -> tuple[float | None, float | None]:
+        """(added, modified) as moments.
+
+        Added: when the earliest PDF of the work appeared on disk, or when it
+        was added to Zotero if that is earlier; a work with no PDF uses the
+        moment it entered the library. Modified: the newest change to any of its PDFs.
         """
         created, changed = [], []
         for loc in locations:
@@ -195,31 +211,26 @@ def create_app(watch: bool = False) -> FastAPI:
                 continue
             created.append(getattr(info, "st_birthtime", info.st_mtime))
             changed.append(info.st_mtime)
-        day = lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%d")   # noqa: E731
-        candidates = [day(min(created))] if created else []
+        candidates = [min(created)] if created else []
         user = (work or {}).get("user", {})
-        if (user.get("zotero") or {}).get("added"):
-            candidates.append(user["zotero"]["added"][:10])
-        if not candidates and work:
-            candidates.append(work["created"][:10])
-        return (min(candidates) if candidates else None), (day(max(changed)) if changed else None)
+        if (zotero_added := moment((user.get("zotero") or {}).get("added"))) is not None:
+            candidates.append(zotero_added)
+        if not candidates and work and (made := moment(work.get("created"))) is not None:
+            candidates.append(made)
+        return (min(candidates) if candidates else None), (max(changed) if changed else None)
 
-    def local_day(stamp: str | None) -> str | None:
-        """An ISO time stamp (UTC, as refs stores them) as this Mac's YYYY-MM-DD."""
-        if not stamp:
-            return None
-        try:
-            return datetime.fromisoformat(stamp).astimezone().strftime("%Y-%m-%d")
-        except ValueError:
-            return stamp[:10]
-
-    def in_refs(item: dict | None, work: dict | None) -> str | None:
-        """When the paper entered refs: the day its work was made (for a Zotero
-        import, the day it was added to Zotero), else the day refs first
-        indexed the PDF. Unlike "added", this ignores the file's own dates."""
+    def in_refs(item: dict | None, work: dict | None) -> float | None:
+        """When the paper entered refs: when its work was made (for a Zotero
+        import, when it was added to Zotero), else when refs first indexed
+        the PDF. Unlike "added", this ignores the file's own dates."""
         if work and work.get("created"):
-            return local_day(work["created"])
-        return local_day((item or {}).get("first_seen"))
+            return moment(work["created"])
+        return moment((item or {}).get("first_seen"))
+
+    def date_fields(added: float | None, modified: float | None, entered: float | None) -> dict:
+        """The three dates as days to show, and as moments (`*_at`) to sort by."""
+        return {"added": local_day(added), "modified": local_day(modified), "in_refs": local_day(entered),
+                "added_at": added, "modified_at": modified, "in_refs_at": entered}
 
     def shape(item: dict, all_works: dict) -> dict:
         """One search result as the page needs it."""
@@ -227,7 +238,7 @@ def create_app(watch: bool = False) -> FastAPI:
         meta = (work or {}).get("meta") or {}
         added, modified = dates(item["locations"], work)
         return {
-            "added": added, "modified": modified, "in_refs": in_refs(item, work),
+            **date_fields(added, modified, in_refs(item, work)),
             # Venue column: the journal for articles, otherwise what the item is.
             "venue_label": venues.label(meta) if meta else item["kind"],
             "abbr": venues.abbreviation(meta.get("venue")) if meta else None,
@@ -251,7 +262,7 @@ def create_app(watch: bool = False) -> FastAPI:
         """A work saved without a PDF, shaped like a search result."""
         meta = work["meta"]
         return {
-            "added": dates([], work)[0], "modified": None, "in_refs": in_refs(None, work),
+            **date_fields(dates([], work)[0], None, in_refs(None, work)),
             "venue_label": venues.label(meta), "abbr": venues.abbreviation(meta.get("venue")),
             "id": work["id"], "work_id": work["id"], "citekey": work["citekey"],
             "title": meta.get("title"), "year": meta.get("year"), "venue": meta.get("venue"),
@@ -688,6 +699,19 @@ def create_app(watch: bool = False) -> FastAPI:
         return {"folder": result["folder"], "job": job, "mode": mode,
                 "taken": [{"name": n, "to": rel} for n, rel in taken],
                 "known": [{"name": n, "path": p} for n, p in result["known"]],
+                "refused": [{"name": n, "why": why} for n, why in result["refused"]]}
+
+    @app.post("/api/downloads/trash")
+    def downloads_trash(names: list[str] = Body(embed=True),
+                        x_refs: str | None = Header(default=None)) -> dict:
+        """Move to the Trash the named PDFs in Downloads that refs already has,
+        byte for byte. Anything refs does not have is refused and stays."""
+        guard(x_refs)
+        try:
+            result = downloads.trash_known(cfg, index.connect(cfg), names)
+        except organize.Refused as error:
+            raise refused(error)
+        return {"trashed": [{"name": n, "path": p} for n, p in result["trashed"]],
                 "refused": [{"name": n, "why": why} for n, why in result["refused"]]}
 
     @app.post("/api/open")

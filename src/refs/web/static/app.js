@@ -72,14 +72,15 @@ const COLUMNS = {
              text: (i) => i.abbr ?? "" },
   venue:   { label: "publication", name: "publication", width: 22, cls: "ve",
              sort: (i) => (i.venue_label ?? last).toLowerCase(), text: (i) => i.venue_label ?? "" },
-  // Dates are YYYY-MM-DD, so sorting them as text is sorting them in time.
-  added:   { label: "added",    width: 10, cls: "da", sort: (i) => i.added ?? "",
+  // Dates show the day (YYYY-MM-DD) but sort by the moment (`*_at`, seconds),
+  // so papers from the same day keep the order in which they came.
+  added:   { label: "added",    width: 10, cls: "da", sort: (i) => i.added_at ?? -Infinity,
              text: (i) => i.added ?? "" },
-  modified: { label: "modified", width: 10, cls: "da", sort: (i) => i.modified ?? "",
+  modified: { label: "modified", width: 10, cls: "da", sort: (i) => i.modified_at ?? -Infinity,
              text: (i) => i.modified ?? "" },
   // When the paper entered refs (its record was made), as opposed to the
   // PDF's own dates above: useful for "what did I collect last week".
-  in_refs: { label: "in refs", name: "added to refs", width: 10, cls: "da", sort: (i) => i.in_refs ?? "",
+  in_refs: { label: "in refs", name: "added to refs", width: 10, cls: "da", sort: (i) => i.in_refs_at ?? -Infinity,
              text: (i) => i.in_refs ?? "" },
 };
 COLUMNS.st.name = "status"; COLUMNS.abbr.name = "journal abbreviation"; COLUMNS.rd.name = "queue / reading";
@@ -610,9 +611,11 @@ async function renderDetail() {
     html += `<dt>read</dt><dd>${esc(item.read_status)}${how}</dd>`;
   }
   if (item.queued) html += `<dt>queue</dt><dd><span class="rd q">▸</span> since ${esc(item.queued.slice(0, 10))}</dd>`;
-  if (item.added) html += `<dt>added</dt><dd>${esc(item.added)}</dd>`;
-  if (item.in_refs) html += `<dt>in refs</dt><dd>${esc(item.in_refs)}</dd>`;
-  if (item.modified) html += `<dt>modified</dt><dd>${esc(item.modified)}</dd>`;
+  // The detail pane gives the time too (the list shows only the day).
+  const when = (day, at) => esc(day) + (at != null ? ` <span class="badge">${clock(at)}</span>` : "");
+  if (item.added) html += `<dt>added</dt><dd>${when(item.added, item.added_at)}</dd>`;
+  if (item.in_refs) html += `<dt>in refs</dt><dd>${when(item.in_refs, item.in_refs_at)}</dd>`;
+  if (item.modified) html += `<dt>modified</dt><dd>${when(item.modified, item.modified_at)}</dd>`;
   html += `</dl>`;
   if (work) {
     // Corrections: edit any field by hand, pull the record for a DOI you know,
@@ -1103,6 +1106,7 @@ async function showDownloads(token) {
   const waiting = data.items.filter((i) => !i.in_refs);
   const shown = data.items.filter((i) => state.dlOthers || papers(i) || i.in_refs);
   const hidden = data.items.length - shown.length;
+  const had = data.items.filter((i) => i.in_refs);     // copies refs has: may go to the Trash
   const takeable = new Set(waiting.filter((i) => i.kind !== "incomplete").map((i) => i.name));
   for (const name of [...state.picked]) if (!takeable.has(name)) state.picked.delete(name);
   $("count").textContent = `${waiting.filter(papers).length} papers in Downloads`;
@@ -1115,6 +1119,7 @@ async function showDownloads(token) {
     <button class="act" data-pick="none">select none</button>
     <span class="where"><span id="npicked">${state.picked.size}</span> ticked</span>
     <button class="act" data-dl-others="1">${state.dlOthers ? "hide the other PDFs" : `show ${hidden} other PDFs`}</button>
+    ${had.length ? `<button class="act" data-dl-trash="*">trash the ${had.length} already in refs</button>` : ""}
   </div>`;
   if (!shown.length) html += `<div class="empty">no PDFs that look like papers in ${esc(data.folder)}.</div>`;
   for (const item of shown) {
@@ -1125,7 +1130,8 @@ async function showDownloads(token) {
       state.picked.has(item.name) ? " checked" : ""}${can ? "" : " disabled"}>
       <span class="name" title="${esc(item.name)}">${esc(item.name)}</span>
       <span class="about">${esc(about)}</span>
-      <span class="who ${item.kind}" title="${esc(why)}">${esc(why)}</span></label>`;
+      <span class="who ${item.kind}" title="${esc(why)}">${esc(why)}</span>${item.in_refs
+        ? `<button class="act trash" data-dl-trash="${esc(item.name)}" title="move this copy in Downloads to the Trash">trash</button>` : ""}</label>`;
   }
   if (data.older) html += `<div class="where" style="padding: 4px 2ch">${data.older} older PDFs are not listed.</div>`;
   $("list").innerHTML = html;
@@ -1196,6 +1202,24 @@ async function sendDownloads(names, folder, create) {
   say(parts.join("; ") + "; reading …", 0);
   await follow(Promise.resolve({ job: result.job }), taken.length === 1 ? taken[0].to.split("/").pop()
     : `${taken.length} PDFs`);
+}
+
+// Downloads copies of PDFs refs already has, byte for byte (say, after "copy"
+// took them in): to the macOS Trash, from where they can be dragged back. The
+// server hashes each file again and refuses any that refs does not have.
+async function trashDownloads(which) {
+  const names = which === "*" ? state.dl.items.filter((i) => i.in_refs).map((i) => i.name) : [which];
+  if (!names.length) return;
+  const what = names.length === 1 ? names[0] : `these ${names.length} PDFs`;
+  if (!confirm(`Move ${what} from Downloads to the Trash?\n\nrefs has the same file${
+    names.length === 1 ? "" : "s"}, so nothing is lost; drag back from the Trash to undo.`)) return;
+  const response = await fetch("/api/downloads/trash", { method: "POST",
+    headers: { "Content-Type": "application/json", "X-Refs": "1" }, body: JSON.stringify({ names }) });
+  const result = await response.json();
+  if (!response.ok) { say(result.detail ?? "could not move them to the Trash", 9000); return; }
+  const left = result.refused.length ? `; ${result.refused.length} kept (${result.refused[0].name}: ${result.refused[0].why})` : "";
+  say(`moved ${result.trashed.length} to the Trash${left}`, 9000);
+  search();
 }
 
 // --- review: identical copies -------------------------------------------------------------
@@ -1478,6 +1502,7 @@ $("list").addEventListener("click", async (event) => {
     tick(inFolder, !boxes.filter(inFolder).every((box) => box.checked));   // toggles the folder
   }
   else if (el.dataset.dlOthers) { state.dlOthers = !state.dlOthers; search(); return; }
+  else if (el.dataset.dlTrash) { event.preventDefault(); await trashDownloads(el.dataset.dlTrash); return; }
   else if (el.dataset.apply) await applyRenames();
   else if (el.dataset.undo) await undoBatch(Number(el.dataset.undo));
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });

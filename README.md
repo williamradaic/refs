@@ -80,7 +80,11 @@ a reference list, the length. Tick the ones you want (or "select all"), then
 **take into the quick-add folder**, or **take into folder…** to put them
 straight into a course or project folder (a new one if you type a path).
 They are moved out of Downloads, or copied if you choose copy, then read like
-any new paper. A PDF refs already has is left where it is and reported. The
+any new paper. A PDF refs already has is left where it is and marked
+"already in refs"; **trash** (on the row, or for all of them in the bar) moves
+those Downloads copies to the Trash, which is how to clear Downloads after
+copying papers in. Only a file whose exact content is in refs can be trashed
+this way, and it can be dragged back from the Trash. The
 folder is a setting (Library → Downloads folder); empty turns the view off.
 
 **The bookmarklet** (`/bookmarklet`, drag "+ refs" to the bookmarks bar) adds

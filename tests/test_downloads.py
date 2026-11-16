@@ -271,3 +271,44 @@ def test_the_setting_must_be_a_folder_outside_the_library(home, tmp_path):
     with pytest.raises(settings.SettingError, match="inside the library"):
         settings.save({"downloads_folder": str(home.root / "papers-dump")})
     assert settings.save({"downloads_folder": ""}).downloads_folder is None
+
+
+# --- clearing out what refs has ----------------------------------------------------------
+
+def test_copies_refs_has_go_to_the_trash(home):
+    (home.dl.parent / ".Trash").mkdir()
+    result = home.client.post("/api/downloads/trash", headers=H, json={"names": ["blp (1).pdf"]}).json()
+    assert result == {"trashed": [{"name": "blp (1).pdf", "path": f"{PROJECT}/blp.pdf"}], "refused": []}
+    assert not (home.dl / "blp (1).pdf").exists()
+    assert (home.dl.parent / ".Trash" / "blp (1).pdf").is_file()          # can be dragged back
+
+
+def test_only_files_refs_has_can_be_trashed(home, tmp_path):
+    (home.dl.parent / ".Trash").mkdir()
+    shutil.copy2(home.root / PROJECT / "blp.pdf", tmp_path / "outside.pdf")
+    (home.dl / "link.pdf").symlink_to(tmp_path / "outside.pdf")          # same content, but a link
+    names = ["demand.pdf", "receipt.pdf", "../outside.pdf", "link.pdf", "missing.pdf", ".hidden.pdf"]
+    result = home.client.post("/api/downloads/trash", headers=H, json={"names": names}).json()
+    assert result["trashed"] == []
+    assert {r["name"] for r in result["refused"]} == set(names)
+    assert (home.dl / "demand.pdf").is_file() and (tmp_path / "outside.pdf").is_file()
+    assert list((home.dl.parent / ".Trash").iterdir()) == []
+
+
+def test_after_copying_in_the_downloads_copy_can_be_trashed(home):
+    (home.dl.parent / ".Trash").mkdir()
+    taken = home.client.post("/api/downloads/take", headers=H, json={
+        "names": ["demand.pdf"], "mode": "copy"}).json()
+    wait(home.client, taken["job"])
+    scan.scan(config.load(), index.connect(config.load()))  # what `refs add` does; it is stubbed here
+    listed = {i["name"]: i for i in home.client.get("/api/downloads").json()["items"]}
+    assert listed["demand.pdf"]["in_refs"] == "papers-dump/demand.pdf"
+    result = home.client.post("/api/downloads/trash", headers=H, json={"names": ["demand.pdf"]}).json()
+    assert [t["name"] for t in result["trashed"]] == ["demand.pdf"]
+    assert (home.root / "papers-dump/demand.pdf").is_file()
+
+
+def test_trashing_needs_the_page_header(home):
+    response = home.client.post("/api/downloads/trash", json={"names": ["blp (1).pdf"]})
+    assert response.status_code == 403
+    assert (home.dl / "blp (1).pdf").is_file()

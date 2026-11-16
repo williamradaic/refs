@@ -209,3 +209,29 @@ def test_new_folders_only_where_filing_is_allowed(lib, folder):
 def test_search_results_say_when_a_paper_entered_refs(lib):
     [item] = [i for i in lib.client.get("/api/search").json()["items"] if i["work_id"]]
     assert len(item["in_refs"]) == 10 and item["in_refs"][:2] == "20"
+
+
+def test_dates_carry_the_time_of_day_for_sorting(lib):
+    """The list shows days, but sorts by moments: two papers from the same day
+    keep the order in which they came. Stamps without a zone (Zotero's) are UTC."""
+    import os
+    from datetime import datetime, timezone
+
+    from refs import records, works
+    [work_id] = works.load_all(lib.cfg)
+    path = works.works_dir(lib.cfg) / f"{work_id}.json"
+    work = records.read_json(path)
+    work["created"] = "2026-11-15T10:30:00+00:00"
+    work["user"]["zotero"] = {"added": "2001-02-03 04:05:06"}
+    records.write_json(path, work)
+    for rel in (DUMP_NAME, f"{READINGS}/blp.pdf"):
+        os.utime(lib.root / rel, (1_700_000_000, 1_700_000_000 + (rel == DUMP_NAME) * 3600))
+
+    [item] = [i for i in lib.client.get("/api/search").json()["items"] if i["work_id"]]
+    utc = lambda *a: datetime(*a, tzinfo=timezone.utc).timestamp()    # noqa: E731
+    assert item["in_refs_at"] == utc(2026, 11, 15, 10, 30)
+    assert item["added_at"] == utc(2001, 2, 3, 4, 5, 6)              # Zotero is earlier than the files
+    assert item["modified_at"] == 1_700_003_600                      # the newer of the two copies
+    local = lambda t: datetime.fromtimestamp(t).strftime("%Y-%m-%d")  # noqa: E731
+    assert (item["in_refs"], item["added"], item["modified"]) == (
+        local(item["in_refs_at"]), local(item["added_at"]), local(item["modified_at"]))
