@@ -32,8 +32,9 @@ def _entry_type(meta: dict) -> str:
     return "unpublished" if record_type != "journal-article" else "article"
 
 
-def entry(work: dict) -> str:
-    """One BibTeX entry for a work."""
+def entry(work: dict, extra: list[tuple[str, str]] | None = None) -> str:
+    """One BibTeX entry for a work. `extra` fields (name, value) go at the end
+    as given, unescaped (library.bib's `file` and `keywords`)."""
     meta = work["meta"]
     kind = _entry_type(meta)
     fields: list[tuple[str, str]] = []
@@ -68,6 +69,7 @@ def entry(work: dict) -> str:
         fields.append(("pages", re.sub(r"\s*[-–]+\s*", "--", meta["pages"])))
     if doi:
         fields.append(("doi", doi))            # verbatim: biblatex prints DOIs as-is
+    fields += extra or []
 
     width = max(len(name) for name, _ in fields)
     body = ",\n".join(f"  {name:<{width}} = {{{value}}}" for name, value in fields if value)

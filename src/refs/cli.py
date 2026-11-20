@@ -7,6 +7,8 @@
     refs find blp             search; add filters like course:101 kind:paper
     refs ask "IO paper on ice cream"   let Haiku rank the candidates (about $0.0005)
     refs contexts             the courses and projects the app has recognised
+    refs collection           collections (courses, projects); add papers to them
+    refs project new bets     a new project (a collection, optionally with a folder)
     refs dupes                files stored in more than one place
     refs open blp             open the best match in the default PDF viewer
     refs path blp             print its full path (handy inside scripts)
@@ -60,11 +62,15 @@ def _where(loc: dict) -> str:
 
 
 def _split_query(words: list[str]) -> tuple[list[str], dict[str, str]]:
-    """Separate free text from `key:value` filters."""
+    """Separate free text from `key:value` filters. `#220a` names a collection;
+    several (`#220a #bets`) must all hold."""
     terms, filters = [], {}
     for word in words:
         key, sep, value = word.partition(":")
-        if sep and value and key.isalpha():
+        if len(word) > 1 and word.startswith("#"):
+            name = word[1:].lower()
+            filters["collection"] = f"{filters['collection']},{name}" if "collection" in filters else name
+        elif sep and value and key.isalpha():
             filters[key.lower()] = value
         else:
             terms.append(word)
@@ -197,7 +203,7 @@ def cmd_find(args: argparse.Namespace) -> int:
     try:
         outcome = ask.search(cfg, conn, terms, filters, mode=mode)
     except ValueError as error:
-        print(f"refs: {error}. Filters: course, project, term, area, in, topic, "
+        print(f"refs: {error}. Filters: #collection, course, project, term, area, in, topic, "
               "section, kind, year, author, status, tag, read, queued.", file=sys.stderr)
         return 2
     results = outcome.results if args.all else outcome.results[:args.limit]
@@ -243,10 +249,17 @@ def cmd_ask(args: argparse.Namespace) -> int:
 
 def cmd_bib(args: argparse.Namespace) -> int:
     """Print BibTeX entries for the works a query selects."""
-    from . import bib, works
+    from . import bib, librarybib, works
 
     cfg = config.load()
     conn = index.connect(cfg)
+    if args.library:
+        written = librarybib.write(cfg, conn)
+        print(f"{librarybib.path(cfg)} {'written' if written else 'already up to date'}.")
+        return 0
+    if not args.query:
+        print("Say which papers (`refs bib blp`, `refs bib project:bets`), or --library.", file=sys.stderr)
+        return 2
     terms, filters = _split_query(args.query)
     all_works = works.load_all(cfg)
     # Only library works have BibTeX; with search words, keep the best `--limit`.
@@ -259,14 +272,27 @@ def cmd_bib(args: argparse.Namespace) -> int:
     if not chosen:
         print("No library works match.", file=sys.stderr)
         return 1
-    if not args.append:
+    if args.append is None:
         print("\n\n".join(bib.entry(w) for w in chosen))
         return 0
 
     # --append: add to a project's .bib, skipping papers it already holds
-    # under any key (matched by key, DOI or title).
+    # under any key (matched by key, DOI or title). With no file named, the
+    # .bib of the collection the query names (`refs bib #bets --append`).
     from pathlib import Path
-    target = Path(args.append).expanduser()
+
+    from . import collection
+    if args.append == "":
+        names = [n for key in ("collection", "project", "course") if key in filters
+                 for n in filters[key].lower().split(",")]
+        registry = collection.load(cfg)
+        target = next((path for n in names if (path := collection.bib_path(cfg, registry.get(n)))), None)
+        if target is None:
+            print("Say which .bib file (--append FILE.bib), or name a collection that has one "
+                  "(`refs project new <name> --bib FILE.bib`).", file=sys.stderr)
+            return 2
+    else:
+        target = Path(args.append).expanduser()
     if target.suffix != ".bib":
         print(f"{target} is not a .bib file.", file=sys.stderr)
         return 2
@@ -297,6 +323,151 @@ def cmd_contexts(args: argparse.Namespace) -> int:
     for row in rows:
         print(f"{row['files']:>6,} {row['papers']:>7,}  {row['context']}")
     return 0
+
+
+def _print_collections(rows: list[dict]) -> None:
+    """Courses by term (newest first), then projects."""
+    from . import collection
+
+    courses = sorted((r for r in rows if r["kind"] == "course"),
+                     key=lambda r: (-collection._term_rank(r["term"] or ""), r["name"]))
+    projects = [r for r in rows if r["kind"] != "course"]
+    for title, group in (("courses", courses), ("projects", projects)):
+        if not group:
+            continue
+        print(title)
+        for r in group:
+            notes = [r["term"] or "", "shared" if r["shared"] else "",
+                     "from folders" if r["implicit"] else "",
+                     f"folder {r['folder']}" if r["folder"] else "",
+                     f"bib {r['bib_file']}" if r["bib_file"] else ""]
+            depth = r["name"].count("/")
+            print(f"  {'  ' * depth}{r['name']:<{28 - 2 * depth}} {r['works']:>5}  "
+                  + " · ".join(n for n in notes if n))
+
+
+def cmd_collection(args: argparse.Namespace) -> int:
+    """`refs collection`: list collections. `add`/`remove` a paper (the best
+    match of a search, or every match with --all), `rename`, `new` or `delete` one."""
+    from . import collection, works
+
+    cfg = config.load()
+    if args.action == "new":
+        return _new_collection(cfg, args, kind=args.kind)
+    conn = index.connect(cfg)
+    if args.action == "list":
+        rows = collection.listing(cfg, conn)
+        if args.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        elif rows:
+            _print_collections(rows)
+        else:
+            print("No collections yet. `refs project new <name>` makes one; "
+                  "`refs collection add <name> <search>` puts a paper in one.")
+        return 0
+    try:
+        if args.action == "delete":
+            if len(args.words) != 1:
+                print("Usage: refs collection delete NAME", file=sys.stderr)
+                return 2
+            count = collection.delete(cfg, args.words[0])
+            index.refresh_derived(cfg, conn)
+            conn.commit()
+            print(f"Deleted {collection.clean_name(args.words[0])} (taken out of {_plural(count, 'paper')}). "
+                  "Papers in it only because of their folder stay as they are.")
+            return 0
+        if args.action == "rename":
+            if len(args.words) != 2:
+                print("Usage: refs collection rename OLD NEW", file=sys.stderr)
+                return 2
+            count = collection.rename(cfg, *args.words)
+            index.refresh_derived(cfg, conn)
+            conn.commit()
+            print(f"Renamed {args.words[0]} to {collection.clean_name(args.words[1])} "
+                  f"({_plural(count, 'paper')}). Papers in it only because of their folder stay as they are.")
+            return 0
+        # add / remove NAME SEARCH...
+        if len(args.words) < 2:
+            print(f"Usage: refs collection {args.action} NAME SEARCH...", file=sys.stderr)
+            return 2
+        name = collection.clean_name(args.words[0])
+    except collection.Invalid as error:
+        print(f"refs: {error}.", file=sys.stderr)
+        return 2
+    all_works = works.load_all(cfg)
+    terms, filters = _split_query(args.words[1:])
+    found = [r for r in index.search(conn, terms, filters, limit=None, semantic=bool(terms))
+             if r["work_id"] in all_works and "meta" in all_works[r["work_id"]]]
+    if not args.all:
+        found = found[:1]
+    if not found:
+        print("No matching paper.", file=sys.stderr)
+        return 1
+    adding = args.action == "add"
+    changed = set(collection.change(cfg, [r["work_id"] for r in found], name, add=adding))
+    all_works = works.load_all(cfg)
+    for item in found:
+        index.update_collections(conn, all_works[item["work_id"]])
+        state = ("added to " if adding else "taken out of ") if item["work_id"] in changed \
+            else ("already in " if adding else "not in ")
+        print(f"{state}{name}: {_headline(item)}  @{item['citekey']}")
+    if not adding and any(name in r["collections"] and r["work_id"] not in changed for r in found):
+        print("(A paper in it because of its folder stays in it until the file moves.)")
+    return 0
+
+
+def _new_collection(cfg, args: argparse.Namespace, kind: str) -> int:
+    """`refs project new` / `refs collection new`: register a collection, and
+    with --make-folder create its folder."""
+    from . import collection, contexts, organize
+
+    try:
+        name = collection.clean_name(args.name)
+    except collection.Invalid as error:
+        print(f"refs: {error}.", file=sys.stderr)
+        return 2
+    folder = args.folder
+    if args.make_folder and not folder:
+        if cfg.layout == "phd" and kind == "project":
+            folder = f"phd/research/{name}/readings"
+        else:
+            print("Say which folder to make with --folder (relative to the library folder).",
+                  file=sys.stderr)
+            return 2
+    if args.shared and not folder:
+        print("A shared collection needs its shared folder: --folder phd/research/<name>/readings.",
+              file=sys.stderr)
+        return 2
+    try:
+        existed = name in collection.load(cfg)
+        if args.term and not contexts.term_of(args.term):
+            raise collection.Invalid(f"{args.term!r} is not a term (say 2026-fall)")
+        if args.make_folder:
+            # Inside the watched folders, never a managed one; made first, so a
+            # refused folder saves nothing.
+            folder = organize.make_folder(cfg, folder)
+        entry = collection.register(cfg, name, kind=kind, term=args.term, folder=folder,
+                                    shared=True if args.shared else None, bib_file=args.bib)
+    except (collection.Invalid, organize.Refused) as error:
+        print(f"refs: {error}.", file=sys.stderr)
+        return 2
+    print(f"{'Updated' if existed else 'New'} {entry['kind']} {name}"
+          + (f" ({entry['term']})" if entry["term"] else ""))
+    if entry["folder"]:
+        made = " (made)" if args.make_folder else ""
+        print(f"  folder  {entry['folder']}{made}" + ("  · shared with coauthors" if entry["shared"] else ""))
+        if not any(entry["folder"] == r or entry["folder"].startswith(r.rstrip("/") + "/") for r in cfg.roots):
+            print("  (refs does not watch this folder: it is outside the watched folders)")
+    if entry["bib_file"]:
+        print(f"  bib     {entry['bib_file']}  (`refs bib collection:{name} --append` adds to it)")
+    print(f"Add papers with `refs collection add {name} <search>`, or on the page.")
+    return 0
+
+
+def cmd_project(args: argparse.Namespace) -> int:
+    """`refs project new <name>`: the plan's name for making a collection."""
+    cfg = config.load()
+    return _new_collection(cfg, args, kind="course" if args.course else "project")
 
 
 def cmd_dupes(args: argparse.Namespace) -> int:
@@ -998,6 +1169,25 @@ def cmd_setup_key(args: argparse.Namespace) -> int:
 
 # --- Entry point -----------------------------------------------------------------
 
+def _collection_options(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--term", help="a course's term, e.g. 2026-fall")
+    p.add_argument("--folder", help="its folder, relative to the library folder")
+    p.add_argument("--make-folder", action="store_true",
+                   help="create the folder (default for a project: phd/research/<name>/readings)")
+    p.add_argument("--shared", action="store_true", help="the folder is shared with coauthors")
+    p.add_argument("--bib", help="the project's .bib file (~/... on this Mac, or inside Dropbox)")
+
+
+def _collection_entry(args: argparse.Namespace) -> int:
+    """`refs collection new NAME` takes the name from the words."""
+    if args.action == "new":
+        if len(args.words) != 1:
+            print("Usage: refs collection new NAME [--kind course|project] [--folder ...]", file=sys.stderr)
+            return 2
+        args.name = args.words[0]
+    return cmd_collection(args)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="refs", description="A folder-aware reference manager on top of Dropbox.")
@@ -1031,9 +1221,11 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(run=cmd_ask)
 
     p = sub.add_parser("bib", help="BibTeX for matching works, e.g. `refs bib blp` or `refs bib project:thesis`")
-    p.add_argument("query", nargs="+", help="words and key:value filters, as in `find`")
+    p.add_argument("query", nargs="*", help="words and key:value filters, as in `find`")
     p.add_argument("--limit", type=int, default=1, help="how many matches when searching by words")
-    p.add_argument("--append", metavar="FILE.bib",
+    p.add_argument("--library", action="store_true",
+                   help="write library.bib (every paper, with its PDF and collections) now")
+    p.add_argument("--append", metavar="FILE.bib", nargs="?", const="",
                    help="add the entries to this .bib file instead of printing them "
                         "(papers already in it, under any key, are skipped)")
     p.set_defaults(run=cmd_bib)
@@ -1041,6 +1233,25 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("contexts", help="courses and projects recognised from folders")
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_contexts)
+
+    p = sub.add_parser("collection",
+                       help="collections (courses, projects): list, add, remove, rename, new, delete")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "add", "remove", "rename", "new", "delete"])
+    p.add_argument("words", nargs="*",
+                   help="add/remove: NAME SEARCH...; rename: OLD NEW; new/delete: NAME")
+    p.add_argument("--all", action="store_true", help="add/remove every match, not only the best")
+    p.add_argument("--kind", choices=["course", "project"], help="new: course or project")
+    _collection_options(p)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=_collection_entry)
+
+    p = sub.add_parser("project", help="`refs project new <name>`: a new project or course")
+    p.add_argument("action", choices=["new"])
+    p.add_argument("name")
+    p.add_argument("--course", action="store_true", help="a course, not a project")
+    _collection_options(p)
+    p.set_defaults(run=cmd_project)
 
     p = sub.add_parser("dupes", help="files stored in more than one place")
     p.add_argument("--json", action="store_true")

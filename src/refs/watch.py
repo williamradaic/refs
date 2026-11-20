@@ -10,6 +10,8 @@ followed by `refs add` would do:
   2. ingest any PDF the pipeline has never read (ingest.py): read and look it
      up, file it under its work and, inside the dump, rename it.
 
+The watching process also keeps library.bib current (librarybib.py).
+
 When the watcher starts it does one such pass straight away, which catches
 whatever changed while refs was not running.
 
@@ -34,7 +36,7 @@ from typing import Callable
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from . import budget, index, ingest, notes
+from . import budget, index, ingest, librarybib, notes
 from . import scan as scanner
 from .config import Config
 
@@ -120,10 +122,14 @@ class Watcher:
         self.held: dict | None = None
         self._approved = False
         self.limit_reached = False
+        # Keeps library.bib current; started with the watcher (one per Mac).
+        self.exporter: librarybib.Exporter | None = None
 
     def _use(self, cfg: Config) -> None:
         """Take these settings: what to watch, and what to ignore."""
         self.cfg = cfg
+        if getattr(self, "exporter", None) is not None:
+            self.exporter.cfg = cfg
         root = str(cfg.dropbox_root)
         # Folders whose changes never matter: the app's own records (written
         # by every pass, so watching them would loop) and excluded paths.
@@ -208,11 +214,15 @@ class Watcher:
 
         self._wake.set()                     # first pass now: catch up on changes made while off
         threading.Thread(target=self._loop, name="refs-watch", daemon=True).start()
+        self.exporter = librarybib.Exporter(self.cfg, log=_log)
+        self.exporter.start()
         return True
 
     def stop(self) -> None:
         self._halt.set()
         self._wake.set()
+        if self.exporter is not None:
+            self.exporter.stop()
         if self._observer is not None:
             self._observer.stop()
         if self._lock_file is not None:
@@ -281,6 +291,8 @@ class Watcher:
                 self.pass_started = None
         self.last_pass = datetime.now().isoformat(timespec="seconds")
         self._report(report, results)
+        if self.exporter is not None and (report.changes or results):
+            self.exporter.poke()             # moved PDFs or new works change library.bib
         return results
 
     def _stage(self, stage: str, done: int, total: int, file: str | None = None) -> None:
@@ -386,4 +398,6 @@ class Watcher:
                 "pending": self._wake.is_set(), "now": time.time(),
                 "roots": list(self.cfg.roots), "auto_process": self.cfg.auto_process,
                 "recent": list(reversed(self.recent)),          # newest first
-                "held": self.held, "limit_reached": self.limit_reached}
+                "held": self.held, "limit_reached": self.limit_reached,
+                "library_bib": None if self.exporter is None else
+                {"written": self.exporter.last_written, "error": self.exporter.error}}
