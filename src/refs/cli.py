@@ -405,6 +405,7 @@ def cmd_collection(args: argparse.Namespace) -> int:
         return 1
     adding = args.action == "add"
     changed = set(collection.change(cfg, [r["work_id"] for r in found], name, add=adding))
+    _after_collect(cfg, conn, [r["work_id"] for r in found], name, adding, changed)
     all_works = works.load_all(cfg)
     for item in found:
         index.update_collections(conn, all_works[item["work_id"]])
@@ -414,6 +415,27 @@ def cmd_collection(args: argparse.Namespace) -> int:
     if not adding and any(name in r["collections"] and r["work_id"] not in changed for r in found):
         print("(A paper in it because of its folder stays in it until the file moves.)")
     return 0
+
+
+def _after_collect(cfg, conn, work_ids: list[str], name: str, adding: bool, changed) -> None:
+    """A shared collection (shared.py): adding copies each paper into its
+    folder; taking out leaves the copies there, and says so."""
+    from . import ingest, shared
+
+    if name not in shared.folders(cfg):
+        return
+    if adding:
+        with ingest.exclusive(cfg):
+            result = shared.copy_in(cfg, conn, work_ids, name)
+            if result["copied"]:
+                scanner.scan(cfg, conn)
+        for _, path in result["copied"]:
+            print(f"copied for coauthors: {path}")
+        for _, why in result["refused"]:
+            print(f"not copied to the shared folder: {why}")
+    else:
+        for path in shared.copies_of(cfg, conn, list(changed), name):
+            print(f"left in the shared folder (coauthors may use it; trash it on the page if not): {path}")
 
 
 def _new_collection(cfg, args: argparse.Namespace, kind: str) -> int:
@@ -445,7 +467,7 @@ def _new_collection(cfg, args: argparse.Namespace, kind: str) -> int:
         if args.make_folder:
             # Inside the watched folders, never a managed one; made first, so a
             # refused folder saves nothing.
-            folder = organize.make_folder(cfg, folder)
+            folder = organize.make_folder(cfg, folder, anywhere=args.shared)
         entry = collection.register(cfg, name, kind=kind, term=args.term, folder=folder,
                                     shared=True if args.shared else None, bib_file=args.bib)
     except (collection.Invalid, organize.Refused) as error:
@@ -706,6 +728,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         work = works.create_stub(cfg, record.to_dict(), source_url)
         if args.queue:
             _queue(cfg, work)
+        _collect_on_add(cfg, conn, work, args.to)
         print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})"
               + ("  [queued]" if args.queue else ""))
         print(f"  @{work['citekey']} . Save the PDF into {cfg.dump} and it will attach itself.")
@@ -731,9 +754,28 @@ def cmd_add(args: argparse.Namespace) -> int:
         _queue(cfg, item.work)
     print(f"Added {ingest.headline(item)}" + ("  [queued]" if args.queue and item.work else ""))
     print(f"  {item.rel}" + (f"   @{item.work['citekey']}" if item.work else ""))
+    if item.work:
+        _collect_on_add(cfg, conn, item.work, args.to)
     for issue in item.read["issues"]:
         print(f"  ! {issue}")
     return 0
+
+
+def _collect_on_add(cfg, conn, work: dict, names: list[str] | None) -> None:
+    """`refs add ... --to 220a --to bets`: put the new paper in those collections."""
+    from . import collection, works
+
+    for raw in names or []:
+        try:
+            name = collection.clean_name(raw)
+        except collection.Invalid as error:
+            print(f"  ! {error}")
+            continue
+        changed = collection.change(cfg, [work["id"]], name)
+        _after_collect(cfg, conn, [work["id"]], name, True, changed)
+        print(f"  in #{name}")
+    if names:
+        index.update_collections(conn, works.load_all(cfg)[work["id"]])
 
 
 def _queue(cfg, work: dict, on: bool = True) -> None:
@@ -1268,6 +1310,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("add", help="quick add: a URL, DOI, arXiv id, NBER number or PDF file")
     p.add_argument("thing")
     p.add_argument("--queue", action="store_true", help="also put it on the reading queue")
+    p.add_argument("--to", action="append", metavar="COLLECTION",
+                   help="also put it in this collection (a course or project); repeatable")
     # Passed by the page when the bookmarklet has read the paper's page already.
     p.add_argument("--doi", help="the paper's DOI, as its page gives it")
     p.add_argument("--pdf-url", help="a link to the PDF, tried first")

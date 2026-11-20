@@ -26,8 +26,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import (bib, capture, collection, config, downloads, index, ingest, keys, notes, onboarding, organize, reading,
-                records, rename, resolve, settings, venues, works)
+from .. import (annotations, bib, capture, collection, config, downloads, inbox, index, ingest, keys, notes,
+                onboarding, organize, reading, records, rename, resolve, settings, shared, venues, works)
 from .. import ask as asking
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
 from .. import scan as scanner
@@ -111,7 +111,8 @@ def create_app(watch: bool = False) -> FastAPI:
     # and the page asks how the job is doing until it finishes.
     jobs: dict[str, dict] = {}
 
-    def start_add(thing: str | list[str], label: str, queue: bool = False, hints: dict | None = None) -> dict:
+    def start_add(thing: str | list[str], label: str, queue: bool = False, hints: dict | None = None,
+                  collections: list[str] | None = None) -> dict:
         """`hints`: what the browser read off the paper's page (doi, pdf_url,
         source_url), passed on as `refs add` options; with them, refs does
         not fetch the page again. A list of `thing`s (PDFs taken in from
@@ -125,6 +126,8 @@ def create_app(watch: bool = False) -> FastAPI:
                 options += [flag, str(hints[key])]
         if hints and (hints.get("doi") or hints.get("pdf_url")):
             options.append("--no-page")
+        for name in collections or []:                # courses and projects to put it in
+            options += ["--to", name]
         things = [thing] if isinstance(thing, str) else list(thing)
 
         def run() -> None:
@@ -151,6 +154,20 @@ def create_app(watch: bool = False) -> FastAPI:
 
         threading.Thread(target=run, daemon=True).start()
         return {"job": job_id}
+
+    def collect_known(paths: list[str], names: list[str]) -> list[str]:
+        """PDFs refs already has, added again with collections: put their
+        papers in those collections. Returns the names used."""
+        if not names or not paths:
+            return []
+        conn = index.connect(cfg)
+        ids = [row["work_id"] for path in paths
+               if (row := conn.execute("SELECT f.work_id FROM paths p JOIN files f ON f.hash = p.hash "
+                                       "WHERE p.path=?", (path,)).fetchone()) and row["work_id"]]
+        used = shared.collect(cfg, conn, ids, names) if ids else []
+        if used:
+            library_changed()
+        return used
 
     @app.get("/api/changes")
     def changes() -> dict:
@@ -339,6 +356,28 @@ def create_app(watch: bool = False) -> FastAPI:
             items.sort(key=lambda i: i["queued"] or "")
         return {"items": items[:800], "asked": outcome.asked, "message": outcome.message}
 
+    def inbox_waiting(conn) -> int | None:
+        if not cfg.inboxes and not shared.folders(cfg):
+            return None
+        count, unseen = inbox.waiting(cfg, conn)
+        if unseen:
+            warm_inbox()
+        return count
+
+    inbox_warming = threading.Lock()
+
+    def warm_inbox() -> None:
+        """Judge the inbox folders' new PDFs in the background, one pass at a time."""
+        if not inbox_warming.acquire(blocking=False):
+            return
+
+        def run() -> None:
+            try:
+                inbox.listing(cfg, index.connect(cfg))
+            finally:
+                inbox_warming.release()
+        threading.Thread(target=run, daemon=True).start()
+
     def downloads_waiting(conn) -> int | None:
         if downloads.folder(cfg) is None:
             return None
@@ -390,6 +429,9 @@ def create_app(watch: bool = False) -> FastAPI:
                 # PDFs in Downloads that look like papers and are not in refs
                 # (None = no Downloads folder: the entry is hidden).
                 "downloads": downloads_waiting(conn),
+                # Papers in inbox and shared folders the library lacks (None:
+                # neither kind of folder is set, so the entry is hidden).
+                "inbox": inbox_waiting(conn),
                 "unprocessed": conn.execute(
                     "SELECT COUNT(*) FROM files WHERE status IS NULL "
                     "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
@@ -413,7 +455,9 @@ def create_app(watch: bool = False) -> FastAPI:
         found = works.load_all(cfg).get(work_id)
         if found is None or "meta" not in found:
             raise HTTPException(404)
-        return {"work": found, "bibtex": bib.entry(found), "note": notes.read(cfg, found)}
+        return {"work": found, "bibtex": bib.entry(found), "note": notes.read(cfg, found),
+                # Each copy's marks and whether to flag it (annotations.py).
+                "copies": annotations.copies(cfg, index.connect(cfg), work_id)}
 
     @app.get("/file")
     def file(path: str) -> FileResponse:
@@ -497,14 +541,29 @@ def create_app(watch: bool = False) -> FastAPI:
                            add: bool = Body(default=True, embed=True),
                            x_refs: str | None = Header(default=None)) -> dict:
         """Put works into a collection (a new name makes a new collection), or
-        take them out. Returns each work's collections afterwards."""
+        take them out. Returns each work's collections afterwards.
+
+        A shared collection (shared.py) also gets a copy of each paper in its
+        folder (`copied`); taking papers out lists their copies there
+        (`shared_copies`) for the page to offer to trash. Nothing is deleted here.
+        """
         guard(x_refs)
+        collections_moved()                  # a collection made shared elsewhere (the CLI)
         try:
             name = collection.clean_name(name)
             changed = collection.change(cfg, work_ids, name, add=add)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
         conn = index.connect(cfg)
+        copied, not_copied, shared_copies = [], [], []
+        if add and name in shared.folders(cfg):
+            with ingest.exclusive(cfg):
+                result = shared.copy_in(cfg, conn, work_ids, name)
+                if result["copied"]:
+                    scanner.scan(cfg, conn)
+            copied, not_copied = result["copied"], result["refused"]
+        elif not add:
+            shared_copies = shared.copies_of(cfg, conn, changed, name)
         all_works = works.load_all(cfg)
         after = {}
         for work_id in work_ids:
@@ -513,7 +572,17 @@ def create_app(watch: bool = False) -> FastAPI:
                                   "own_collections": collection.explicit(all_works[work_id])}
         if changed:
             library_changed()
-        return {"name": name, "changed": changed, "works": after}
+        return {"name": name, "changed": changed, "works": after,
+                "copied": [{"work_id": w, "path": p} for w, p in copied],
+                "not_copied": [{"work_id": w, "why": why} for w, why in not_copied],
+                "shared_copies": shared_copies}
+
+    def collections_moved() -> None:
+        """The registry changed: if that changed which folders are shared (and
+        so watched), use the new settings at once."""
+        fresh = config.load()
+        if fresh.shared_folders != cfg.shared_folders:
+            apply_settings(fresh)
 
     @app.post("/api/collections/delete")
     def collections_delete(name: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
@@ -528,6 +597,7 @@ def create_app(watch: bool = False) -> FastAPI:
         index.refresh_derived(cfg, conn)
         conn.commit()
         library_changed()
+        collections_moved()
         return {"name": collection.clean_name(name), "papers": count}
 
     @app.post("/api/collections/new")
@@ -553,7 +623,7 @@ def create_app(watch: bool = False) -> FastAPI:
                 # The same checks as a new folder from "file to…": inside the
                 # watched folders, a place refs may write. Made before the
                 # collection is saved, so a refused folder saves nothing.
-                folder = organize.make_folder(cfg, folder)
+                folder = organize.make_folder(cfg, folder, anywhere=shared)
             entry = collection.register(cfg, name, kind=kind, term=term or "", folder=folder,
                                         shared=shared, bib_file=(bib_file or "").strip())
         except collection.Invalid as error:
@@ -561,8 +631,8 @@ def create_app(watch: bool = False) -> FastAPI:
         except organize.Refused as error:
             raise refused(error)
         library_changed()
-        watched = bool(entry["folder"]) and any(
-            entry["folder"] == r or entry["folder"].startswith(r.rstrip("/") + "/") for r in cfg.roots)
+        collections_moved()                    # a shared folder is watched from now on
+        watched = bool(entry["folder"]) and cfg.is_watched(entry["folder"])
         return {"name": name, "entry": entry, "watched": watched}
 
     @app.post("/api/work/{work_id}/edit")
@@ -777,6 +847,7 @@ def create_app(watch: bool = False) -> FastAPI:
     def downloads_take(names: list[str] = Body(embed=True), folder: str | None = Body(default=None, embed=True),
                        mode: str = Body(default="move", embed=True), create: bool = Body(default=False, embed=True),
                        queue: bool = Body(default=False, embed=True),
+                       collections: list[str] = Body(default=[], embed=True),
                        x_refs: str | None = Header(default=None)) -> dict:
         """Move (or copy) PDFs from Downloads into the quick-add folder (no
         `folder`) or into a library folder (`create` makes it first), then
@@ -796,7 +867,10 @@ def create_app(watch: bool = False) -> FastAPI:
         job = None
         if taken:
             label = taken[0][1].split("/")[-1] if len(taken) == 1 else f"{len(taken)} PDFs from Downloads"
-            job = start_add([str(cfg.absolute(rel)) for _, rel in taken], label, queue)["job"]
+            job = start_add([str(cfg.absolute(rel)) for _, rel in taken], label, queue,
+                            collections=collections)["job"]
+        # Already in refs: put those papers in the collections too.
+        collect_known([path for _, path in result["known"] if "/" in path], collections)
         return {"folder": result["folder"], "job": job, "mode": mode,
                 "taken": [{"name": n, "to": rel} for n, rel in taken],
                 "known": [{"name": n, "path": p} for n, p in result["known"]],
@@ -949,6 +1023,7 @@ def create_app(watch: bool = False) -> FastAPI:
     @app.post("/api/add")
     def add(thing: str = Body(embed=True), queue: bool = Body(default=False, embed=True),
             doi: str | None = Body(default=None, embed=True), pdf_url: str | None = Body(default=None, embed=True),
+            collections: list[str] = Body(default=[], embed=True),
             x_refs: str | None = Header(default=None)) -> dict:
         """Quick add. Runs the same code as `refs add`, as a separate process,
         because it can take a while (download, model, registry). `queue` also
@@ -957,12 +1032,13 @@ def create_app(watch: bool = False) -> FastAPI:
         guard(x_refs)
         hints = {"doi": doi, "pdf_url": pdf_url,
                  "source_url": thing if thing.lower().startswith("http") else None}
-        return start_add(thing, thing, queue, hints if doi or pdf_url else None)
+        return start_add(thing, thing, queue, hints if doi or pdf_url else None, collections)
 
     @app.post("/api/capture")
     def capture_add(token: str = Body(embed=True), url: str = Body(embed=True),
                     meta: dict = Body(default={}, embed=True), pdf: str | None = Body(default=None, embed=True),
                     queue: bool = Body(default=False, embed=True),
+                    collections: list[str] = Body(default=[], embed=True),
                     x_refs: str | None = Header(default=None)) -> dict:
         """What the bookmarklet read in your browser: the page address, its
         citation tags (`meta`: doi, title, pdf_url) and, when the browser could
@@ -983,7 +1059,7 @@ def create_app(watch: bool = False) -> FastAPI:
             # the paper without a file. It never re-fetches the page.
             if not (hints["doi"] or hints["pdf_url"] or capture.parse(url).ids):
                 hints = {"source_url": hints["source_url"]}       # nothing read: let refs read the page
-            return start_add(url, label, queue, hints)
+            return start_add(url, label, queue, hints, collections)
         try:
             body = base64.b64decode(pdf, validate=True)
         except (binascii.Error, ValueError):
@@ -994,11 +1070,50 @@ def create_app(watch: bool = False) -> FastAPI:
             "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
             (hashlib.sha256(body).hexdigest(),)).fetchone()
         if known is not None and known["status"] is not None:
-            return {"ok": True, "message": f"Already in the library: {known['path']}"}
+            used = collect_known([known["path"]], collections)
+            return {"ok": True, "message": f"Already in the library: {known['path']}"
+                                          + (f"; now in {', '.join('#' + n for n in used)}" if used else "")}
         if known is not None:                       # on disk but never identified
-            return start_add(str(cfg.absolute(known["path"])), label, queue, hints | {"pdf_url": None})
+            return start_add(str(cfg.absolute(known["path"])), label, queue, hints | {"pdf_url": None},
+                             collections)
         path = capture.save(body, cfg.absolute(cfg.dump))
-        return start_add(str(path), label, queue, hints | {"pdf_url": None})
+        return start_add(str(path), label, queue, hints | {"pdf_url": None}, collections)
+
+    @app.get("/api/inbox")
+    def inbox_list() -> dict:
+        """Papers in inbox folders (course folders) and shared folders that the
+        library lacks, each with the collection it would go in (inbox.py)."""
+        return inbox.listing(cfg, index.connect(cfg))
+
+    @app.post("/api/inbox/take")
+    def inbox_take(choices: list[dict] = Body(embed=True), extra: list[str] = Body(default=[], embed=True),
+                   x_refs: str | None = Header(default=None)) -> dict:
+        """Bring inbox PDFs into the library: moved, or copied from shared and
+        managed folders, under their canonical names (journaled; undo with u).
+        A known paper goes straight into its collections (`choices[].collections`
+        plus `extra`); a PDF never read is read as a new one, then filed."""
+        guard(x_refs)
+        with ingest.exclusive(cfg):              # the watcher must not read them half-moved
+            conn = index.connect(cfg)
+            result = inbox.take(cfg, conn, choices)
+            if result["taken"]:
+                scanner.scan(cfg, conn)
+        conn = index.connect(cfg)
+        jobs_started, unread = [], {}
+        for _, new_rel, work_id, names in result["taken"]:
+            names = list(dict.fromkeys([*names, *extra]))
+            if work_id:
+                shared.collect(cfg, conn, [work_id], names)
+            else:                                # read it first; `refs add --to` files it
+                unread.setdefault(tuple(names), []).append(str(cfg.absolute(new_rel)))
+        for names, paths in unread.items():
+            label = Path(paths[0]).name if len(paths) == 1 else f"{len(paths)} PDFs from the inbox"
+            jobs_started.append(start_add(paths, label, collections=list(names))["job"])
+        if result["taken"]:
+            library_changed()
+        return {"taken": [{"from": a, "to": b, "work_id": w, "collections": n} for a, b, w, n in result["taken"]],
+                "refused": [{"path": p, "why": why} for p, why in result["refused"]],
+                "jobs": jobs_started}
 
     @app.post("/api/identify")
     def identify(path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
@@ -1010,10 +1125,13 @@ def create_app(watch: bool = False) -> FastAPI:
         return start_add(str(cfg.absolute(path)), Path(path).name)
 
     @app.post("/api/upload")
-    async def upload(request: Request, name: str = "upload.pdf",
+    async def upload(request: Request, name: str = "upload.pdf", to: str = "",
                      x_refs: str | None = Header(default=None)) -> dict:
-        """A PDF dropped on the page: save it into the dump, then add it like any other."""
+        """A PDF dropped on the page: save it into the dump, then add it like any
+        other. `to`: collections to put it in, comma-separated (the one the
+        page shows, when you drop it there)."""
         guard(x_refs)
+        names = [n for n in to.split(",") if n.strip()]
         body = await request.body()
         if not body.startswith(b"%PDF"):
             raise HTTPException(400, "that file is not a PDF")
@@ -1023,9 +1141,11 @@ def create_app(watch: bool = False) -> FastAPI:
             (hashlib.sha256(body).hexdigest(),)).fetchone()
         if known is not None and known["status"] is None:
             # On disk, but never identified (an earlier attempt was interrupted).
-            return start_add(str(cfg.absolute(known["path"])), Path(known["path"]).name)
+            return start_add(str(cfg.absolute(known["path"])), Path(known["path"]).name, collections=names)
         if known is not None:
-            return {"ok": True, "message": f"Already in the library: {known['path']}"}
+            used = collect_known([known["path"]], names)
+            return {"ok": True, "message": f"Already in the library: {known['path']}"
+                                          + (f"; now in {', '.join('#' + n for n in used)}" if used else "")}
         # Keep the dropped file's name, minus anything unsafe in a file name.
         safe = re.sub(r"[^\w .()+,&'-]", "_", Path(name).name).strip() or "upload.pdf"
         if not safe.lower().endswith(".pdf"):
@@ -1036,6 +1156,6 @@ def create_app(watch: bool = False) -> FastAPI:
             target = target.with_name(f"{Path(safe).stem}-{number}.pdf")
             number += 1
         target.write_bytes(body)
-        return start_add(str(target), target.name)
+        return start_add(str(target), target.name, collections=names)
 
     return app

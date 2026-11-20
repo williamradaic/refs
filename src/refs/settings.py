@@ -57,6 +57,11 @@ FIELDS = [
     Field("roots", "Library", "Watched folders", kind="folders",
           help="Folders scanned for PDFs, with everything inside them. New PDFs in them are read "
                "as set under AI (about $0.001 each), so adding a large folder can cost a few dollars."),
+    Field("inboxes", "Library", "Inbox folders", kind="folders",
+          help="Folders refs lists but does not index, such as course folders or a course "
+               "site's sync folder. The Inbox view shows the papers in them that the library "
+               "lacks, to take in with their course filled in. Nothing in them is read until "
+               "you take it in."),
     Field("dump", "Library", "Quick-add folder", kind="folder",
           help="Where added papers and the bookmarklet's downloads go, and the one folder refs "
                "renames freely. Created if it does not exist."),

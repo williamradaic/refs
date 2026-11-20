@@ -64,6 +64,8 @@ class Context:
     section: str | None = None      # first folder below the context: "readings"
     topic: str | None = None        # "Demand estimation II"
     topic_order: int | None = None  # 3
+    folder: str | None = None       # the context's own folder: "phd/coursework/2026-fall/220a"
+    topic_folder: str | None = None  # the topic's folder as named on disk: "03-demand-estimation-ii"
 
 
 @dataclass(frozen=True)
@@ -270,17 +272,19 @@ class Layout:
         below = dirs[used:]
         section = below[0] if below else None
 
-        topic, topic_order = None, None
+        topic, topic_order, topic_folder = None, None, None
         for i, folder in enumerate(below):
             # A "readings" folder (also "Required Readings") groups papers by topic:
             # the folder right under it names the topic.
             if "reading" in folder.lower() and i + 1 < len(below):
                 topic, topic_order = pretty_topic(below[i + 1])
+                topic_folder = below[i + 1]
                 break
 
-        return Context(key, area, term, slug, section, topic, topic_order)
+        return Context(key, area, term, slug, section, topic, topic_order,
+                       "/".join(dirs[:used]) or None, topic_folder)
 
 
 def layout_for(cfg: Config) -> Layout:
     """The layout config.toml describes (`layout`, `contexts`, `roots`, `dump`)."""
-    return Layout(cfg.contexts, cfg.roots, cfg.dump, cfg.layout)
+    return Layout(cfg.contexts, cfg.watched, cfg.dump, cfg.layout)

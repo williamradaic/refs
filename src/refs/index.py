@@ -50,8 +50,11 @@ CREATE TABLE IF NOT EXISTS files (
     marks       INTEGER,            --   counted yet. Counted once per content.
     read_status TEXT,               -- the work's read status and queue time, copied
     queued      TEXT,               --   from its work file for the read:/queued: filters
-    collections TEXT                -- JSON list: the work's collections, yours and the
-);                                  --   ones its folders stand for (collection.py)
+    collections TEXT,               -- JSON list: the work's collections, yours and the
+                                    --   ones its folders stand for (collection.py)
+    marks_by    TEXT,               -- JSON {author: marks}: everyone's marks in this file,
+    marks_latest TEXT               --   and the newest one's date (annotations.py)
+);
 
 CREATE TABLE IF NOT EXISTS paths (
     path        TEXT PRIMARY KEY,   -- relative to the Dropbox root
@@ -137,7 +140,8 @@ def connect(cfg: Config) -> sqlite3.Connection:
 
 # Columns of `files` newer than the table itself (added by connect()).
 ADDED_COLUMNS = [("pages", "INTEGER"), ("marked_pages", "INTEGER"), ("marks", "INTEGER"),
-                 ("read_status", "TEXT"), ("queued", "TEXT"), ("collections", "TEXT")]
+                 ("read_status", "TEXT"), ("queued", "TEXT"), ("collections", "TEXT"),
+                 ("marks_by", "TEXT"), ("marks_latest", "TEXT")]
 
 # What connect() creates, so it can tell, by reading only, that there is nothing to do.
 _TABLES = {"meta", "files", "paths", "events", "search", "vectors"}
@@ -165,16 +169,21 @@ def count_marks(cfg: Config, conn: sqlite3.Connection, local_paths: dict[str, st
     is counted once: annotating it changes its content, so it comes back as a
     new hash. Returns how many files were counted.
     """
-    todo = {h for (h,) in conn.execute("SELECT hash FROM files WHERE marked_pages IS NULL")}
+    # marks_by is newer than the counts: files counted before it are counted
+    # again, once.
+    todo = {h for (h,) in conn.execute(
+        "SELECT hash FROM files WHERE marked_pages IS NULL OR marks_by IS NULL")}
     authors = {name.strip().lower() for name in cfg.annotation_authors}
     counted = 0
     for rel, file_hash in local_paths.items():
         if file_hash not in todo:
             continue
         todo.discard(file_hash)                  # one path per content is enough
-        pages, marked, marks = reading.count_marks(cfg.absolute(rel), authors)
-        conn.execute("UPDATE files SET pages=?, marked_pages=?, marks=? WHERE hash=?",
-                     (pages, marked, marks, file_hash))
+        found = reading.survey(cfg.absolute(rel), authors)
+        conn.execute("UPDATE files SET pages=?, marked_pages=?, marks=?, marks_by=?, marks_latest=? "
+                     "WHERE hash=?",
+                     (found["pages"], found["marked_pages"], found["marks"],
+                      json.dumps(found["by_author"], ensure_ascii=False), found["latest"], file_hash))
         counted += 1
     return counted
 
@@ -680,4 +689,8 @@ def search(
                     first["topic_order"] if first["topic_order"] is not None else 999,
                     first["path"])
         results.sort(key=folder_order)
+    # Then the library copy (in the quick-add folder, area "dump") first among
+    # each result's locations: the one opened, cited and handed to agents.
+    for item in results:
+        item["locations"].sort(key=lambda loc: loc["area"] != "dump")
     return results[:limit] if limit else results

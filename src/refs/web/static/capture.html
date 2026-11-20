@@ -18,6 +18,8 @@
     .row2 { display: flex; gap: 1.5ch; align-items: center; flex-wrap: wrap; margin-top: .6em; }
     label { color: var(--dim); cursor: pointer; }
     input[type=checkbox] { accent-color: var(--accent); }
+    #into { font: inherit; color: inherit; background: none; border: 0; border-bottom: 1px solid currentColor;
+            width: 18ch; padding: 0 2px; outline: 0; }
   </style>
 </head>
 <body>
@@ -29,6 +31,9 @@
       <button class="act" id="go" hidden>add it (Enter)</button>
       <button class="act" id="lib" hidden>open it through the library</button>
       <label><input type="checkbox" id="queue"> also put it on the reading queue</label>
+      <label>into <input id="into" list="colls" placeholder="#bets #220a" spellcheck="false" autocomplete="off"
+             title="collections to put it in; remembered for the next paper (for a literature review)"></label>
+      <datalist id="colls"></datalist>
       <button class="act" id="stay" hidden>keep this window open</button>
       <a class="act" href="/" target="refs-main">open refs</a>
     </div>
@@ -69,6 +74,16 @@
 
     $("from").textContent = pageUrl;
     try { $("queue").checked = localStorage.getItem("refs-capture-queue") === "1"; } catch {}
+    // Collections to put each captured paper in: kept between papers, so a
+    // literature review for one project needs it set once.
+    try { $("into").value = localStorage.getItem("refs-capture-into") ?? ""; } catch {}
+    $("into").addEventListener("change", () => {
+      try { localStorage.setItem("refs-capture-into", $("into").value); } catch {}
+    });
+    const into = () => $("into").value.split(/[\s,]+/).map((w) => w.replace(/^#/, "")).filter(Boolean);
+    fetch("/api/collections").then((r) => r.json()).then((data) => {
+      $("colls").innerHTML = (data.collections ?? []).map((c) => `<option value="#${c.name}">`).join("");
+    }).catch(() => {});
     $("queue").addEventListener("change", () => {
       try { localStorage.setItem("refs-capture-queue", $("queue").checked ? "1" : "0"); } catch {}
     });
@@ -155,6 +170,7 @@
         : "no PDF on the page; refs looks for an open copy";
       show(stage + " …");
       const body = { token: message.token ?? "", url: message.url ?? pageUrl, meta, queue: $("queue").checked,
+                     collections: into(),
                      pdf: pdf ? await base64(pdf) : null };
       const begun = await postJson("/api/capture", body);
       if (begun.status === 403) {          // an old bookmarklet: its key is not this Mac's
@@ -175,7 +191,7 @@
         started = true;
         $("go").hidden = true;
         show("adding …");
-        await follow(await postJson("/api/add", { thing: pageUrl, queue: $("queue").checked,
+        await follow(await postJson("/api/add", { thing: pageUrl, queue: $("queue").checked, collections: into(),
           doi: meta.doi || params.get("doi") || null, pdf_url: meta.pdf_url || null }));
       };
     }
