@@ -136,7 +136,7 @@ registry) holds only details: kind, term, folder, shared, `bib_file`. A name
 can have members without an entry.
 
 `library.bib` runs in the watching process only (one per Mac): the watcher
-pokes it after a pass that changed anything, the page after any edit, and it
+pokes it after every pass (the first one, at start, fills the index), the page after any edit, and it
 compares a fingerprint of the work files once a minute for changes from the
 command line or another Mac. The `file` field is JabRef's `:path:PDF` with a
 path relative to the .bib; the PDF is the copy in the quick-add (library)

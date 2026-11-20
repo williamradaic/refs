@@ -178,9 +178,11 @@ class Exporter:
         return written
 
     def _loop(self) -> None:
-        first = True
+        # No write at start: the watcher's first pass, which fills the index,
+        # pokes when it is done. Writing earlier would race that pass and miss
+        # the collections that come from folders.
         while not self._halt.is_set():
-            poked = self._wake.wait(0 if first else self.check)
+            poked = self._wake.wait(self.check)
             if self._halt.is_set():
                 return
             if poked:
@@ -189,10 +191,10 @@ class Exporter:
                     self._wake.clear()
                     self._halt.wait(self.debounce)
             try:
-                # A poke means something changed: write even if the work files
-                # look the same (a scan changes which PDF an entry points to).
-                self.run_once(force=poked or first)
+                # A poke means something may have changed: render even if the
+                # work files look the same (a scan changes which PDF an entry
+                # points to); the file is written only if its text differs.
+                self.run_once(force=poked)
             except Exception as error:                  # noqa: BLE001 (never stop the thread)
                 self.error = f"{type(error).__name__}: {error}"
                 self._log(f"library.bib not written: {self.error}")
-            first = False

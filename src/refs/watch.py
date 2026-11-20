@@ -291,8 +291,11 @@ class Watcher:
                 self.pass_started = None
         self.last_pass = datetime.now().isoformat(timespec="seconds")
         self._report(report, results)
-        if self.exporter is not None and (report.changes or results):
-            self.exporter.poke()             # moved PDFs or new works change library.bib
+        # Every pass, not only one that changed something: the first pass after
+        # a start (or an upgrade) is what fills the index's collections, and
+        # library.bib is written only if its text actually changes.
+        if self.exporter is not None:
+            self.exporter.poke()
         return results
 
     def _stage(self, stage: str, done: int, total: int, file: str | None = None) -> None:
