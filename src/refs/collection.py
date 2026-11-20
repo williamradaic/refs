@@ -8,10 +8,9 @@ Two kinds of membership:
 
   explicit  stored on the work, `user.collections` (works.py): you put the
             paper there (the page, `refs collection add`, a Zotero import).
-  implicit  read off the folders, as before (contexts.py): a PDF under
-            phd/coursework/2026-fall/220a is in `220a`. This keeps courses and
-            projects working until the readings are migrated into the library
-            folder; it cannot be removed except by moving the file.
+  implicit  read off the folders (contexts.py): a PDF in a watched course or
+            project folder, such as a shared one, is in that collection; it
+            cannot be removed except by moving the file.
 
 The registry, `<state>/collections.json`, describes collections: kind (course
 or project), term, a folder, whether that folder is shared with coauthors, a

@@ -216,7 +216,7 @@ Collections live in refs' folder in the library: `collections.json` describes
 them, and each paper's file lists the ones you put it in.
 
 **One library folder.** Every reading lives once in the library folder (the
-quick-add folder, `refs-library` once migrated), named
+quick-add folder, `refs-library`), named
 `surname-year-short-title.pdf`; courses and projects are collections, not
 folders. Course folders keep their slides and problem sets and can be listed
 as *inboxes* (settings): the **Inbox** view (under Review) shows the papers in
@@ -245,16 +245,6 @@ the paper (Tab completes, this term's courses first); the bookmarklet window
 has an *into* field it remembers between papers (for a literature review);
 the Downloads view has one too; a PDF dropped on the page while a
 collection is shown goes into it; `refs add <link> --to bets`.
-
-**Migration.** `refs migrate` (or *migration* in the sidebar) moves every
-reading that lives only in a course or project folder into the library
-(copied out of shared and managed folders), and turns the courses and
-projects its folders gave it into collections of its own, readings/<topic>
-folders as parts. You review the plan and untick anything; one batch, undone
-as one (`refs migrate --undo`); `readings.md` in each course folder lists its
-readings. Then `refs migrate --finish` renames the library folder and has
-refs watch it alone (plus shared folders), with the course folders as
-inboxes.
 
 **library.bib.** refs keeps `library.bib` in the same folder: every paper,
 with `file` (its PDF, relative to the .bib) and `keywords` (its collections).
@@ -330,7 +320,6 @@ refs bib blp --append references.bib   # add it unless the file already has it
 refs add <link> --to 220a      # add straight into a collection
 refs marks blp                 # the copies of a paper and whose marks each holds
 refs marks blp --pull '#bets'  # bring the bets copy's marks into the library copy
-refs migrate                   # the plan to move every reading into the library (--apply, --undo, --finish)
 refs bib --library             # write library.bib (every paper, PDF and collections) now
 refs rename in:dump            # propose tidy names; add --apply to rename
 refs rename --undo 3           # reverse the last 3 renames and moves

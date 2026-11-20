@@ -280,8 +280,7 @@ function drawSidebar() {
   }
   add("other", "Other", html);
   add("fields", "Fields", data.fields.map(([tag, count]) => nav(tag, count, `data-tag="${esc(tag)}"`)).join(""));
-  html = `<div class="nav" data-view="migrate"><span>migration</span><span class="n"></span></div>`;
-  html += `<div class="nav" data-view="sidebar" title="sort, pin, hide, fold"><span>sidebar</span><span class="n"></span></div>`;
+  html = `<div class="nav" data-view="sidebar" title="sort, pin, hide, fold"><span>sidebar</span><span class="n"></span></div>`;
   html += `<div class="nav" data-view="settings"><span>settings</span><span class="n">,</span></div>`;
   add("refs", "refs", html);
 
@@ -557,7 +556,7 @@ async function search(keepId = null, ask = "off") {
 // Where a paper sits in the reading list being shown: {order, label, heading}.
 // In a collection: the part it is in (219a/public-economics, ordered and
 // labelled by the collection's details), else the readings/<topic> folder its
-// PDF sits in (before the migration), else "other", last. In a folder: the topic.
+// PDF sits in, else "other", last. In a folder: the topic.
 const pad = (n) => (n != null ? String(n).padStart(2, "0") + " " : "");
 function groupOf(item) {
   if (state.collection) {
@@ -1208,7 +1207,6 @@ $("detail").addEventListener("click", (event) => {
   }
   else if (el.dataset.dl) takeDownloads(el.dataset.dl);
   else if (el.dataset.inbox) takeInbox();
-  else if (el.dataset.mig) migrateAct(el.dataset.mig);
   else if (el.dataset.pull) pullMarks(el.dataset.pull);
   else if (el.dataset.collAdd) openCollectionPicker([state.items[state.selected]?.work_id].filter(Boolean), $("collpicker"));
   else if (el.dataset.collOut) collect([state.items[state.selected]?.work_id].filter(Boolean), el.dataset.collOut, false);
@@ -1665,107 +1663,6 @@ async function takeInbox() {
   for (const job of answer.jobs) await follow(Promise.resolve({ job }), "the new PDFs");
 }
 
-// --- the migration (migrate.py) ---------------------------------------------------------------
-// Every paper with no PDF in the library folder gets one (moved; copied out of
-// shared and managed folders), and keeps its courses and projects as
-// collections (readings/<topic> folders as parts). Reviewed here: untick
-// what should stay; one batch, undone as one. Then "finish" switches the
-// watched folders to the library alone.
-
-async function showMigrate(token) {
-  const data = await get("/api/migrate");
-  if (token !== listToken) return;
-  state.items = [];
-  state.migrate = data;
-  if (!state.migrateSeen) {                       // first look: everything ticked
-    state.picked = new Set(data.rows.map((r) => r.work_id));
-    state.migrateSeen = true;
-  }
-  const ids = new Set(data.rows.map((r) => r.work_id));
-  for (const id of [...state.picked]) if (!ids.has(id)) state.picked.delete(id);
-  const moving = data.rows.filter((r) => r.source);
-  $("count").textContent = `${moving.length} to bring in · ${data.rows.length - moving.length} to file`;
-  let html = `<div class="bar">
-    <button class="act" data-pick="all">select all</button>
-    <button class="act" data-pick="none">select none</button>
-    <span class="where"><span id="npicked">${state.picked.size}</span> ticked</span>
-  </div>`;
-  if (!data.rows.length) html += `<div class="empty">every paper is in the library folder with its collections.</div>`;
-  let group = null;
-  for (const row of data.rows) {
-    if (row.group !== group) {
-      group = row.group;
-      html += `<div class="topic folder"><span>${esc(group)}</span></div>`;
-    }
-    const what = row.source ? `${row.mode} ${row.source.split("/").pop()}${row.mode === "copy" ? ` (${row.why})` : ""}`
-                            : "already in the library";
-    const into = row.collections.length ? row.collections.map((n) => "#" + n).join(" ") : "no new collection";
-    html += `<label class="prop dl"><input type="checkbox" data-path="${esc(row.work_id)}"${
-      state.picked.has(row.work_id) ? " checked" : ""}>
-      <span class="name" title="${esc(row.citekey)}">${esc(row.title)}</span>
-      <span class="about" title="${esc(row.source ?? "")}">${esc(what)}</span>
-      <span class="who" title="${esc(into)}">→ ${esc(into)}</span></label>`;
-  }
-  $("list").innerHTML = html;
-  drawMigrateDetail();
-}
-
-function drawMigrateDetail() {
-  const data = state.migrate, moving = data.rows.filter((r) => r.source);
-  const copies = moving.filter((r) => r.mode === "copy").length;
-  const f = data.finish;
-  const n = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
-  $("detail").innerHTML = `<div class="label">Into the library</div>
-    <p>${n(moving.length, "paper")} without a PDF in <code>${esc(data.dump)}</code>: ${moving.length - copies} moved there,
-    ${copies} copied (from folders shared with coauthors, or managed by another tool, which keep theirs).
-    Each keeps its courses and projects as collections, its readings/&lt;topic&gt; folder as a part.
-    ${n(data.rows.length - moving.length, "paper")} already there just get their collections.</p>
-    <div class="acts" style="margin-top:8px">
-      <button class="act" data-mig="apply">bring the ticked papers in (<span class="dln">${state.picked.size}</span>)</button>
-      ${data.undo ? `<button class="act" data-mig="undo">undo the last batch</button>` : ""}
-    </div>
-    <div class="dlopts"><label><input type="checkbox" name="readingsmd" checked> write readings.md into each course folder</label></div>
-    ${data.unidentified.length ? `<p class="where">${n(data.unidentified.length, "PDF")} that look like papers were never read
-      and stay where they are; identify them first (they are under "not identified").</p>` : ""}
-    <div class="label" style="margin-top:14px">Then: finish</div>
-    <p>Once the papers are in, refs can watch the library alone:</p>
-    <dl class="meta">
-      <dt>library</dt><dd><input name="libname" value="${esc(f.dump)}" spellcheck="false" autocomplete="off"> (now ${esc(data.dump)})</dd>
-      <dt>watched</dt><dd>the library, plus folders shared with coauthors (now ${esc(data.roots.join(", "))})</dd>
-      <dt>inboxes</dt><dd>${esc(f.inboxes.join(", ") || "none")}: listed in the Inbox, not indexed</dd>
-    </dl>
-    <p class="where">Course material (slides, problem sets) stays in its folders and leaves the index. Undo the
-    batch above before finishing, not after.</p>
-    <div class="acts"><button class="act" data-mig="finish">finish: switch the watched folders</button></div>`;
-}
-
-async function migrateAct(name) {
-  if (name === "apply") {
-    const ids = [...state.picked];
-    if (!ids.length) { say("tick the papers to bring in first"); return; }
-    const readingsMd = $("detail").querySelector("input[name=readingsmd]")?.checked ?? true;
-    say(`bringing ${ids.length} papers into the library …`, 0);
-    const answer = await post("/api/migrate/apply", { work_ids: ids, readings_md: readingsMd });
-    if (answer.detail) { say(answer.detail, 9000); return; }
-    say(`done: ${answer.done} papers (${answer.moved} files into the library)` +
-        (answer.refused.length ? `; ${answer.refused.length} refused (${answer.refused[0].why})` : ""), 12000);
-  } else if (name === "undo") {
-    if (!confirm("Put the last batch back: files to where they were, copies to the Trash, memberships undone?")) return;
-    const answer = await post("/api/migrate/undo", {});
-    say(`put back ${answer.files} files; ${answer.papers} papers' collections undone`, 9000);
-  } else if (name === "finish") {
-    const libname = $("detail").querySelector("input[name=libname]")?.value.trim();
-    const f = state.migrate.finish;
-    if (!confirm(`Rename ${state.migrate.dump} to ${libname}, watch only it (and shared folders), and list ` +
-                 `${f.inboxes.join(", ") || "no folders"} as inboxes?\n\nThe previous settings are kept as config.toml.bak.`)) return;
-    const answer = await post("/api/migrate/finish", { library_name: libname });
-    if (answer.detail) { say(answer.detail, 12000); return; }
-    say(`finished: the library is ${answer.settings.dump}; watching it alone`, 12000);
-  }
-  folderList = null;
-  loadSidebar(); search();
-}
-
 function drawDownloadsDetail() {
   const data = state.dl;
   const copy = state.dlMode === "copy";
@@ -2158,7 +2055,7 @@ $("detail").addEventListener("click", async (event) => {
 });
 
 const REVIEW_VIEWS = { renames: showRenames, copies: showCopies, downloads: showDownloads, inbox: showInbox,
-                       migrate: showMigrate, settings: showSettings, sidebar: showSidebarPage };
+                       settings: showSettings, sidebar: showSidebarPage };
 
 $("list").addEventListener("change", (event) => {
   const path = event.target.dataset?.path;

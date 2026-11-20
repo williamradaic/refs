@@ -3,6 +3,10 @@
 Synthesis of a design discussion (November 2026). Read with `docs/development.md`
 (map of the code, how files are identified, where state lives).
 
+Status: done. The migration (phase 3) ran on the real library on 2026-11-20 and
+its code (`migrate.py`, `refs migrate`, the migration view) has been removed;
+the library-folder layout is now the only one. Section 6 is kept as history.
+
 ## Goal
 
 Make refs a research-first reference manager. Every reading (research

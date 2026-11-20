@@ -1,7 +1,7 @@
 """The library folder: where every reading lives once, under its canonical name.
 
-The library folder is the quick-add folder (`dump` in config.toml): papers-dump
-before the migration, refs-library after it. A course or project is a
+The library folder is the quick-add folder (`dump` in config.toml),
+refs-library. A course or project is a
 collection (collection.py), not a folder, so a paper needs only this one copy;
 the exceptions are shared project folders (shared.py), which get recorded
 copies for coauthors.
@@ -9,7 +9,7 @@ copies for coauthors.
 `place` brings one PDF in from elsewhere: moved (or copied, when the source
 must stay where it is) and named `surname-year-short-title.pdf` when its
 record is verified or confirmed. Every placement is journaled like a
-rename, so `refs rename --undo` (and the migration's undo) reverses it.
+rename, so `refs rename --undo` reverses it.
 """
 
 from __future__ import annotations

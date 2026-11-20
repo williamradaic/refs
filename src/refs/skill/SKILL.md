@@ -149,8 +149,7 @@ queue by themselves once read.
 
 These change the user's files, settings or spend money in bulk, so run them
 only when asked for exactly that: `refs rename ... --apply` and
-`refs rename --undo`, `refs process` (reads many PDFs through the API), `refs migrate --apply`,
-`--undo` and `--finish`, `refs marks --pull`,
+`refs rename --undo`, `refs process` (reads many PDFs through the API), `refs marks --pull`,
 `refs zotero-import`, `refs init`, `refs service ...`, `refs setup-key` and
 `refs uninstall`. Never move, rename or delete PDFs in the library folders
 yourself; refs keeps an undo journal for the changes it makes, and the web

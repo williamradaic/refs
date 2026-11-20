@@ -54,7 +54,6 @@ there unless you mean to pay for it.
 | `inbox.py` | papers in inbox folders (listed, not indexed) and shared folders that the library lacks; taking them in |
 | `annotations.py` | each copy's marks by author and date, flags, and the pull merge into the library copy |
 | `keep.py` | which copy of a paper to keep (marks, version, place, name) and doing it: the Copies review |
-| `migrate.py` | phase 3: the plan, apply/undo (records in `<state>/migrations/`), readings.md, the finish switch |
 | `storage.py`, `scan.py` | walk the watched folders, hash, reconcile with the index |
 | `index.py`, `embed.py` | the SQLite index (a rebuildable cache) and semantic search |
 | `extract.py`, `llm.py`, `resolve.py`, `pipeline.py` | reading a PDF: text and identifiers, Claude Haiku's transcription, registry lookup, status |
@@ -109,7 +108,7 @@ have no usable registry record and end as extracted or needs-review.
 | Settings | `~/.config/refs/config.toml` (`.bak` = the version before the last save) |
 | Index (rebuildable cache), search vectors, Haiku answers, reading ledger | `~/Library/Application Support/refs/index.db` |
 | Search model (about 70 MB, downloaded once), registry cache | `~/Library/Caches/refs/` |
-| Works, read records, rename journal, `review.json`, `collections.json`, `library.bib`, migration records, annotation backups (synced) | `<library>/<state_dir>/`, `.refs/` by default |
+| Works, read records, rename journal, `review.json`, `collections.json`, `library.bib`, annotation backups (synced) | `<library>/<state_dir>/`, `.refs/` by default |
 | Reading notes | `<vault>/<obsidian_folder>/<citekey>.md` |
 | API key | macOS Keychain, item `refs` |
 | Login service, log | `~/Library/LaunchAgents/com.williamradaic.refs.plist`, `~/Library/Logs/refs.log` |

@@ -492,79 +492,6 @@ def cmd_project(args: argparse.Namespace) -> int:
     return _new_collection(cfg, args, kind="course" if args.course else "project")
 
 
-def cmd_migrate(args: argparse.Namespace) -> int:
-    """`refs migrate`: move every reading into the library folder, with its
-    courses and projects as collections (migrate.py). Without options it only
-    shows the plan; --apply does it, --undo puts it back, --finish switches
-    the watched folders afterwards."""
-    from . import ingest, librarybib, migrate
-
-    cfg = config.load()
-    conn = index.connect(cfg)
-    if args.undo:
-        with ingest.exclusive(cfg):
-            done = migrate.undo(cfg)
-            scanner.scan(cfg, conn)
-        print(f"Put back {_plural(done['files'], 'file')}; memberships undone on {_plural(done['papers'], 'paper')}.")
-        return 0
-    the_plan = migrate.plan(cfg, conn)
-    if args.json:
-        print(migrate.to_json(the_plan))
-        return 0
-    if args.finish:
-        changes = migrate.finish_changes(cfg, the_plan, args.library_name)
-        print(f"This renames {cfg.dump} to {changes['dump']} and saves these settings:")
-        for key, value in changes.items():
-            print(f"  {key} = {value}")
-        print("Folders no longer watched leave the index (their files stay where they are).")
-        if not args.yes and input("Go ahead? [y/N] ").strip().lower() != "y":
-            print("Nothing changed.")
-            return 1
-        result = migrate.finish(cfg, the_plan, args.library_name)
-        cfg = config.load()
-        scanner.scan(cfg, index.connect(cfg))
-        librarybib.write(cfg)
-        print("Done." + (f" The library folder is now {result['renamed'][1]}." if result["renamed"] else "")
-              + " Restart the service to use the new settings: `refs service restart`.")
-        return 0
-
-    moving = [r for r in the_plan.rows if r.source]
-    only = {collection_name.lower() for collection_name in args.only or []}
-    chosen = [r for r in the_plan.rows
-              if not only or any(n.split("/")[0] in only for n in r.collections) or r.group in only]
-    if not args.apply:
-        moves = sum(r.mode == "move" for r in moving)
-        print(f"{_plural(len(moving), 'paper')} to bring into {cfg.dump}: {moves} moved, "
-              f"{len(moving) - moves} copied; {_plural(len(the_plan.rows) - len(moving), 'paper')} already "
-              f"there get their collections.")
-        rows = chosen if (args.list or only) else chosen[:25]
-        group = None
-        for row in rows:
-            if row.group != group:
-                group = row.group
-                print(f"\n{group}")
-            what = f"{row.mode:<4} {row.source}" if row.source else "     (in the library)"
-            print(f"  {what}\n       {row.citekey}  -> {' '.join('#' + n for n in row.collections) or '(no new collection)'}")
-        if len(rows) < len(chosen):
-            print(f"\n... and {len(chosen) - len(rows)} more (--list shows all).")
-        if the_plan.unidentified:
-            print(f"\n{_plural(len(the_plan.unidentified), 'PDF')} that look like papers were never read; "
-                  "identify them first (`refs process`) or they stay where they are.")
-        print("\n`refs migrate --apply` does it (undo: `refs migrate --undo`); the page shows the same plan "
-              "under refs → migration.")
-        return 0
-    ids = {r.work_id for r in chosen}
-    with ingest.exclusive(cfg):
-        result = migrate.apply(cfg, conn, the_plan, ids, readings_md=not args.no_readings_md)
-        scanner.scan(cfg, conn)
-    librarybib.write(cfg, conn)
-    print(f"Done: {_plural(len(result['done']), 'paper')} ({result['record']}).")
-    for work_id, why in result["refused"]:
-        print(f"  not moved: {why}")
-    print("Undo with `refs migrate --undo`. When it looks right: `refs migrate --finish`.")
-    return 0
-
-
 def cmd_marks(args: argparse.Namespace) -> int:
     """`refs marks <search>`: each copy of the best match, with whose marks it
     holds; `--pull FROM` brings one copy's marks into the library copy
@@ -1411,19 +1338,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--course", action="store_true", help="a course, not a project")
     _collection_options(p)
     p.set_defaults(run=cmd_project)
-
-    p = sub.add_parser("migrate", help="move every reading into the library folder, courses as collections")
-    p.add_argument("--apply", action="store_true", help="do it (without: show the plan)")
-    p.add_argument("--only", action="append", metavar="COLLECTION", help="only these courses or projects")
-    p.add_argument("--list", action="store_true", help="show every row of the plan")
-    p.add_argument("--no-readings-md", action="store_true", help="do not write readings.md into course folders")
-    p.add_argument("--undo", action="store_true", help="put the last migration back")
-    p.add_argument("--finish", action="store_true",
-                   help="afterwards: watch only the library (and shared folders), course folders as inboxes")
-    p.add_argument("--library-name", help="with --finish: rename the library folder, e.g. refs-library")
-    p.add_argument("--yes", action="store_true", help="with --finish: do not ask")
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(run=cmd_migrate)
 
     p = sub.add_parser("marks", help="a paper's copies and whose marks each holds; --pull merges them")
     p.add_argument("query", nargs="+", help="words and key:value filters; the best match")

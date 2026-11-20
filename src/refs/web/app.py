@@ -27,7 +27,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .. import (annotations, bib, capture, collection, config, downloads, inbox, index, ingest, keys, library,
-                migrate, notes, onboarding, organize, reading, records, rename, resolve, settings, shared, venues,
+                notes, onboarding, organize, reading, records, rename, resolve, settings, shared, venues,
                 works)
 from .. import ask as asking
 from .. import keep as keeping              # an endpoint below is called `keep`
@@ -1235,56 +1235,6 @@ def create_app(watch: bool = False) -> FastAPI:
                              collections)
         path = capture.save(body, cfg.absolute(cfg.dump))
         return start_add(str(path), label, queue, hints | {"pdf_url": None}, collections)
-
-    # --- the migration (migrate.py) ------------------------------------------------------
-
-    @app.get("/api/migrate")
-    def migrate_plan() -> dict:
-        """The plan, what `finish` would change, and whether a batch can be undone."""
-        the_plan = migrate.plan(cfg, index.connect(cfg))
-        last = migrate.last_record(cfg)
-        return {**the_plan.to_dict(), "dump": cfg.dump,
-                "finish": migrate.finish_changes(cfg, the_plan, "refs-library"),
-                "roots": cfg.roots, "undo": last.name if last else None}
-
-    @app.post("/api/migrate/apply")
-    def migrate_apply(work_ids: list[str] = Body(embed=True), readings_md: bool = Body(default=True, embed=True),
-                      x_refs: str | None = Header(default=None)) -> dict:
-        """Bring the ticked papers into the library and make their collections
-        their own. One batch, undone as one."""
-        guard(x_refs)
-        with ingest.exclusive(cfg):
-            conn = index.connect(cfg)
-            result = migrate.apply(cfg, conn, migrate.plan(cfg, conn), set(work_ids), readings_md=readings_md)
-            scanner.scan(cfg, conn)
-        library_changed()
-        return {"done": len(result["done"]), "moved": sum(bool(r.target) for r in result["done"]),
-                "refused": [{"work_id": w, "why": why} for w, why in result["refused"]],
-                "record": result["record"]}
-
-    @app.post("/api/migrate/undo")
-    def migrate_undo(x_refs: str | None = Header(default=None)) -> dict:
-        guard(x_refs)
-        with ingest.exclusive(cfg):
-            done = migrate.undo(cfg)
-            scanner.scan(cfg, index.connect(cfg))
-        library_changed()
-        return done
-
-    @app.post("/api/migrate/finish")
-    def migrate_finish(library_name: str = Body(default="", embed=True),
-                       x_refs: str | None = Header(default=None)) -> dict:
-        """Rename the library folder and watch only it (and shared folders);
-        course folders become inboxes. The new settings apply at once."""
-        guard(x_refs)
-        try:
-            with ingest.exclusive(cfg):
-                result = migrate.finish(cfg, migrate.plan(cfg, index.connect(cfg)), library_name.strip() or None)
-        except (OSError, settings.SettingError) as error:
-            raise HTTPException(409, str(error))
-        apply_settings(config.load())
-        library_changed()
-        return {"renamed": result["renamed"], "settings": result["settings"]}
 
     @app.get("/api/inbox")
     def inbox_list() -> dict:
