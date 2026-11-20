@@ -665,15 +665,17 @@ def create_app(watch: bool = False) -> FastAPI:
 
     @app.post("/api/collections/arrange")
     def collections_arrange(names: list[str] = Body(embed=True), reset: bool = Body(default=False, embed=True),
+                            field: str = Body(default="order", embed=True),
                             x_refs: str | None = Header(default=None)) -> dict:
-        """The sidebar's order of projects: `names` in the order wanted, or
-        with `reset`, back to A–Z for those names."""
+        """The sidebar's order of projects (or with field="pinned", of the
+        pinned collections): `names` in the order wanted, or with `reset`,
+        back to A–Z for those names."""
         guard(x_refs)
         try:
             if reset:
                 collection.unarrange(cfg, names)
             else:
-                names = collection.arrange(cfg, names, index.connect(cfg))
+                names = collection.arrange(cfg, names, index.connect(cfg), field)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
         return {"names": names}
@@ -689,6 +691,17 @@ def create_app(watch: bool = False) -> FastAPI:
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
         return {"names": names, "hidden": hidden}
+
+    @app.post("/api/collections/pin")
+    def collections_pin(names: list[str] = Body(embed=True), pinned: bool = Body(default=True, embed=True),
+                        x_refs: str | None = Header(default=None)) -> dict:
+        """Pin collections at the top of the sidebar, or unpin them."""
+        guard(x_refs)
+        try:
+            names = collection.pin(cfg, names, pinned, index.connect(cfg))
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        return {"names": names, "pinned": pinned}
 
     @app.post("/api/collections/rename")
     def collections_rename(old: str = Body(embed=True), new: str = Body(embed=True),

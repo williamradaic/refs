@@ -265,8 +265,13 @@ def change(cfg: Config, work_ids: list[str], name: str, *, add: bool = True) -> 
             changed.append(work_id)
     if add:
         registry = load(cfg)
-        if name not in registry:
+        fresh = name not in registry
+        if fresh:
             register(cfg, name, registry=registry)
+        if changed:
+            # When papers last went in: the sidebar's "recently added to".
+            registry[name]["touched"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        if fresh or changed:
             save(cfg, registry)
     return changed
 
@@ -311,12 +316,20 @@ def _ensure(cfg: Config, registry: dict[str, dict], name: str, derived: dict[str
     return registry[name]
 
 
-def arrange(cfg: Config, names: list[str], conn: sqlite3.Connection | None = None) -> list[str]:
-    """Put collections in this order (order 1, 2, …). Returns the cleaned names."""
+# Which detail holds a place: `order` among the projects, `pinned` among the pins.
+PLACES = ("order", "pinned")
+
+
+def arrange(cfg: Config, names: list[str], conn: sqlite3.Connection | None = None,
+            field: str = "order") -> list[str]:
+    """Put collections in this order (1, 2, …) among the projects, or with
+    field="pinned" among the pinned ones. Returns the cleaned names."""
+    if field not in PLACES:
+        raise Invalid(f"no such place: {field}")
     registry, derived = load(cfg), derived_details(conn) if conn is not None else {}
     names = list(dict.fromkeys(clean_name(n) for n in names))
     for at, name in enumerate(names, start=1):
-        _ensure(cfg, registry, name, derived)["order"] = at
+        _ensure(cfg, registry, name, derived)[field] = at
     save(cfg, registry)
     return names
 
@@ -327,6 +340,23 @@ def unarrange(cfg: Config, names: list[str]) -> None:
     for name in (clean_name(n) for n in names):
         registry.get(name, {}).pop("order", None)
     save(cfg, registry)
+
+
+def pin(cfg: Config, names: list[str], pinned: bool = True,
+        conn: sqlite3.Connection | None = None) -> list[str]:
+    """Pin collections (any course, project or part) at the top of the
+    sidebar, after the ones pinned before; or unpin them."""
+    registry, derived = load(cfg), derived_details(conn) if conn is not None else {}
+    names = list(dict.fromkeys(clean_name(n) for n in names))
+    last = max((e.get("pinned") or 0 for e in registry.values()), default=0)
+    for name in names:
+        if pinned and not (registry.get(name) or {}).get("pinned"):
+            last += 1
+            _ensure(cfg, registry, name, derived)["pinned"] = last
+        elif not pinned and name in registry:
+            registry[name].pop("pinned", None)
+    save(cfg, registry)
+    return names
 
 
 def set_hidden(cfg: Config, names: list[str], hidden: bool = True,
@@ -370,8 +400,9 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
     folder, shared, bib_file, `works` (papers in it, sub-collections included),
     `own` (papers in it directly), `implicit` (true if it exists only
     because of folders, so it cannot be renamed or emptied from refs),
-    `from_folders` (some papers are in it by their folder) and `hidden`
-    (left out of the sidebar).
+    `from_folders` (some papers are in it by their folder), `hidden` (left
+    out of the sidebar), `pinned` (its place among the pins) and two dates
+    for sorting, `created_at` and `used_at`.
     """
     import json
 
@@ -390,6 +421,8 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
         for name in explicit(work):
             members.setdefault(name, set()).add(work_id)
     folder_born = derived_details(conn)
+    # When each paper entered refs, for the dates below.
+    entered = {wid: t for wid, w in all_works.items() if (t := _moment(w.get("created"))) is not None}
 
     names = set(members) | set(registry)
     # A sub-collection's parent is listed even when it has no paper of its own.
@@ -401,6 +434,7 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
         entry = registry.get(name) or {}
         derived = folder_born.get(name, {})
         inside = set().union(*(ids for n, ids in members.items() if matches(n, name)))
+        times = [entered[w] for w in inside if w in entered]
         out.append({
             "name": name,
             "kind": entry.get("kind") or derived.get("kind") or guess_kind(name, registry),
@@ -416,6 +450,12 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
             # Some papers are in it because of their folder (a rename leaves those).
             "from_folders": bool(derived),
             "hidden": bool(entry.get("hidden")),
+            "pinned": entry.get("pinned"),
+            # Seconds since 1970, for the sidebar's sorts: when it was made
+            # (else when its first paper entered refs), and when papers last
+            # went in (else when its newest paper entered refs).
+            "created_at": _moment(entry.get("created")) or (min(times) if times else None),
+            "used_at": max(filter(None, [_moment(entry.get("touched")), max(times, default=None)]), default=None),
             "works": len(inside),
             "own": len(members.get(name, set())),
         })
@@ -437,6 +477,18 @@ def derived_details(conn: sqlite3.Connection) -> dict[str, dict]:
         if before is None or (term and (before["term"] is None or _term_rank(term) > _term_rank(before["term"]))):
             found[name] = {"kind": kind, "term": term}
     return found
+
+
+def _moment(stamp: str | None) -> float | None:
+    """An ISO time stamp (refs', or Zotero's "2023-04-05 12:34:56") as
+    seconds; a stamp without a zone is UTC, as both store it."""
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()
 
 
 _SEASON_RANK = {"winter": 0, "spring": 1, "summer": 2, "fall": 3}

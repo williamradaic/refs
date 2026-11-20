@@ -149,9 +149,51 @@ async function loadSidebar() {
   drawSidebar();
 }
 
-// Draw the sidebar from the last answer (state.sidebar). Hiding a collection
-// or moving a project changes that answer in place and redraws at once; the
-// server is told meanwhile.
+// --- sidebar preferences ---------------------------------------------------------------
+// How each section looks, in this browser (like the column layout): its sort,
+// folded or not, hidden or not, and whether empty collections show. Pins and
+// hidden collections are different: they belong to the collections and are
+// saved with them (collections.json), so they follow you to your other Macs.
+const SORTS = { custom: "my order", term: "by term", az: "A–Z", newest: "newest first",
+  recent: "recently added to", size: "most papers" };
+const SORT_CHOICES = { pinned: ["custom", "az", "newest", "recent", "size"],
+  project: ["custom", "az", "newest", "recent", "size"], course: ["term", "az", "newest", "recent", "size"] };
+const SIDE_DEFAULT = { sort: { pinned: "custom", project: "custom", course: "term" },
+  folded: {}, hidden: [], empty: {}, quiet: false };
+// Sections that cannot be hidden: the way to everything else, and to settings.
+const KEEP_SECTIONS = new Set(["library", "refs"]);
+
+function loadSide() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("refs-sidebar"));
+    if (saved) return { ...structuredClone(SIDE_DEFAULT), ...saved, sort: { ...SIDE_DEFAULT.sort, ...saved.sort } };
+  } catch {}
+  return structuredClone(SIDE_DEFAULT);
+}
+let side = loadSide();
+// Save and redraw (the sidebar, and the sidebar page if it is open).
+function saveSide() {
+  try { localStorage.setItem("refs-sidebar", JSON.stringify(side)); } catch {}
+  drawSidebar();
+  if (state.view === "sidebar" && !state.collection && !state.context && !state.tag) drawSidebarPage();
+}
+
+// The comparison for a sort mode. `field` holds "my order": `order` for
+// projects, `pinned` for pins. Unknown dates and places go last.
+function sorter(mode, field = "order") {
+  const az = (a, b) => a.name.localeCompare(b.name);
+  const desc = (key) => (a, b) => (b[key] ?? -Infinity) - (a[key] ?? -Infinity) || az(a, b);
+  return {
+    custom: (a, b) => (a[field] ?? Infinity) - (b[field] ?? Infinity) || az(a, b),
+    term: (a, b) => termRank(b.term) - termRank(a.term) || az(a, b),
+    newest: desc("created_at"), recent: desc("used_at"),
+    size: (a, b) => b.works - a.works || az(a, b),
+  }[mode] ?? az;
+}
+
+// Draw the sidebar from the last answer (state.sidebar). Hiding, pinning or
+// moving changes that answer in place and redraws at once; the server is
+// told meanwhile.
 function drawSidebar() {
   const data = state.sidebar;
   if (!data) return;
@@ -161,9 +203,10 @@ function drawSidebar() {
   state.proxy = data.proxy ?? "";     // the library proxy (settings), "" = none
   const nav = (label, count, attrs, sub = false) =>
     `<div class="nav${sub ? " sub" : ""}" ${attrs}><span>${esc(label)}</span><span class="n">${count}</span></div>`;
+  const sections = [];                 // [key, title, body], in order
+  const add = (key, title, body) => sections.push([key, title, body]);
 
-  let html = `<div class="label">Library</div>`;
-  html += nav("all papers", data.presets.all, `data-view="all"`);
+  let html = nav("all papers", data.presets.all, `data-view="all"`);
   html += nav("queue", data.presets.queue, `data-view="queue"`);
   html += nav("unread", data.presets.unread, `data-view="unread"`);
   html += nav("reading", data.presets.reading, `data-view="reading"`);
@@ -172,18 +215,29 @@ function drawSidebar() {
   // The library folder itself (the quick-add folder, refs-library): its PDFs.
   const libraryFolder = data.contexts.find((c) => c.key === "dump");
   if (libraryFolder) html += nav(state.dump, libraryFolder.count, `data-context="dump" title="the library folder"`);
-  // Things that want a decision from you.
-  html += `<div class="label">Review</div>`;
-  html += nav("needs review", data.presets.review, `data-view="review"`);
-  html += nav("renames", data.presets.renames, `data-view="renames"`);
-  html += nav("copies", data.presets.copies, `data-view="copies"`);
+  add("library", "Library", html);
+
+  add("pinned", "Pinned", pinnedNav(data.collections ?? []));
+
+  // Things that want a decision from you. "Only what needs you" (the
+  // section's menu) leaves out the ones at 0, except the one you are on.
+  const review = (view, label, count) => (count == null || (side.quiet && !count && state.view !== view)) ? ""
+    : nav(label, count, `data-view="${view}"`);
+  html = review("review", "needs review", data.presets.review);
+  html += review("renames", "renames", data.presets.renames);
+  html += review("copies", "copies", data.presets.copies);
   // PDFs in ~/Downloads that look like papers (null: no Downloads folder set).
-  if (data.presets.downloads != null) html += nav("downloads", data.presets.downloads, `data-view="downloads"`);
+  html += review("downloads", "downloads", data.presets.downloads);
   // Papers in course (inbox) folders and shared folders that the library lacks.
-  if (data.presets.inbox != null) html += nav("inbox", data.presets.inbox, `data-view="inbox"`);
+  html += review("inbox", "inbox", data.presets.inbox);
   // PDFs that are on disk but were never read (an interrupted add, or a file
   // that arrived through Finder). Shown only when there are some.
   if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
+  add("review", "Review", html || `<div class="nav more"><span>nothing to decide</span><span class="n"></span></div>`);
+
+  // Collections (collection.py): projects, then courses.
+  add("project", "Projects", collectionSection("project", data.collections ?? []));
+  add("course", "Courses", collectionSection("course", data.collections ?? []));
 
   // Folders that are not collections (the quick-add folder; anything the
   // layout does not read as a course or project) arrive as keys like
@@ -198,13 +252,9 @@ function drawSidebar() {
     (areas[name] ??= []).push({ key, rest, count, term });
   }
   const listed = ["dump", ...data.areas];
-  // Collections (collection.py): projects, then courses by term, newest
-  // first. A sub-collection (219a/public-economics) sits under its parent and
-  // goes with the parent's term. (The library folder is listed under Library.)
-  html += collectionsNav(data.collections ?? []);
   for (const area of listed) {
     if (!areas[area] || area === "dump") continue;
-    html += `<div class="label">${esc(area)}</div>`;
+    html = "";
     let term = null;
     const termed = areas[area].some((c) => c.term);
     // Contexts without a term first (by name), then terms newest first; the
@@ -221,74 +271,103 @@ function drawSidebar() {
       const label = rest[rest.length - 1] ?? area;
       html += nav(label, count, `data-context="${esc(key)}"`, grouped);
     }
+    add(`area:${area}`, area, html);
   }
   const shown = new Set(listed);
-  const others = Object.keys(areas).filter((a) => !shown.has(a));
-  if (others.length) html += `<div class="label">Other</div>`;
-  for (const area of others) for (const { key, count } of areas[area]) html += nav(key, count, `data-context="${esc(key)}"`);
-  html += `<div class="label">Fields</div>`;
-  for (const [tag, count] of data.fields) html += nav(tag, count, `data-tag="${esc(tag)}"`);
-  html += `<div class="label">refs</div>`;
-  html += `<div class="nav" data-view="migrate"><span>migration</span><span class="n"></span></div>`;
+  html = "";
+  for (const area of Object.keys(areas).filter((a) => !shown.has(a))) {
+    for (const { key, count } of areas[area]) html += nav(key, count, `data-context="${esc(key)}"`);
+  }
+  add("other", "Other", html);
+  add("fields", "Fields", data.fields.map(([tag, count]) => nav(tag, count, `data-tag="${esc(tag)}"`)).join(""));
+  html = `<div class="nav" data-view="migrate"><span>migration</span><span class="n"></span></div>`;
+  html += `<div class="nav" data-view="sidebar" title="sort, pin, hide, fold"><span>sidebar</span><span class="n"></span></div>`;
   html += `<div class="nav" data-view="settings"><span>settings</span><span class="n">,</span></div>`;
-  $("side").innerHTML = html;
+  add("refs", "refs", html);
+
+  // Each section: a heading (click folds it, right-click has its options),
+  // then its entries. A section with nothing in it is left out.
+  state.sideSections = sections.filter(([, , body]) => body).map(([key, title]) => ({ key, title }));
+  $("side").innerHTML = sections.map(([key, title, body]) => {
+    if (!body || side.hidden.includes(key)) return "";
+    const folded = Boolean(side.folded[key]);
+    const sort = SORT_CHOICES[key] && side.sort[key] !== SORT_CHOICES[key][0] ? ` · ${SORTS[side.sort[key]]}` : "";
+    return `<div class="label fold${folded ? " folded" : ""}" data-section="${esc(key)}"
+      title="click to fold or unfold; right-click for its options"><span><i class="tw">${folded ? "▸" : "▾"}</i>${
+      esc(title)}<span class="sortname">${esc(sort)}</span></span></div>` + (folded ? "" : body);
+  }).join("");
   markSidebar();
 }
 
-// Collections (collection.py) in the sidebar. A project's place is its
-// `order` (drag it, or "move up" in its menu), the unplaced ones after, A–Z;
-// courses go by term, newest first. Each is followed by its parts in their
-// reading-list order. A hidden collection (and its parts) is left out, behind
-// a "N hidden" line at the end of its section that shows them, dimmed.
-const byPlace = (a, b) => (a.order ?? Infinity) - (b.order ?? Infinity) || a.name.localeCompare(b.name);
+// Pinned: shortcuts to any course, project or part, at the top. Each is
+// still listed in its own section too.
+function pinnedNav(list) {
+  return list.filter((c) => c.pinned).sort(sorter(side.sort.pinned, "pinned")).map((c) =>
+    `<div class="nav${c.hidden ? " hid" : ""}" data-collection="${esc(c.name)}" data-drag="pinned" draggable="true"
+      title="#${esc(c.name)} (pinned): drag to move, right-click for more"><span>${esc(c.name + (c.shared ? " ⇄" : ""))}</span>` +
+    `<span class="n">${c.works}</span></div>`).join("");
+}
+
+// A collection section (collection.py). Projects: your order by default (drag
+// one, or "move up" in its menu), else the section's sort; courses: by term,
+// newest first, else the sort. Each is followed by its parts in their
+// reading-list order. Hidden ones (and, if asked, empty ones) are left out,
+// behind a "N hidden" line at the end that shows them, dimmed.
 const topName = (name) => name.split("/")[0];
 state.showHidden = { project: false, course: false };   // the "N hidden" lines, unfolded
 
-// Every top-level project, in sidebar order, hidden ones too (for moving one).
-function projectOrder() {
-  return (state.sidebar?.collections ?? [])
-    .filter((c) => !c.name.includes("/") && c.kind !== "course").sort(byPlace).map((c) => c.name);
+// The top-level collections of a section, in the order shown (hidden ones too).
+function sectionTops(kind, list = state.sidebar?.collections ?? []) {
+  return list.filter((c) => !c.name.includes("/") && (kind === "course") === (c.kind === "course"))
+    .sort(sorter(side.sort[kind], "order"));
 }
+// The names in a draggable group (projects, or pins), in the order shown.
+function groupOrder(group) {
+  return group === "pinned"
+    ? (state.sidebar?.collections ?? []).filter((c) => c.pinned).sort(sorter(side.sort.pinned, "pinned")).map((c) => c.name)
+    : sectionTops("project").map((c) => c.name);
+}
+// Left out of a section unless its "N hidden" line is unfolded.
+const tucked = (c, kind) => c.hidden || (side.empty[kind] && !c.works);
 
-function collectionsNav(list) {
+function collectionSection(kind, list) {
   const parts = {};                                   // parent name -> its parts
   for (const c of list) if (c.name.includes("/")) (parts[c.name.slice(0, c.name.lastIndexOf("/"))] ??= []).push(c);
-  const withParts = (c) => [c, ...(parts[c.name] ?? []).sort(byPlace).flatMap(withParts)];
-  const tops = list.filter((c) => !c.name.includes("/"));
+  const open = state.showHidden[kind];
+  const withParts = (c) => [c, ...(parts[c.name] ?? []).sort(byPlace).filter((p) => open || !tucked(p, kind)).flatMap(withParts)];
+  const tops = sectionTops(kind, list);
   const entry = (c, top) => {
     const depth = c.name.split("/").length - 1;
     const label = c.name.split("/").pop() + (c.shared ? " ⇄" : "");
+    const away = tucked(top, kind) || tucked(c, kind);
     const about = [c.kind, c.term, c.shared ? "shared with coauthors" : "", c.implicit ? "from its folder" : "",
-                   c.folder ? `folder ${c.folder}` : "", top.hidden ? "hidden" : ""].filter(Boolean).join(" · ");
+                   c.folder ? `folder ${c.folder}` : "", c.pinned ? "pinned" : "", away ? "hidden" : ""].filter(Boolean).join(" · ");
     // A top-level project can be dragged to another place among the projects.
-    const drag = c === top && top.kind !== "course" ? ` draggable="true" data-top="1"` : "";
+    const drag = c === top && kind === "project" ? ` draggable="true" data-drag="project"` : "";
     const hint = drag ? "; drag to move, right-click for more" : "; right-click for more";
-    return `<div class="nav${top.hidden ? " hid" : ""}" data-collection="${esc(c.name)}"${drag} title="#${esc(c.name)}: ${esc(about)}${hint}"
+    return `<div class="nav${away ? " hid" : ""}" data-collection="${esc(c.name)}"${drag} title="#${esc(c.name)}: ${esc(about)}${hint}"
       style="padding-left:${4 + 2 * depth}ch"><span>${esc(label)}</span><span class="n">${c.works}</span></div>`;
   };
-  const section = (kind, ordered) => {
-    const open = state.showHidden[kind], hidden = ordered.filter((c) => c.hidden).length;
-    let html = `<div class="label" data-section="${kind}">${kind === "course" ? "Courses" : "Projects"}</div>`, term;
-    for (const top of ordered) {
-      if (top.hidden && !open) continue;
-      if (kind === "course" && (top.term ?? null) !== term) {
-        term = top.term ?? null;
-        html += `<div class="group" data-term="${esc(term ?? "")}">${esc(term ?? "no term")}</div>`;
-      }
-      for (const c of withParts(top)) html += entry(c, top);
+  let html = "", term;
+  const away = list.filter((c) => (kind === "course") === (state.collectionInfo[topName(c.name)]?.kind === "course")
+    && (tucked(c, kind) || tucked(state.collectionInfo[topName(c.name)] ?? c, kind))).length;
+  for (const top of tops) {
+    if (tucked(top, kind) && !open) continue;
+    // Courses by term: a heading per term (right-click it to hide the term's courses).
+    if (kind === "course" && side.sort.course === "term" && (top.term ?? null) !== term) {
+      term = top.term ?? null;
+      html += `<div class="group" data-term="${esc(term ?? "")}">${esc(term ?? "no term")}</div>`;
     }
-    if (hidden) html += `<div class="nav more" data-show-hidden="${kind}" title="collections you hid from the sidebar">` +
-      `<span>${open ? "▾" : "▸"} ${hidden} hidden</span><span class="n"></span></div>`;
-    // Each section ends with its own "+ new", which makes one of that kind.
-    return html + `<div class="nav" data-newcoll="${kind}" style="padding-left:4ch">` +
-      `<span>+ new ${kind}</span><span class="n"></span></div>`;
-  };
-  // Projects first, in your order; then courses by term, newest first
-  // (courses without a term first), A–Z within a term.
-  const courses = tops.filter((c) => c.kind === "course")
-    .sort((a, b) => termRank(b.term) - termRank(a.term) || a.name.localeCompare(b.name));
-  return section("project", tops.filter((c) => c.kind !== "course").sort(byPlace)) + section("course", courses);
+    for (const c of withParts(top)) html += entry(c, top);
+  }
+  if (away) html += `<div class="nav more" data-show-hidden="${kind}" title="hidden collections${
+    side.empty[kind] ? " and empty ones" : ""}: click to show them">` +
+    `<span>${open ? "▾" : "▸"} ${away} hidden</span><span class="n"></span></div>`;
+  // The section ends with its own "+ new", which makes one of that kind.
+  return html + `<div class="nav" data-newcoll="${kind}" style="padding-left:4ch">` +
+    `<span>+ new ${kind}</span><span class="n"></span></div>`;
 }
+const byPlace = (a, b) => (a.order ?? Infinity) - (b.order ?? Infinity) || a.name.localeCompare(b.name);
 
 function markSidebar() {
   for (const el of $("side").querySelectorAll(".nav")) {
@@ -301,6 +380,8 @@ function markSidebar() {
 }
 
 $("side").addEventListener("click", (event) => {
+  const heading = event.target.closest(".label[data-section]");
+  if (heading) { foldSection(heading.dataset.section); return; }
   const el = event.target.closest(".nav");
   if (!el) return;
   if (el.dataset.newcoll) { renderNewCollection(el.dataset.newcoll); return; }
@@ -317,75 +398,113 @@ $("side").addEventListener("click", (event) => {
   search();
 });
 
-// --- sidebar: moving projects, hiding collections -------------------------------------
-// Both are saved in the registry (collections.json, in the library), so they
-// sync to your other Macs; neither touches any paper or folder.
+// --- sidebar: moving, pinning, hiding, folding -------------------------------------------
+// Places, pins and hidden collections are saved in the registry
+// (collections.json, in the library), so they sync to your other Macs; none
+// of it touches a paper or a folder.
 
-let sideDrag = null;                // the project being dragged
+let sideDrag = null;                // { name, group } while a project or pin is dragged
 const clearDrop = () => $("side").querySelectorAll(".drop-before, .drop-after, .dragged")
   .forEach((el) => el.classList.remove("drop-before", "drop-after", "dragged"));
 $("side").addEventListener("dragstart", (event) => {
-  const el = event.target.closest?.(".nav[data-top]");
+  const el = event.target.closest?.(".nav[data-drag]");
   if (!el) return;
-  sideDrag = el.dataset.collection;
+  sideDrag = { name: el.dataset.collection, group: el.dataset.drag };
   event.dataTransfer.effectAllowed = "move";
-  event.dataTransfer.setData("text/x-refs-project", sideDrag);   // not "Files": the drop-a-PDF code ignores it
+  event.dataTransfer.setData("text/x-refs-collection", sideDrag.name);   // not "Files": the drop-a-PDF code ignores it
   el.classList.add("dragged");
 });
+// A drop target: another entry of the same group (a project among projects, a pin among pins).
+const dropTarget = (event) => {
+  const el = event.target.closest?.(".nav[data-drag]");
+  return el && sideDrag && el.dataset.drag === sideDrag.group && el.dataset.collection !== sideDrag.name ? el : null;
+};
 $("side").addEventListener("dragover", (event) => {
   if (!sideDrag) return;
-  const el = event.target.closest(".nav[data-top]");
   $("side").querySelectorAll(".drop-before, .drop-after").forEach((x) => x.classList.remove("drop-before", "drop-after"));
-  if (!el || el.dataset.collection === sideDrag) return;
+  const el = dropTarget(event);
+  if (!el) return;
   event.preventDefault();
   const box = el.getBoundingClientRect();
   el.classList.add(event.clientY < box.top + box.height / 2 ? "drop-before" : "drop-after");
 });
 $("side").addEventListener("drop", (event) => {
-  const el = event.target.closest(".nav[data-top]");
-  if (!sideDrag || !el) return;
+  const el = dropTarget(event);
+  if (!el) return;
   event.preventDefault();
-  placeProject(sideDrag, el.dataset.collection, el.classList.contains("drop-after"));
+  placeIn(sideDrag.group, sideDrag.name, el.dataset.collection, el.classList.contains("drop-after"));
 });
 $("side").addEventListener("dragend", () => { sideDrag = null; clearDrop(); });
 
-// Put a project just before (or after) another one.
-function placeProject(name, target, after = false) {
+// Put a project (or pin) just before, or after, another one. The section
+// switches to "my order", starting from the order it showed.
+function placeIn(group, name, target, after = false) {
   if (name === target) return;
-  const names = projectOrder().filter((n) => n !== name);
+  const names = groupOrder(group).filter((n) => n !== name);
   names.splice(names.indexOf(target) + (after ? 1 : 0), 0, name);
-  arrangeProjects(names);
+  arrangeIn(group, names);
 }
 
-// Move a project one place up or down among the projects shown (or to the top).
-function stepProject(name, how) {
-  const shown = projectOrder().filter((n) => !state.collectionInfo[n]?.hidden || state.showHidden.project);
+// Move one place up or down among those shown, or to the top.
+function stepIn(group, name, how) {
+  const shown = groupOrder(group).filter((n) => group === "pinned" || state.showHidden.project
+    || !tucked(state.collectionInfo[n] ?? {}, "project"));
   const at = shown.indexOf(name);
-  if (how === "top") placeProject(name, shown[0]);
-  else if (how === "up" && at > 0) placeProject(name, shown[at - 1]);
-  else if (how === "down" && at < shown.length - 1) placeProject(name, shown[at + 1], true);
+  if (how === "top") placeIn(group, name, shown[0]);
+  else if (how === "up" && at > 0) placeIn(group, name, shown[at - 1]);
+  else if (how === "down" && at < shown.length - 1) placeIn(group, name, shown[at + 1], true);
 }
 
-// `names` in this order (order 1, 2, …), or with `reset` back to A–Z.
-async function arrangeProjects(names, reset = false) {
-  names.forEach((n, at) => { if (state.collectionInfo[n]) state.collectionInfo[n].order = reset ? null : at + 1; });
-  drawSidebar();
-  const answer = await post("/api/collections/arrange", { names, reset });
+// `names` in this order (1, 2, …): projects (`order`) or pins (`pinned`).
+async function arrangeIn(group, names) {
+  const field = group === "pinned" ? "pinned" : "order";
+  names.forEach((n, at) => { if (state.collectionInfo[n]) state.collectionInfo[n][field] = at + 1; });
+  side.sort[group] = "custom";
+  saveSide();
+  const answer = await post("/api/collections/arrange", { names, field });
   if (answer.detail) { say(answer.detail, 8000); loadSidebar(); return; }
   collectionList = null;
-  if (reset) say("projects back in A–Z order");
 }
 
 async function hideCollections(names, hidden = true) {
   if (!names.length) return;
   for (const n of names) if (state.collectionInfo[n]) state.collectionInfo[n].hidden = hidden;
-  drawSidebar();
+  saveSide();
   const answer = await post("/api/collections/hide", { names, hidden });
   if (answer.detail) { say(answer.detail, 8000); loadSidebar(); return; }
   collectionList = null;
   const what = names.length === 1 ? `#${names[0]}` : `${names.length} collections`;
   say(hidden ? `hid ${what} (still found by #name)` : `${what} back in the sidebar`, 8000);
 }
+
+async function pinCollections(names, pinned = true) {
+  if (!names.length) return;
+  // New pins go after the others, as the server places them.
+  let last = Math.max(0, ...Object.values(state.collectionInfo).map((c) => c.pinned ?? 0));
+  for (const n of names) {
+    const c = state.collectionInfo[n];
+    if (c) c.pinned = pinned ? (c.pinned || ++last) : null;
+  }
+  saveSide();
+  const answer = await post("/api/collections/pin", { names, pinned });
+  if (answer.detail) { say(answer.detail, 8000); loadSidebar(); return; }
+  const what = names.length === 1 ? `#${names[0]}` : `${names.length} collections`;
+  say(pinned ? `pinned ${what}` : `unpinned ${what}`);
+}
+
+function foldSection(key, folded = !side.folded[key]) {
+  if (folded) side.folded[key] = true;
+  else delete side.folded[key];
+  saveSide();
+}
+
+function hideSection(key, hidden = true) {
+  if (KEEP_SECTIONS.has(key)) return;
+  side.hidden = hidden ? [...new Set([...side.hidden, key])] : side.hidden.filter((k) => k !== key);
+  saveSide();
+  if (hidden) say(`hid ${sectionTitle(key)} (sidebar, under refs, shows it again)`, 8000);
+}
+const sectionTitle = (key) => state.sideSections?.find((s) => s.key === key)?.title ?? key;
 
 // --- list ------------------------------------------------------------------------
 
@@ -2039,7 +2158,7 @@ $("detail").addEventListener("click", async (event) => {
 });
 
 const REVIEW_VIEWS = { renames: showRenames, copies: showCopies, downloads: showDownloads, inbox: showInbox,
-                       migrate: showMigrate, settings: showSettings };
+                       migrate: showMigrate, settings: showSettings, sidebar: showSidebarPage };
 
 $("list").addEventListener("change", (event) => {
   const path = event.target.dataset?.path;
@@ -2408,6 +2527,120 @@ async function createCollection(form) {
   search();
 }
 
+// --- the sidebar page ("sidebar", under refs) -----------------------------------------------
+// Every course and project in one table, to pin and hide many at once (and
+// bulk: empty ones, past terms' courses), and every section's options: shown,
+// folded, sort, what it lists.
+
+async function showSidebarPage(token) {
+  state.items = [];
+  await loadSidebar();                     // fresh counts and dates
+  if (token !== listToken) return;
+  drawSidebarPage();
+}
+
+const shortDate = (t) => (t ? new Date(t * 1000).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" }) : "");
+
+function drawSidebarPage() {
+  const list = state.sidebar?.collections ?? [];
+  const typed = (state.sbFilter ?? "").toLowerCase();
+  const kindOf = (c) => state.collectionInfo[topName(c.name)]?.kind ?? c.kind;
+  // Projects in the sidebar's order, then courses newest term first; parts under their parent.
+  const tops = [...sectionTops("project", list), ...[...sectionTops("course", list)].sort(sorter("term"))];
+  const rows = tops.flatMap((t) => [t, ...list.filter((c) => c.name.startsWith(t.name + "/")).sort(byPlace)])
+    .filter((c) => !typed || c.name.includes(typed));
+  const newest = list.filter((c) => c.kind === "course" && c.term).map((c) => c.term).sort((a, b) => termRank(b) - termRank(a))[0];
+  const past = list.filter((c) => !c.name.includes("/") && c.kind === "course" && !c.hidden && c.term && c.term !== newest);
+  const empty = list.filter((c) => !c.hidden && !c.works);
+  $("count").textContent = `${list.length} collections`;
+  let html = `<div class="bar">
+    <input class="sbfilter" data-sb-filter="1" value="${esc(state.sbFilter ?? "")}" placeholder="filter" spellcheck="false" autocomplete="off">
+    <button class="act" data-sb-bulk="empty" ${empty.length ? "" : "disabled"}>hide the ${empty.length} empty</button>
+    <button class="act" data-sb-bulk="past" ${past.length ? "" : "disabled"}
+      title="every course of a term before ${esc(newest ?? "the newest")}">hide past terms' courses (${past.length})</button>
+    <button class="act" data-sb-bulk="show" ${list.some((c) => c.hidden) ? "" : "disabled"}>show all</button>
+  </div>
+  <div class="sbrow sbhead"><span>pin</span><span>hide</span><span>name</span><span>kind</span><span class="right">papers</span>
+    <span>made</span><span>last added to</span></div>`;
+  if (!rows.length) html += `<div class="empty">no collection${typed ? ` matches ${esc(typed)}` : " yet"}.</div>`;
+  for (const c of rows) {
+    const depth = c.name.split("/").length - 1;
+    html += `<div class="sbrow${c.hidden ? " hid" : ""}">
+      <span><input type="checkbox" data-sb-pin="${esc(c.name)}"${c.pinned ? " checked" : ""} title="pin to the top of the sidebar"></span>
+      <span><input type="checkbox" data-sb-hide="${esc(c.name)}"${c.hidden ? " checked" : ""} title="hide from the sidebar"></span>
+      <span class="name" style="padding-left:${2 * depth}ch"><span class="tag" data-coll-show="${esc(c.name)}">${esc(depth ? c.name.split("/").pop() : c.name)}</span></span>
+      <span class="dim">${esc(kindOf(c) === "course" ? (state.collectionInfo[topName(c.name)]?.term ?? "course") : "project")}</span>
+      <span class="right">${c.works}</span>
+      <span class="dim">${esc(shortDate(c.created_at))}</span><span class="dim">${esc(shortDate(c.used_at))}</span></div>`;
+  }
+  $("list").innerHTML = html;
+  drawSidebarOptions();
+}
+
+// The right pane: each section's options.
+function drawSidebarOptions() {
+  const tick = (attrs, on, label, off = false) => `<label class="tickline"><input type="checkbox" ${attrs}${on ? " checked" : ""}${
+    off ? " disabled" : ""}> ${label}</label>`;
+  let html = `<h1>Sidebar</h1>
+    <p class="where">Pins and hidden collections are saved with your collections, so they follow you to
+    your other Macs. How each section looks is kept in this browser. A hidden collection keeps its papers
+    and is still found by <code>#name</code>. Right-click a section's heading for the same options.</p>
+    <div class="label">Sections</div>`;
+  for (const { key, title } of state.sideSections ?? []) {
+    const choices = SORT_CHOICES[key];
+    html += `<div class="sbsec"><b>${esc(title)}</b>
+      ${tick(`data-side-shown="${esc(key)}"`, !side.hidden.includes(key), "shown", KEEP_SECTIONS.has(key))}
+      ${tick(`data-side-fold="${esc(key)}"`, side.folded[key], "folded")}
+      ${choices ? `<label class="tickline">sort <select data-side-sort="${esc(key)}">${choices.map((m) =>
+        `<option value="${m}"${side.sort[key] === m ? " selected" : ""}>${esc(SORTS[m])}</option>`).join("")}</select></label>` : ""}
+      ${key === "project" || key === "course" ? tick(`data-side-empty="${key}"`, side.empty[key], "hide empty ones") : ""}
+      ${key === "review" ? tick(`data-side-quiet="1"`, side.quiet, "only what needs a decision") : ""}</div>`;
+  }
+  html += `<div class="acts" style="margin-top:10px"><button class="act" data-side-reset="1">reset sections to the defaults</button></div>`;
+  $("detail").innerHTML = html;
+}
+
+// The table: pin and hide boxes, the filter, the bulk buttons.
+$("list").addEventListener("change", (event) => {
+  const el = event.target;
+  if (el.dataset?.sbPin) pinCollections([el.dataset.sbPin], el.checked);
+  else if (el.dataset?.sbHide) hideCollections([el.dataset.sbHide], el.checked);
+});
+$("list").addEventListener("input", (event) => {
+  if (!event.target.dataset?.sbFilter) return;
+  state.sbFilter = event.target.value;
+  drawSidebarPage();
+  const box = $("list").querySelector(".sbfilter");
+  box.focus(); box.setSelectionRange(box.value.length, box.value.length);
+});
+$("list").addEventListener("click", (event) => {
+  const bulk = event.target.closest?.("[data-sb-bulk]")?.dataset.sbBulk;
+  const name = event.target.closest?.("[data-coll-show]")?.dataset.collShow;
+  if (name && state.view === "sidebar") { showCollection(name); return; }
+  if (!bulk) return;
+  const list = state.sidebar?.collections ?? [];
+  if (bulk === "show") { hideCollections(list.filter((c) => c.hidden).map((c) => c.name), false); return; }
+  const newest = list.filter((c) => c.kind === "course" && c.term).map((c) => c.term).sort((a, b) => termRank(b) - termRank(a))[0];
+  const names = bulk === "empty" ? list.filter((c) => !c.hidden && !c.works).map((c) => c.name)
+    : list.filter((c) => !c.name.includes("/") && c.kind === "course" && !c.hidden && c.term && c.term !== newest).map((c) => c.name);
+  hideCollections(names);
+});
+// The sections' options.
+$("detail").addEventListener("change", (event) => {
+  const d = event.target.dataset ?? {};
+  if (d.sideShown) hideSection(d.sideShown, !event.target.checked);
+  else if (d.sideFold) foldSection(d.sideFold, event.target.checked);
+  else if (d.sideSort) { side.sort[d.sideSort] = event.target.value; saveSide(); }
+  else if (d.sideEmpty) { side.empty[d.sideEmpty] = event.target.checked; saveSide(); }
+  else if (d.sideQuiet) { side.quiet = event.target.checked; saveSide(); }
+});
+$("detail").addEventListener("click", (event) => {
+  if (!event.target.closest?.("[data-side-reset]")) return;
+  side = structuredClone(SIDE_DEFAULT);
+  saveSide();
+  say("sidebar sections back to the defaults (pins and hidden collections stay)");
+});
+
 // --- context menus ----------------------------------------------------------------------
 // Right-click anything that has actions of its own: a paper (or the selection),
 // a course or project, a term, a sidebar section, a column header, a file, or
@@ -2566,8 +2799,11 @@ function showCollection(name) {
 function collectionMenu(el) {
   const name = el.dataset.collection, c = state.collectionInfo?.[name];
   if (!c) return null;
-  const top = !name.includes("/"), project = top && c.kind !== "course";
-  const shown = projectOrder().filter((n) => !state.collectionInfo[n]?.hidden || state.showHidden.project);
+  const top = !name.includes("/");
+  // Moving: among the pins when opened on a pin, else among the projects.
+  const group = el.dataset.drag ?? (top && c.kind !== "course" ? "project" : null);
+  const shown = group ? groupOrder(group).filter((n) => group === "pinned" || state.showHidden.project
+    || !tucked(state.collectionInfo[n] ?? {}, "project")) : [];
   const at = shown.indexOf(name);
   const folderOnly = c.implicit && "its papers are in it because of their folder: rename or move the folder instead";
   return { title: `#${name}`, items: [
@@ -2582,10 +2818,11 @@ function collectionMenu(el) {
     c.folder && { label: "show its folder in Finder", run: () => openCollectionPlace(name, "folder") },
     c.bib_file && { label: "show its .bib in Finder", run: () => openCollectionPlace(name, "bib") },
     SEP,
-    project && { label: "move up", off: at <= 0, run: () => stepProject(name, "up") },
-    project && { label: "move down", off: at < 0 || at >= shown.length - 1, run: () => stepProject(name, "down") },
-    project && { label: "move to the top", off: at <= 0, run: () => stepProject(name, "top") },
-    top && { label: c.hidden ? "show in the sidebar" : "hide from the sidebar", run: () => hideCollections([name], !c.hidden) },
+    { label: c.pinned ? "unpin" : "pin to the top", run: () => pinCollections([name], !c.pinned) },
+    group && { label: "move up", off: at <= 0, run: () => stepIn(group, name, "up") },
+    group && { label: "move down", off: at < 0 || at >= shown.length - 1, run: () => stepIn(group, name, "down") },
+    group && { label: "move to the top", off: at <= 0, run: () => stepIn(group, name, "top") },
+    { label: c.hidden ? "show in the sidebar" : "hide from the sidebar", run: () => hideCollections([name], !c.hidden) },
     SEP,
     { label: "edit details…", run: () => renderNewCollection(c.kind, "", c) },
     { label: "rename…", off: folderOnly, run: () => renameCollection(c) },
@@ -2642,21 +2879,43 @@ function termMenu(el) {
   ] };
 }
 
-// Projects or Courses (its label, "N hidden" line or "+ new").
+// A sidebar section's options (its heading; for Projects and Courses also
+// their "N hidden" line and "+ new"): sort, fold, hide, and what it lists.
 function sectionMenu(el) {
-  const kind = el.dataset.section ?? el.dataset.showHidden ?? el.dataset.newcoll;
-  const tops = (state.sidebar?.collections ?? []).filter((c) => !c.name.includes("/")
-    && (kind === "course" ? c.kind === "course" : c.kind !== "course"));
+  const key = el.dataset.section ?? el.dataset.showHidden ?? el.dataset.newcoll;
+  const kind = key === "project" || key === "course" ? key : null;
+  const pick = (on, label) => `${on ? "✓" : " "} ${label}`;
+  const tops = kind ? sectionTops(kind) : [];
+  const away = tops.filter((c) => tucked(c, kind)).length;
   const hidden = tops.filter((c) => c.hidden).map((c) => c.name);
-  return { title: kind === "course" ? "Courses" : "Projects", items: [
-    { label: `new ${kind}…`, run: () => renderNewCollection(kind) },
+  const pinned = key === "pinned" ? Object.values(state.collectionInfo).filter((c) => c.pinned).map((c) => c.name) : [];
+  return { title: sectionTitle(key), items: [
+    kind && { label: `new ${kind}…`, run: () => renderNewCollection(kind) },
     SEP,
-    hidden.length && { label: state.showHidden[kind] ? `fold the ${hidden.length} hidden` : `show the ${hidden.length} hidden`,
+    // Sort: a choice of orders, the current one ticked.
+    ...(SORT_CHOICES[key] ?? []).map((mode) => ({ label: pick(side.sort[key] === mode, `sort ${SORTS[mode]}`),
+      run: () => { side.sort[key] = mode; saveSide(); } })),
+    SEP,
+    kind && { label: pick(side.empty[kind], "hide empty ones"), run: () => {
+      side.empty[kind] = !side.empty[kind]; saveSide(); } },
+    key === "review" && { label: pick(side.quiet, "only what needs a decision"), run: () => {
+      side.quiet = !side.quiet; saveSide(); } },
+    kind && away && { label: state.showHidden[kind] ? `fold the ${away} hidden` : `show the ${away} hidden`,
       run: () => { state.showHidden[kind] = !state.showHidden[kind]; drawSidebar(); } },
-    hidden.length && { label: `show all ${hidden.length} in the sidebar again`, run: () => hideCollections(hidden, false) },
-    kind === "project" && { label: "sort A–Z", off: !tops.some((c) => c.order != null) && "they are A–Z already",
-      run: () => arrangeProjects(tops.map((c) => c.name), true) },
+    hidden.length && { label: `bring all ${hidden.length} hidden back`, run: () => hideCollections(hidden, false) },
+    pinned.length && { label: `unpin all ${pinned.length}`, run: () => pinCollections(pinned, false) },
+    SEP,
+    { label: side.folded[key] ? "unfold" : "fold", run: () => foldSection(key) },
+    !KEEP_SECTIONS.has(key) && { label: "hide this section", run: () => hideSection(key) },
+    side.hidden.length && { label: `show the ${side.hidden.length} hidden ${side.hidden.length === 1 ? "section" : "sections"}`,
+      run: () => { side.hidden = []; saveSide(); } },
+    { label: "manage the sidebar…", run: showSidebarView },
   ] };
+}
+
+function showSidebarView() {
+  state.collection = null; state.context = null; state.tag = null; state.view = "sidebar";
+  markSidebar(); search();
 }
 
 // A column header: sort, hide, sizes.
@@ -2831,9 +3090,13 @@ selecting many
 
 sidebar
 
-  drag a project       move it among the projects (or right-click: move up / down)
-  right-click          hide a course or project (a term's courses at once), rename, edit, delete;
-                       "N hidden" at the end of a section shows the hidden ones
+  drag a project       move it among the projects (a pin among the pins); the section
+                       switches to "my order"
+  click a heading      fold or unfold the section
+  right-click          a heading: sort, hide empty ones, fold, hide the section;
+                       a course or project: pin, hide, move, rename, edit, delete;
+                       a term: hide its courses. "N hidden" shows the hidden ones
+  sidebar (under refs) every collection, to pin or hide many at once; every section's options
 
 review (sidebar)
 

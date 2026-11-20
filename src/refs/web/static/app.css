@@ -486,3 +486,43 @@ header { position: relative; }
 .ctx hr { border: 0; border-top: 1px solid var(--line); margin: 3px 0; }
 /* What the open menu is about. */
 .ctxon { outline: 1px dashed var(--accent); outline-offset: -1px; }
+
+/* Section headings fold: the arrow shows on hover, or while folded. The
+   sort, when not the section's usual one, follows the title. */
+#side .label.fold { cursor: pointer; user-select: none; }
+#side .label.fold:hover { color: var(--fg); }
+.label .tw { font-style: normal; display: inline-block; width: 2ch; margin-left: -2ch; opacity: 0; }
+#side .label.fold:hover .tw, #side .label.folded .tw { opacity: 1; }
+.label .sortname { text-transform: none; letter-spacing: 0; color: var(--faint); }
+
+/* The sidebar page: one row per collection. */
+.sbrow {
+  /* Name takes the room; the rest shrink (and cut off) when the pane is narrow. */
+  display: grid; grid-template-columns: 4ch 5ch minmax(10ch, 1fr) minmax(0, 12ch) minmax(0, 7ch) minmax(0, 13ch) minmax(0, 14ch);
+  column-gap: 1ch; padding: 1px 2ch; align-items: center;
+}
+.sbrow:hover:not(.sbhead) { background: color-mix(in srgb, var(--sel) 55%, transparent); }
+.sbrow input { margin: 0; accent-color: var(--accent); }
+.sbrow .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sbrow > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sbrow .dim { color: var(--dim); }
+.sbrow.hid .tag { color: var(--faint); }
+.sbhead { color: var(--dim); font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+          border-bottom: 1px solid var(--line); padding-top: 4px; padding-bottom: 3px; }
+.sbfilter { background: none; border: 0; border-bottom: 1px solid var(--line); color: var(--fg);
+            font: inherit; outline: 0; width: 16ch; }
+.sbsec { display: flex; flex-wrap: wrap; align-items: center; gap: 0 2ch; padding: 3px 0;
+         border-bottom: 1px solid var(--line); }
+.sbsec b { font-weight: 500; min-width: 12ch; }
+.sbsec select { background: var(--bg); color: var(--fg); border: 1px solid var(--line); font: inherit; }
+.sbsec input { accent-color: var(--accent); }
+/* A narrow middle pane drops the dates, then kind and count, rather than cut them. */
+#list { container-type: inline-size; }
+@container (max-width: 620px) {
+  .sbrow { grid-template-columns: 4ch 5ch minmax(10ch, 1fr) minmax(0, 12ch) minmax(0, 7ch); }
+  .sbrow > :nth-child(n+6) { display: none; }
+}
+@container (max-width: 360px) {
+  .sbrow { grid-template-columns: 4ch 5ch minmax(0, 1fr); }
+  .sbrow > :nth-child(n+4) { display: none; }
+}

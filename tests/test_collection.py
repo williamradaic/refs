@@ -317,3 +317,32 @@ def test_zotero_import_cleans_collection_names(lib):
     work = importer.add(record, file_hashes=[], external={}, tags=[], collections=["Card-Dahl style", "card-dahl-style"],
                         notes=[])
     assert work["user"]["collections"] == ["card-dahl-style"]
+
+
+def test_pins_go_after_earlier_ones_and_can_be_rearranged(lib):
+    collection.pin(lib.cfg, ["bets"], True, lib.conn)
+    collection.pin(lib.cfg, ["220a", "bets"], True, lib.conn)        # bets stays where it was
+    registry = collection.load(lib.cfg)
+    assert (registry["bets"]["pinned"], registry["220a"]["pinned"]) == (1, 2)
+    assert registry["220a"]["kind"] == "course"                       # registered as its folder says
+    collection.arrange(lib.cfg, ["220a", "bets"], lib.conn, field="pinned")
+    rows = {r["name"]: r for r in collection.listing(lib.cfg, lib.conn)}
+    assert (rows["220a"]["pinned"], rows["bets"]["pinned"]) == (1, 2)
+    collection.pin(lib.cfg, ["220a"], False)
+    assert "pinned" not in collection.load(lib.cfg)["220a"]
+    with pytest.raises(collection.Invalid):
+        collection.arrange(lib.cfg, ["bets"], field="hidden")
+
+
+def test_listing_dates_for_sorting(lib):
+    """created_at: when the collection was made, else its first paper;
+    used_at: when papers last went in, else its newest paper."""
+    rows = {r["name"]: r for r in collection.listing(lib.cfg, lib.conn)}
+    assert rows["bets"]["created_at"] is not None and rows["bets"]["used_at"] is not None
+    collection.register(lib.cfg, "thesis")
+    assert {r["name"]: r for r in collection.listing(lib.cfg, lib.conn)}["thesis"]["used_at"] is None
+    collection.change(lib.cfg, [lib.work[SALIENCE]], "thesis")
+    entry = collection.load(lib.cfg)["thesis"]
+    assert entry["touched"] >= entry["created"]
+    row = {r["name"]: r for r in collection.listing(lib.cfg, lib.conn)}["thesis"]
+    assert row["used_at"] >= row["created_at"]

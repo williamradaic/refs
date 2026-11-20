@@ -188,10 +188,19 @@ selection: file, collect, queue, copy citekeys, `\cite{…}` or BibTeX), a
 course or project (show its folder or `.bib`, copy its BibTeX, new part, move
 up or down, hide, edit, rename, delete), a term heading (hide all its
 courses), a column header, a file or collection on a paper. Each item shows
-its key where it has one; `.` opens the highlighted paper's menu. A hidden
-course or project keeps its papers and is still found by `#name`; *N hidden*
-at the end of its section shows it again. Order and hiding are saved in
-`collections.json`, so they follow you to your other Macs. In the terminal:
+its key where it has one; `.` opens the highlighted paper's menu.
+
+**The sidebar.** Pin any course, project or part to *Pinned* at the top.
+Each section has its options under a right-click on its heading: sort
+(projects: your order, A–Z, newest first, recently added to, most papers;
+courses also by term), hide empty collections, fold, hide the section;
+clicking a heading folds it. A hidden course or project keeps its papers and
+is still found by `#name`; *N hidden* at the end of its section shows it
+again. *sidebar* (under refs) lists every collection to pin or hide many at
+once (empty ones, past terms' courses) and every section's options. Pins,
+places and hidden collections are saved in `collections.json`, so they follow
+you to your other Macs; how each section looks is kept in the browser. In the
+terminal:
 
 ```sh
 refs project new bets --folder phd/research/bets/readings/lit --shared --bib ~/phd/research/bets/refs.bib
