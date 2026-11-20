@@ -55,11 +55,14 @@ class Row:
 class Plan:
     rows: list[Row] = field(default_factory=list)
     parts: dict[str, dict] = field(default_factory=dict)   # part -> {"order", "label"}
+    # The courses and projects folders stand for -> {"kind", "term"}: registered
+    # by apply, so a course keeps its term once its folder is no longer indexed.
+    tops: dict[str, dict] = field(default_factory=dict)
     unidentified: list[str] = field(default_factory=list)  # paper-like PDFs never read
     inboxes: list[str] = field(default_factory=list)       # course areas, for `finish`
 
     def to_dict(self) -> dict:
-        return {"rows": [asdict(r) for r in self.rows], "parts": self.parts,
+        return {"rows": [asdict(r) for r in self.rows], "parts": self.parts, "tops": self.tops,
                 "unidentified": self.unidentified, "inboxes": self.inboxes}
 
 
@@ -96,14 +99,16 @@ def plan(cfg: Config, conn: sqlite3.Connection) -> Plan:
         names: dict[str, None] = {}
         for row in rows:
             ctx = layout.derive(row["path"])
+            if (found := collection.implicit(ctx)) is not None:
+                known = result.tops.setdefault(found[0], {"kind": found[1], "term": found[2]})
+                if found[2] and (known["term"] is None or collection._term_rank(found[2])
+                                 > collection._term_rank(known["term"])):
+                    known["term"] = found[2]
             if (part := collection.suggested(ctx)) is not None:
                 names[part] = None
                 if "/" in part and part not in result.parts:
                     label, order = contexts.pretty_topic(ctx.topic_folder or "")
                     result.parts[part] = {"order": order, "label": label}
-            found = collection.implicit(ctx)
-            if found and found[1] == "course" and (area := _area_folder(ctx)):
-                inbox_areas.add(area)
         # Memberships it has already need not be made again.
         new = [n for n in names if n not in collection.explicit(work)]
         paths = [r["path"] for r in rows]
@@ -132,6 +137,13 @@ def plan(cfg: Config, conn: sqlite3.Connection) -> Plan:
         if not library.holds(cfg, row["path"]):
             result.unidentified.append(row["path"])
     result.rows.sort(key=lambda r: (r.source is None, r.group, r.title.lower()))
+    # The course areas, from every indexed PDF (slides too), so they are found
+    # after the papers have left them: the inboxes `finish` proposes.
+    for (path,) in conn.execute("SELECT DISTINCT path FROM paths"):
+        ctx = layout.derive(path)
+        found = collection.implicit(ctx)
+        if found and found[1] == "course" and (area := _area_folder(ctx)):
+            inbox_areas.add(area)
     result.inboxes = sorted(inbox_areas)
     return result
 
@@ -171,6 +183,10 @@ def apply(cfg: Config, conn: sqlite3.Connection, the_plan: Plan, work_ids: set[s
             if name not in registry:
                 collection.register(cfg, name, order=details.get("order"), label=details.get("label"),
                                     registry=registry)
+            top = name.split("/")[0]
+            if top not in registry and top in the_plan.tops:
+                collection.register(cfg, top, kind=the_plan.tops[top]["kind"],
+                                    term=the_plan.tops[top]["term"] or "", registry=registry)
         row.collections = added                     # what undo takes back
         done.append(row)
     collection.save(cfg, registry)

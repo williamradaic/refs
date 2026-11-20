@@ -1427,17 +1427,18 @@ function drawMigrateDetail() {
   const data = state.migrate, moving = data.rows.filter((r) => r.source);
   const copies = moving.filter((r) => r.mode === "copy").length;
   const f = data.finish;
+  const n = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
   $("detail").innerHTML = `<div class="label">Into the library</div>
-    <p>${moving.length} papers have no PDF in <code>${esc(data.dump)}</code> yet: ${moving.length - copies} are moved there,
+    <p>${n(moving.length, "paper")} without a PDF in <code>${esc(data.dump)}</code>: ${moving.length - copies} moved there,
     ${copies} copied (from folders shared with coauthors, or managed by another tool, which keep theirs).
     Each keeps its courses and projects as collections, its readings/&lt;topic&gt; folder as a part.
-    ${data.rows.length - moving.length} papers already there just get their collections.</p>
+    ${n(data.rows.length - moving.length, "paper")} already there just get their collections.</p>
     <div class="acts" style="margin-top:8px">
       <button class="act" data-mig="apply">bring the ticked papers in (<span class="dln">${state.picked.size}</span>)</button>
       ${data.undo ? `<button class="act" data-mig="undo">undo the last batch</button>` : ""}
     </div>
     <div class="dlopts"><label><input type="checkbox" name="readingsmd" checked> write readings.md into each course folder</label></div>
-    ${data.unidentified.length ? `<p class="where">${data.unidentified.length} PDFs that look like papers were never read
+    ${data.unidentified.length ? `<p class="where">${n(data.unidentified.length, "PDF")} that look like papers were never read
       and stay where they are; identify them first (they are under "not identified").</p>` : ""}
     <div class="label" style="margin-top:14px">Then: finish</div>
     <p>Once the papers are in, refs can watch the library alone:</p>

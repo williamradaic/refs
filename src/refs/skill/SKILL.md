@@ -130,6 +130,10 @@ refs project new <name> [--course --term 2026-fall] [--folder F] [--shared] [--b
 
 A new name makes a new collection, so check the existing names first
 (`refs collection list --json`) rather than inventing a near-duplicate.
+`refs add <link> --to <name>` adds a paper straight into a collection. A
+paper's first location is its library copy: read and cite that one. Putting a
+paper in a *shared* collection copies its PDF into a folder coauthors see;
+do that only when asked.
 `library.bib` in refs' folder holds every paper with its PDF and collections;
 it is for the user's other reference managers, not for citing (use `refs bib`).
 
@@ -145,7 +149,8 @@ queue by themselves once read.
 
 These change the user's files, settings or spend money in bulk, so run them
 only when asked for exactly that: `refs rename ... --apply` and
-`refs rename --undo`, `refs process` (reads many PDFs through the API),
+`refs rename --undo`, `refs process` (reads many PDFs through the API), `refs migrate --apply`,
+`--undo` and `--finish`, `refs marks --pull`,
 `refs zotero-import`, `refs init`, `refs service ...`, `refs setup-key` and
 `refs uninstall`. Never move, rename or delete PDFs in the library folders
 yourself; refs keeps an undo journal for the changes it makes, and the web

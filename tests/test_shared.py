@@ -85,6 +85,10 @@ def test_shared_folders_are_watched_and_inboxes_are_not(lib, tmp_path, monkeypat
     monkeypatch.setenv("REFS_CONFIG", str(tmp_path / "config.toml"))
     cfg = config.load()
     assert cfg.shared_folders == [outside] and outside in cfg.watched
+    assert cfg.shared_collections == {outside: "bets"}
+    # A PDF in the shared folder belongs to the project.
+    ctx = __import__("refs").contexts.layout_for(cfg).derive(f"{outside}/a.pdf")
+    assert collection.implicit(ctx) == ("bets", "project", None)
     assert cfg.is_watched(f"{outside}/a.pdf") and not cfg.is_watched("elsewhere/x.pdf")
     (lib.root / COURSE / "slides.pdf").write_bytes(b"%PDF slides")
     walked = {f.rel for f in storage.walk_pdfs(cfg)}
@@ -301,3 +305,26 @@ def test_pull_refuses_different_versions_and_strangers(lib):
         annotations.pull(lib.cfg, lib.conn, lib.work, f"{SHARED}/blp.pdf", now=later)
     with pytest.raises(annotations.Refused, match="not another copy"):
         annotations.pull(lib.cfg, lib.conn, lib.work, "phd/elsewhere.pdf", now=later)
+
+
+def test_inbox_take_through_the_page_files_a_known_paper(lib, tmp_path, monkeypatch):
+    # A course copy refs read while the folder was still indexed: after the
+    # switch it is only listed, and taking it in files it into its course.
+    (lib.root / COURSE / "blp-course.pdf").write_bytes((lib.root / LIBRARY_BLP).read_bytes() + b"\n%v2")
+    lib.rescan()
+    course_hash = lib.conn.execute("SELECT hash FROM paths WHERE path=?", (f"{COURSE}/blp-course.pdf",)).fetchone()[0]
+    write_read(lib.cfg, course_hash, f"{COURSE}/blp-course.pdf")
+    lib.rescan()
+    (lib.root / LIBRARY_BLP).unlink()                       # the library lacks it now
+    (tmp_path / "config.toml").write_text('inboxes = ["phd/coursework"]\n')
+    monkeypatch.setenv("REFS_CONFIG", str(tmp_path / "config.toml"))
+    lib.reload().rescan()
+    client = TestClient(create_app())
+    [item] = client.get("/api/inbox").json()["items"]
+    assert item["work_id"] == lib.work and item["why"] == "read before"
+    answer = client.post("/api/inbox/take", json={"choices": [{"path": item["path"],
+                                                               "collections": [item["suggested"]]}],
+                                                  "extra": ["thesis"]}, headers=H).json()
+    [taken] = answer["taken"]
+    assert taken["to"] == f"papers-dump/{CANONICAL}" and answer["jobs"] == []
+    assert works.load_all(lib.cfg)[lib.work]["user"]["collections"] == ["220a/demand-estimation-ii", "thesis"]

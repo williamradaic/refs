@@ -92,6 +92,10 @@ def test_apply_then_undo_puts_everything_back(lib):
     assert (lib.root / SHARED / "laibson.pdf").is_file()              # coauthors keep theirs
     blp = works.load_all(lib.cfg)[lib.ids["berry1995automobile"]]
     assert blp["user"]["collections"] == ["220a/demand-estimation-ii"]
+    # The course is registered with its term: it keeps it once its folder leaves the index.
+    assert collection.load(lib.cfg)["220a"] | {"created": None} == {
+        "kind": "course", "term": "2026-fall", "folder": None, "shared": False, "bib_file": None,
+        "created": None}
     assert collection.load(lib.cfg)["220a/demand-estimation-ii"]["label"] == "Demand estimation II"
     readings = (lib.root / "phd/coursework/2026-fall/220a/readings.md").read_text()
     assert "## 03 Demand estimation II" in readings and "`berry1995automobile`" in readings
@@ -106,8 +110,11 @@ def test_apply_then_undo_puts_everything_back(lib):
 
 
 def test_finish_renames_the_library_and_watches_it_alone(lib):
+    (lib.root / "phd/coursework/2026-fall/220a/slides.pdf").write_bytes(b"%PDF slides")
     migrate.apply(lib.cfg, lib.conn, migrate.plan(lib.cfg, lib.conn))
     scan.scan(lib.cfg, lib.conn)
+    # The papers have left the course folders; the slides say where they were.
+    assert migrate.plan(lib.cfg, lib.conn).inboxes == ["phd/coursework"]
     result = migrate.finish(lib.cfg, migrate.plan(lib.cfg, lib.conn), "refs-library")
     assert result["renamed"] == ("papers-dump", "refs-library")
     saved = tomllib.loads(lib.config_file.read_text())

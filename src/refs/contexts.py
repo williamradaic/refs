@@ -223,8 +223,12 @@ class Layout:
     """The rules for one library: config.toml's, the preset's, one per root."""
 
     def __init__(self, rules: list[str], roots: list[str], dump: str,
-                 preset: str = "folders") -> None:
+                 preset: str = "folders", shared: dict[str, str] | None = None) -> None:
         chosen = PRESETS[preset]
+        # Folders shared with coauthors, and their collections (collection.py):
+        # a PDF in one belongs to that project, whatever the rules say.
+        self.shared = {tuple(p for p in folder.split("/") if p): name
+                       for folder, name in (shared or {}).items()}
         self.rules = [Rule.parse(text) for text in [*rules, *chosen.rules]]
         self.dump = tuple(p for p in dump.strip("/").split("/") if p)
         # Every watched folder ends with the generic rules, tried last: each
@@ -256,7 +260,12 @@ class Layout:
         key, area, term, slug = "other", "other", None, None
         used = 0   # number of leading folders that belong to the context itself
 
-        if self.dump and dirs[:len(self.dump)] == self.dump:
+        shared = next(((parts, name) for parts, name in self.shared.items()
+                       if parts and dirs[:len(parts)] == parts), None)
+        if shared is not None:
+            parts, name = shared
+            key, area, slug, used = f"shared/{name}", "shared", name, len(parts)
+        elif self.dump and dirs[:len(self.dump)] == self.dump:
             key, area, used = "dump", "dump", len(self.dump)
         else:
             for rule in self.rules:
@@ -287,4 +296,4 @@ class Layout:
 
 def layout_for(cfg: Config) -> Layout:
     """The layout config.toml describes (`layout`, `contexts`, `roots`, `dump`)."""
-    return Layout(cfg.contexts, cfg.watched, cfg.dump, cfg.layout)
+    return Layout(cfg.contexts, cfg.watched, cfg.dump, cfg.layout, cfg.shared_collections)

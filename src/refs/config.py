@@ -140,8 +140,9 @@ class Config:
     roots: list[str] = field(default_factory=list)
     inboxes: list[str] = field(default_factory=list)
     # Folders of collections shared with coauthors (collections.json), watched
-    # like roots. Read when the settings are loaded.
+    # like roots, and the collection each belongs to. Read when the settings load.
     shared_folders: list[str] = field(default_factory=list)
+    shared_collections: dict[str, str] = field(default_factory=dict)   # folder -> name
     dump: str = "papers-dump"
     state_dir: str = ".refs"
     exclude_paths: list[str] = field(default_factory=list)
@@ -263,7 +264,8 @@ def load(config_file: Path | None = None) -> Config:
         index_db=index_db,
         roots=list(settings["roots"]),
         inboxes=[str(f).strip("/") for f in settings["inboxes"]],
-        shared_folders=_shared_folders(dropbox_root / settings["state_dir"] / "collections.json"),
+        shared_folders=sorted(shared := _shared_folders(dropbox_root / settings["state_dir"] / "collections.json")),
+        shared_collections=shared,
         dump=settings["dump"],
         state_dir=settings["state_dir"],
         exclude_paths=list(settings["exclude_paths"]),
@@ -292,16 +294,17 @@ def load(config_file: Path | None = None) -> Config:
     )
 
 
-def _shared_folders(registry: Path) -> list[str]:
+def _shared_folders(registry: Path) -> dict[str, str]:
     """The folders of shared collections in collections.json (collection.py),
-    read directly: a missing or half-written file means none."""
+    each with its collection's name, read directly: a missing or half-written
+    file means none."""
     import json
     try:
         entries = json.loads(registry.read_text()).get("collections") or {}
     except (OSError, ValueError, AttributeError):
-        return []
-    return sorted({str(e["folder"]).strip("/") for e in entries.values()
-                   if isinstance(e, dict) and e.get("shared") and e.get("folder")})
+        return {}
+    return {str(e["folder"]).strip("/"): name for name, e in sorted(entries.items())
+            if isinstance(e, dict) and e.get("shared") and e.get("folder")}
 
 
 def not_set_up(cfg: Config) -> str | None:

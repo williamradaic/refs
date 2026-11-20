@@ -124,9 +124,10 @@ def listing(cfg: Config, conn: sqlite3.Connection, *, look: bool = True) -> dict
                     continue
                 # A file refs read before (when the folder was still indexed)
                 # keeps its work: the `files` row outlives the path.
-                row = conn.execute("SELECT work_id, kind FROM files WHERE hash=?", (file_hash,)).fetchone()
+                row = conn.execute("SELECT work_id, kind, status FROM files WHERE hash=?", (file_hash,)).fetchone()
                 work_id = row["work_id"] if row else None
-                kind, why = (row["kind"], "read before") if row and row["kind"] else (verdict.kind, verdict.why)
+                read = row is not None and row["status"] is not None
+                kind, why = (row["kind"], "read before") if read and row["kind"] else (verdict.kind, verdict.why)
                 if work_id is None and kind not in {"paper", "maybe", *PAPER_KINDS}:
                     continue
             items.append(describe(rel, file_hash, work_id, kind or "paper", why, "inbox",
