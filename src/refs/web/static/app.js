@@ -145,9 +145,18 @@ function say(text, ms = 4000) {
 // --- sidebar -------------------------------------------------------------------
 
 async function loadSidebar() {
-  const data = await get("/api/sidebar");
+  state.sidebar = await get("/api/sidebar");
+  drawSidebar();
+}
+
+// Draw the sidebar from the last answer (state.sidebar). Hiding a collection
+// or moving a project changes that answer in place and redraws at once; the
+// server is told meanwhile.
+function drawSidebar() {
+  const data = state.sidebar;
+  if (!data) return;
   state.dump = data.dump || state.dump;
-  // Each collection's details, for the reading-list headings (groupOf).
+  // Each collection's details, for the reading-list headings (groupOf) and the menus.
   state.collectionInfo = Object.fromEntries((data.collections ?? []).map((c) => [c.name, c]));
   state.proxy = data.proxy ?? "";     // the library proxy (settings), "" = none
   const nav = (label, count, attrs, sub = false) =>
@@ -226,36 +235,59 @@ async function loadSidebar() {
   markSidebar();
 }
 
+// Collections (collection.py) in the sidebar. A project's place is its
+// `order` (drag it, or "move up" in its menu), the unplaced ones after, A–Z;
+// courses go by term, newest first. Each is followed by its parts in their
+// reading-list order. A hidden collection (and its parts) is left out, behind
+// a "N hidden" line at the end of its section that shows them, dimmed.
+const byPlace = (a, b) => (a.order ?? Infinity) - (b.order ?? Infinity) || a.name.localeCompare(b.name);
+const topName = (name) => name.split("/")[0];
+state.showHidden = { project: false, course: false };   // the "N hidden" lines, unfolded
+
+// Every top-level project, in sidebar order, hidden ones too (for moving one).
+function projectOrder() {
+  return (state.sidebar?.collections ?? [])
+    .filter((c) => !c.name.includes("/") && c.kind !== "course").sort(byPlace).map((c) => c.name);
+}
+
 function collectionsNav(list) {
-  const byName = Object.fromEntries(list.map((c) => [c.name, c]));
-  const top = (c) => byName[c.name.split("/")[0]] ?? c;
-  const entry = (c) => {
+  const parts = {};                                   // parent name -> its parts
+  for (const c of list) if (c.name.includes("/")) (parts[c.name.slice(0, c.name.lastIndexOf("/"))] ??= []).push(c);
+  const withParts = (c) => [c, ...(parts[c.name] ?? []).sort(byPlace).flatMap(withParts)];
+  const tops = list.filter((c) => !c.name.includes("/"));
+  const entry = (c, top) => {
     const depth = c.name.split("/").length - 1;
     const label = c.name.split("/").pop() + (c.shared ? " ⇄" : "");
     const about = [c.kind, c.term, c.shared ? "shared with coauthors" : "", c.implicit ? "from its folder" : "",
-                   c.folder ? `folder ${c.folder}` : ""].filter(Boolean).join(" · ");
-    return `<div class="nav" data-collection="${esc(c.name)}" title="#${esc(c.name)}: ${esc(about)}"
+                   c.folder ? `folder ${c.folder}` : "", top.hidden ? "hidden" : ""].filter(Boolean).join(" · ");
+    // A top-level project can be dragged to another place among the projects.
+    const drag = c === top && top.kind !== "course" ? ` draggable="true" data-top="1"` : "";
+    const hint = drag ? "; drag to move, right-click for more" : "; right-click for more";
+    return `<div class="nav${top.hidden ? " hid" : ""}" data-collection="${esc(c.name)}"${drag} title="#${esc(c.name)}: ${esc(about)}${hint}"
       style="padding-left:${4 + 2 * depth}ch"><span>${esc(label)}</span><span class="n">${c.works}</span></div>`;
   };
-  // Each section ends with its own "+ new", which makes one of that kind.
-  const adder = (kind) => `<div class="nav" data-newcoll="${kind}" style="padding-left:4ch">` +
-    `<span>+ new ${kind}</span><span class="n"></span></div>`;
-  // Projects first, by name.
-  let html = `<div class="label">Projects</div>`;
-  for (const c of list.filter((c) => top(c).kind !== "course")) html += entry(c);
-  html += adder("project");
-  // Then courses, grouped by term, newest first; courses without a term first.
-  const courses = list.filter((c) => top(c).kind === "course")
-    .sort((a, b) => termRank(top(b).term) - termRank(top(a).term) || a.name.localeCompare(b.name));
-  html += `<div class="label">Courses</div>`;
-  let term;
-  for (const c of courses) {
-    const t = top(c).term ?? null;
-    if (t !== term) { term = t; html += `<div class="group">${esc(t ?? "no term")}</div>`; }
-    html += entry(c);
-  }
-  html += adder("course");
-  return html;
+  const section = (kind, ordered) => {
+    const open = state.showHidden[kind], hidden = ordered.filter((c) => c.hidden).length;
+    let html = `<div class="label" data-section="${kind}">${kind === "course" ? "Courses" : "Projects"}</div>`, term;
+    for (const top of ordered) {
+      if (top.hidden && !open) continue;
+      if (kind === "course" && (top.term ?? null) !== term) {
+        term = top.term ?? null;
+        html += `<div class="group" data-term="${esc(term ?? "")}">${esc(term ?? "no term")}</div>`;
+      }
+      for (const c of withParts(top)) html += entry(c, top);
+    }
+    if (hidden) html += `<div class="nav more" data-show-hidden="${kind}" title="collections you hid from the sidebar">` +
+      `<span>${open ? "▾" : "▸"} ${hidden} hidden</span><span class="n"></span></div>`;
+    // Each section ends with its own "+ new", which makes one of that kind.
+    return html + `<div class="nav" data-newcoll="${kind}" style="padding-left:4ch">` +
+      `<span>+ new ${kind}</span><span class="n"></span></div>`;
+  };
+  // Projects first, in your order; then courses by term, newest first
+  // (courses without a term first), A–Z within a term.
+  const courses = tops.filter((c) => c.kind === "course")
+    .sort((a, b) => termRank(b.term) - termRank(a.term) || a.name.localeCompare(b.name));
+  return section("project", tops.filter((c) => c.kind !== "course").sort(byPlace)) + section("course", courses);
 }
 
 function markSidebar() {
@@ -272,6 +304,11 @@ $("side").addEventListener("click", (event) => {
   const el = event.target.closest(".nav");
   if (!el) return;
   if (el.dataset.newcoll) { renderNewCollection(el.dataset.newcoll); return; }
+  if (el.dataset.showHidden) {
+    state.showHidden[el.dataset.showHidden] = !state.showHidden[el.dataset.showHidden];
+    drawSidebar();
+    return;
+  }
   state.collection = el.dataset.collection ?? null;
   state.context = el.dataset.context ?? null;
   state.tag = el.dataset.tag ?? null;
@@ -279,6 +316,76 @@ $("side").addEventListener("click", (event) => {
   markSidebar();
   search();
 });
+
+// --- sidebar: moving projects, hiding collections -------------------------------------
+// Both are saved in the registry (collections.json, in the library), so they
+// sync to your other Macs; neither touches any paper or folder.
+
+let sideDrag = null;                // the project being dragged
+const clearDrop = () => $("side").querySelectorAll(".drop-before, .drop-after, .dragged")
+  .forEach((el) => el.classList.remove("drop-before", "drop-after", "dragged"));
+$("side").addEventListener("dragstart", (event) => {
+  const el = event.target.closest?.(".nav[data-top]");
+  if (!el) return;
+  sideDrag = el.dataset.collection;
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/x-refs-project", sideDrag);   // not "Files": the drop-a-PDF code ignores it
+  el.classList.add("dragged");
+});
+$("side").addEventListener("dragover", (event) => {
+  if (!sideDrag) return;
+  const el = event.target.closest(".nav[data-top]");
+  $("side").querySelectorAll(".drop-before, .drop-after").forEach((x) => x.classList.remove("drop-before", "drop-after"));
+  if (!el || el.dataset.collection === sideDrag) return;
+  event.preventDefault();
+  const box = el.getBoundingClientRect();
+  el.classList.add(event.clientY < box.top + box.height / 2 ? "drop-before" : "drop-after");
+});
+$("side").addEventListener("drop", (event) => {
+  const el = event.target.closest(".nav[data-top]");
+  if (!sideDrag || !el) return;
+  event.preventDefault();
+  placeProject(sideDrag, el.dataset.collection, el.classList.contains("drop-after"));
+});
+$("side").addEventListener("dragend", () => { sideDrag = null; clearDrop(); });
+
+// Put a project just before (or after) another one.
+function placeProject(name, target, after = false) {
+  if (name === target) return;
+  const names = projectOrder().filter((n) => n !== name);
+  names.splice(names.indexOf(target) + (after ? 1 : 0), 0, name);
+  arrangeProjects(names);
+}
+
+// Move a project one place up or down among the projects shown (or to the top).
+function stepProject(name, how) {
+  const shown = projectOrder().filter((n) => !state.collectionInfo[n]?.hidden || state.showHidden.project);
+  const at = shown.indexOf(name);
+  if (how === "top") placeProject(name, shown[0]);
+  else if (how === "up" && at > 0) placeProject(name, shown[at - 1]);
+  else if (how === "down" && at < shown.length - 1) placeProject(name, shown[at + 1], true);
+}
+
+// `names` in this order (order 1, 2, …), or with `reset` back to A–Z.
+async function arrangeProjects(names, reset = false) {
+  names.forEach((n, at) => { if (state.collectionInfo[n]) state.collectionInfo[n].order = reset ? null : at + 1; });
+  drawSidebar();
+  const answer = await post("/api/collections/arrange", { names, reset });
+  if (answer.detail) { say(answer.detail, 8000); loadSidebar(); return; }
+  collectionList = null;
+  if (reset) say("projects back in A–Z order");
+}
+
+async function hideCollections(names, hidden = true) {
+  if (!names.length) return;
+  for (const n of names) if (state.collectionInfo[n]) state.collectionInfo[n].hidden = hidden;
+  drawSidebar();
+  const answer = await post("/api/collections/hide", { names, hidden });
+  if (answer.detail) { say(answer.detail, 8000); loadSidebar(); return; }
+  collectionList = null;
+  const what = names.length === 1 ? `#${names[0]}` : `${names.length} collections`;
+  say(hidden ? `hid ${what} (still found by #name)` : `${what} back in the sidebar`, 8000);
+}
 
 // --- list ------------------------------------------------------------------------
 
@@ -444,14 +551,19 @@ $("list").addEventListener("click", (event) => {
   if (!head || event.target.closest(".grip")) return;
   // Cycle: ascending, descending, back to the default order.
   const id = head.dataset.col, current = layout.sort;
-  layout.sort = current?.col !== id ? { col: id, dir: "asc" }
-    : current.dir === "asc" ? { col: id, dir: "desc" } : null;
+  setSort(current?.col !== id ? { col: id, dir: "asc" }
+    : current.dir === "asc" ? { col: id, dir: "desc" } : null);
+});
+
+// Sort the list by a column ({col, dir}), or null for the default order.
+function setSort(sort) {
+  layout.sort = sort;
   saveLayout();
   const keep = state.items[state.selected]?.id;
   sortItems();
   state.selected = Math.max(0, state.items.findIndex((i) => i.id === keep));
   renderList();
-});
+}
 
 $("list").addEventListener("pointerdown", (event) => {
   const grip = event.target.closest(".grip");
@@ -546,7 +658,7 @@ function select(i, scroll = true) {
     row.classList.toggle("sel", Number(row.dataset.i) === state.selected);
   }
   if (scroll) $("list").querySelector(".row.sel")?.scrollIntoView({ block: "nearest" });
-  renderDetail();
+  return renderDetail();
 }
 
 // Plain click: select one row (and drop any batch selection, as in Finder).
@@ -656,7 +768,9 @@ async function batchAct(name) {
 // --- detail ------------------------------------------------------------------------
 
 let detailToken = 0;
-async function renderDetail() {
+let detailDone = Promise.resolve();   // the detail pane's latest draw (menu actions wait for it)
+function renderDetail() { return (detailDone = drawDetail()); }
+async function drawDetail() {
   if (state.marked.size) { ++detailToken; renderBatch(); return; }
   const item = state.items[state.selected];
   if (!item) { $("detail").innerHTML = ""; return; }
@@ -748,7 +862,7 @@ async function renderDetail() {
     const place = copy?.where === "library" ? "library copy"
       : copy?.shared ? `#${copy.shared} copy · shared with coauthors`
       : [loc.context, loc.topic ?? loc.section].filter(Boolean).join(" · ");
-    html += `<div class="loc"><div>${esc(place)}</div>
+    html += `<div class="loc" data-path="${esc(loc.path)}"><div>${esc(place)}</div>
       <div class="path">${esc(loc.path.split("/").pop())}</div>${marksLine(copy, item.locations.length > 1)}
       <div class="acts">
         <a class="act" href="/file?path=${encodeURIComponent(loc.path)}" target="_blank">open</a>
@@ -962,11 +1076,7 @@ $("detail").addEventListener("submit", (event) => {
 
 $("detail").addEventListener("click", (event) => {
   const el = event.target;
-  if (el.dataset.identify) {
-    const name = el.dataset.identify.split("/").pop();
-    say(`adding ${name} …`, 0);
-    follow(post("/api/identify", { path: el.dataset.identify }), name);
-  }
+  if (el.dataset.identify) identify(el.dataset.identify);
   else if (el.dataset.open) post("/api/open", { path: el.dataset.open });
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
   else if (el.dataset.fileto) openPicker([el.dataset.fileto], "move");
@@ -1007,6 +1117,47 @@ $("detail").addEventListener("click", (event) => {
 });
 
 // --- actions (shared by keys and buttons) -------------------------------------------
+
+// Read a PDF that is on disk but was never read (about $0.001).
+function identify(path) {
+  const name = path.split("/").pop();
+  say(`adding ${name} …`, 0);
+  follow(post("/api/identify", { path }), name);
+}
+
+// One copy of a paper to the macOS Trash (the server refuses the last copy).
+async function trashCopy(path) {
+  if (!confirm(`Move this copy to the Trash?\n\n${path}`)) return;
+  const response = await fetch("/api/trash", { method: "POST",
+    headers: { "Content-Type": "application/json", "X-Refs": "1" },
+    body: JSON.stringify({ path }) });
+  say(response.ok ? "moved to the Trash" : (await response.json()).detail);
+  loadSidebar(); search(state.items[state.selected]?.id ?? null);
+}
+
+// Copy text. `text` may be a promise (BibTeX still being fetched): Safari
+// allows the clipboard only during the click itself, so the write starts
+// now and its contents follow.
+async function copyText(text, message) {
+  try {
+    if (typeof text !== "string" && window.ClipboardItem) {
+      const blob = Promise.resolve(text).then((t) => new Blob([t], { type: "text/plain" }));
+      await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
+    } else {
+      await navigator.clipboard.writeText(await text);
+    }
+    say(typeof message === "function" ? message(await text) : message ?? "copied");
+  } catch {
+    say("could not copy: the browser refused the clipboard", 8000);
+  }
+}
+
+// The BibTeX of these works, one entry after another.
+function copyBibtex(ids) {
+  const text = Promise.all(ids.map((id) => get(`/api/work/${id}`).then((d) => d.bibtex ?? "", () => "")))
+    .then((entries) => entries.filter(Boolean).join("\n"));
+  copyText(text, `copied BibTeX for ${ids.length === 1 ? "1 paper" : `${ids.length} papers`}`);
+}
 
 async function act(name) {
   const item = state.items[state.selected];
@@ -1128,6 +1279,21 @@ async function follow(start, label) {
 // --- adding by drop or paste ---------------------------------------------------------
 
 $("addbutton").addEventListener("click", () => setAdding(true));
+
+// The brand, top left: back to all papers, with the search box emptied (the
+// row selection for a batch stays). A ⌘-click still opens a new tab.
+function goHome() {
+  clearTimeout(typing);
+  state.query = ""; state.collection = null; state.context = null; state.tag = null; state.view = "all";
+  setAdding(false);
+  markSidebar();
+  search();
+}
+$("brand").addEventListener("click", (event) => {
+  if (event.metaKey || event.ctrlKey || event.shiftKey) return;
+  event.preventDefault();
+  goHome();
+});
 
 // A link, DOI, arXiv id or NBER number pasted anywhere (outside a text field)
 // opens the add bar with it filled in; Enter confirms.
@@ -1943,14 +2109,7 @@ $("list").addEventListener("click", async (event) => {
     say("back in the list to review");
     loadSidebar(); search();
   }
-  else if (el.dataset.trash) {
-    if (!confirm(`Move this copy to the Trash?\n\n${el.dataset.trash}`)) return;
-    const response = await fetch("/api/trash", { method: "POST",
-      headers: { "Content-Type": "application/json", "X-Refs": "1" },
-      body: JSON.stringify({ path: el.dataset.trash }) });
-    say(response.ok ? "moved to the Trash" : (await response.json()).detail);
-    loadSidebar(); search();
-  }
+  else if (el.dataset.trash) await trashCopy(el.dataset.trash);
   const counter = $("npicked");
   if (counter) counter.textContent = state.picked.size;
   dlCount();
@@ -2096,7 +2255,10 @@ function collectionsHtml(item) {
 function collectionOrder(list) {
   const terms = list.filter((c) => c.kind === "course" && c.term).map((c) => c.term);
   const now = terms.sort((a, b) => termRank(b) - termRank(a))[0];
-  const rank = (c) => (c.kind === "course" && c.term === now ? 0 : c.kind === "course" ? 2 : 1);
+  // Hidden ones (or parts of a hidden one) last: still there, out of the way.
+  const hidden = new Set(list.filter((c) => c.hidden).map((c) => c.name));
+  const rank = (c) => (hidden.has(topName(c.name)) ? 3
+    : c.kind === "course" && c.term === now ? 0 : c.kind === "course" ? 2 : 1);
   return [...list].sort((a, b) => rank(a) - rank(b)
     || (rank(a) === 2 ? termRank(b.term) - termRank(a.term) : 0) || a.name.localeCompare(b.name));
 }
@@ -2188,52 +2350,445 @@ async function collect(ids, name, add = true) {
 
 // A new project or course, on the page (`refs project new` in the terminal):
 // the "+ new" of the sidebar section it was opened from decides which.
-function renderNewCollection(kind = "project") {
+// `prefill` starts the name ("219a/" for a new part). With `edit` (a
+// collection from the sidebar), the same form changes that one's details.
+function renderNewCollection(kind = "project", prefill = "", edit = null) {
   ++detailToken;
+  if (edit) kind = edit.kind;
   const course = kind === "course";
-  const field = (name, label, hint = "") => `<label><span>${label}</span>
-    <input name="${name}" placeholder="${esc(hint)}" autocomplete="off" spellcheck="false"></label>`;
-  const tick = (name, label) => `<label><span></span><span class="tickline">
-    <input type="checkbox" name="${name}"> ${label}</span></label>`;
-  $("detail").innerHTML = `<h1>New ${kind}</h1>
-    <p class="where">A set of papers, whichever folders their PDFs are in. A paper can be in
-    any number of courses and projects; a / makes a part (${course ? "219a/public-economics" : "bets/lit"}).</p>
+  const field = (name, label, hint = "", value = "") => `<label><span>${label}</span>
+    <input name="${name}" placeholder="${esc(hint)}" value="${esc(value ?? "")}" autocomplete="off" spellcheck="false"></label>`;
+  const tick = (name, label, on = false) => `<label><span></span><span class="tickline">
+    <input type="checkbox" name="${name}"${on ? " checked" : ""}> ${label}</span></label>`;
+  const kinds = `<label><span>kind</span><select name="kind">${["project", "course"].map((k) =>
+    `<option${k === kind ? " selected" : ""}>${k}</option>`).join("")}</select></label>`;
+  $("detail").innerHTML = `<h1>${edit ? `#${esc(edit.name)}` : `New ${kind}`}</h1>
+    <p class="where">${edit ? `Its details. Its papers stay as they are; rename it from its menu (right-click it in the sidebar).`
+      : `A set of papers, whichever folders their PDFs are in. A paper can be in
+    any number of courses and projects; a / makes a part (${course ? "219a/public-economics" : "bets/lit"}).`}</p>
     <form class="edit" id="newcoll">
-      <input type="hidden" name="kind" value="${kind}">
-      ${field("name", "name", course ? "220a, 219a/public-economics" : "bets, thesis")}
-      ${course ? field("term", "term", "2026-fall") : ""}
+      ${edit ? `<input type="hidden" name="name" value="${esc(edit.name)}"><input type="hidden" name="edit" value="1">${kinds}`
+             : `<input type="hidden" name="kind" value="${kind}">
+      ${field("name", "name", course ? "220a, 219a/public-economics" : "bets, thesis", prefill)}`}
+      ${course || edit ? field("term", "term", "2026-fall", edit?.term) : ""}
       ${field("folder", "folder", course ? "optional: phd/coursework/2026-fall/220a/readings"
-                                         : "optional: phd/research/bets/readings")}
+                                         : "optional: phd/research/bets/readings", edit?.folder)}
       ${tick("make_folder", "make the folder")}
-      ${tick("shared", "the folder is shared with coauthors")}
+      ${tick("shared", "the folder is shared with coauthors", edit?.shared)}
       ${field("bib_file", ".bib", course ? "optional: a .bib for the course"
-                                         : "optional: ~/phd/research/bets/overleaf/refs.bib")}
+                                         : "optional: ~/phd/research/bets/overleaf/refs.bib", edit?.bib_file)}
       <div class="acts">
-        <button class="act" type="submit">create</button>
+        <button class="act" type="submit">${edit ? "save" : "create"}</button>
         <button class="act" type="button" data-act="cancel-new">cancel</button>
       </div>
       <p class="bad" id="newcollbad"></p>
     </form>`;
-  $("newcoll").name.focus();
+  const first = $("newcoll").querySelector(edit ? "input[name=term], input[name=folder]" : "input[name=name]");
+  first.focus();
+  first.setSelectionRange?.(first.value.length, first.value.length);
 }
 
 async function createCollection(form) {
-  const f = new FormData(form);
+  const f = new FormData(form), editing = f.has("edit");
+  // Editing: an emptied field clears that detail (""); a new one leaves it out (null).
+  const blank = editing ? "" : null;
   const body = { name: String(f.get("name") ?? "").trim(), kind: f.get("kind"),
-                 term: String(f.get("term") ?? "").trim() || null,
-                 folder: String(f.get("folder") ?? "").trim() || null,
-                 bib_file: String(f.get("bib_file") ?? "").trim() || null,
+                 term: String(f.get("term") ?? "").trim() || blank,
+                 folder: String(f.get("folder") ?? "").trim() || blank,
+                 bib_file: String(f.get("bib_file") ?? "").trim() || blank,
                  make_folder: f.has("make_folder"), shared: f.has("shared") };
   if (!body.name) { $("newcollbad").textContent = "give it a name"; return; }
   const answer = await post("/api/collections/new", body);
   if (answer.detail) { $("newcollbad").textContent = answer.detail; return; }
   collectionList = null;
   const where = answer.entry.folder && !answer.watched ? " (refs does not watch its folder)" : "";
-  say(`new ${answer.entry.kind} #${answer.name}${where}. Add papers with #`, 8000);
+  say(editing ? `saved #${answer.name}${where}` : `new ${answer.entry.kind} #${answer.name}${where}. Add papers with #`, 8000);
   state.collection = answer.name; state.context = null; state.tag = null; state.view = "all";
   await loadSidebar();
   search();
 }
+
+// --- context menus ----------------------------------------------------------------------
+// Right-click anything that has actions of its own: a paper (or the selection),
+// a course or project, a term, a sidebar section, a column header, a file, or
+// a collection or tag in the detail pane. Each kind of thing has one builder
+// (MENUS), which returns a title and its items; an item runs the same code as
+// the button or key that does the same, and shows that key, so the menu also
+// teaches the keys. "." (or ⇧F10) opens the highlighted paper's menu from the
+// keyboard; ↑/↓ choose, Enter runs, Esc closes. In a text field, on selected
+// text, or where nothing has a menu, the browser's own menu appears.
+
+const SEP = { sep: true };
+const ctx = { el: null, items: [], at: -1, anchor: null };
+
+function closeMenu() {
+  ctx.el?.remove();
+  ctx.anchor?.classList.remove("ctxon");
+  Object.assign(ctx, { el: null, items: [], at: -1, anchor: null });
+}
+
+// items: { label, key, run, off (true or the reason), danger } or SEP;
+// false and null are skipped, so a builder can write `cond && {...}`.
+function openMenu(x, y, title, items, anchor = null, keyboard = false) {
+  closeMenu();
+  const list = [];
+  for (const item of items) {
+    if (!item || (item.sep && (!list.length || list[list.length - 1].sep))) continue;
+    list.push(item);
+  }
+  while (list.at(-1)?.sep) list.pop();
+  if (!list.length) return false;
+  const el = document.createElement("div");
+  el.className = "ctx";
+  el.setAttribute("role", "menu");
+  el.innerHTML = (title ? `<div class="ctxtitle" title="${esc(title)}">${esc(title)}</div>` : "") +
+    list.map((item, n) => item.sep ? `<hr>` :
+      `<div class="ctxitem${item.danger ? " danger" : ""}${item.off ? " off" : ""}" role="menuitem" data-n="${n}"${
+        typeof item.off === "string" ? ` title="${esc(item.off)}"` : ""}><span>${esc(item.label)}</span>${
+        item.key ? `<kbd>${esc(item.key)}</kbd>` : ""}</div>`).join("");
+  document.body.appendChild(el);
+  // Keep it inside the window: open to the left of, or above, the pointer when there is no room.
+  const box = el.getBoundingClientRect();
+  el.style.left = `${Math.max(4, x + box.width > innerWidth - 4 ? x - box.width : x)}px`;
+  el.style.top = `${Math.max(4, y + box.height > innerHeight - 4 ? innerHeight - 4 - box.height : y)}px`;
+  anchor?.classList.add("ctxon");
+  Object.assign(ctx, { el, items: list, at: -1, anchor });
+  if (keyboard) moveMenu(1);
+  return true;
+}
+
+function moveMenu(step) {
+  const usable = ctx.items.map((item, n) => (item.sep || item.off ? -1 : n)).filter((n) => n >= 0);
+  if (!usable.length) return;
+  const at = usable.indexOf(ctx.at);
+  ctx.at = usable[at < 0 ? (step > 0 ? 0 : usable.length - 1) : (at + step + usable.length) % usable.length];
+  for (const row of ctx.el.querySelectorAll(".ctxitem")) row.classList.toggle("at", Number(row.dataset.n) === ctx.at);
+}
+
+// Run an item now, inside the click or key press (the clipboard needs that).
+function runMenu(n) {
+  const item = ctx.items[n];
+  if (!item || item.sep || item.off) return;
+  closeMenu();
+  try {
+    Promise.resolve(item.run()).catch((error) => say(String(error?.message ?? error), 8000));
+  } catch (error) { say(String(error?.message ?? error), 8000); }
+}
+
+// A short name for a paper, for a menu's title.
+function workTitle(item) {
+  const who = item.authors?.length ? `${authorsShort(item.authors)} (${item.year ?? "n.d."}) ` : "";
+  return who + (item.title ?? item.locations[0]?.path.split("/").pop() ?? "");
+}
+
+// A paper's menu: what its buttons and keys do. When rows are selected for a
+// batch and this one is not among them, the menu is still about this paper
+// (the selection stays); the pickers then open where the batch's do.
+function rowMenu(row) {
+  const i = Number(row.dataset.i), item = state.items[i];
+  if (!item) return null;
+  if (state.marked.has(item.id)) return batchMenu();
+  const ready = state.selected === i ? detailDone : select(i, false);
+  const w = item.work_id, has = item.locations.length > 0, marks = state.marked.size > 0;
+  const path = item.locations[0]?.path;
+  const here = state.collection && (item.own_collections ?? []).some((n) => n === state.collection
+    || n.startsWith(state.collection + "/"));
+  const after = (fn) => async () => { await ready; fn(); };
+  return { title: workTitle(item), items: [
+    has && { label: "open", key: "⏎", run: () => act("open") },
+    has && { label: "open in Preview", key: "p", run: () => act("preview") },
+    has && { label: "show in Finder", key: "f", run: () => act("reveal") },
+    has && !item.status && { label: "identify it now", run: () => identify(path) },
+    SEP,
+    w && { label: item.queued ? "take off the queue" : "put on the queue", key: "q", run: () => act("queue") },
+    w && { label: item.read_status === "read" ? "mark unread" : "mark read", key: "r", run: () => act("read") },
+    w && item.read_status === "unread" && { label: "mark started", run: () => setRead(item, "reading") },
+    SEP,
+    item.citekey && { label: "copy citekey", key: "y", run: () => copyText(item.citekey, `copied ${item.citekey}`) },
+    item.citekey && { label: "copy \\cite{…}", run: () => copyText(`\\cite{${item.citekey}}`, `copied \\cite{${item.citekey}}`) },
+    w && { label: "copy BibTeX", key: "b", run: () => copyBibtex([w]) },
+    SEP,
+    w && { label: "add to collection…", key: "#",
+           run: after(() => openCollectionPicker([w], marks ? $("batchpicker") : $("collpicker"))) },
+    here && { label: `take out of #${state.collection}`, run: () => collect([w], state.collection, false) },
+    has && { label: "file to…", key: "F", run: after(() => openPicker([path], "move", marks ? $("batchpicker") : null)) },
+    has && { label: "copy to…", key: "C", run: after(() => openPicker([path], "copy", marks ? $("batchpicker") : null)) },
+    SEP,
+    w && !marks && { label: "write a note", key: "n", run: after(() => $("note")?.focus()) },
+    w && !marks && { label: "edit the record", run: after(showEditor) },
+    w && !marks && ["needs-review", "extracted", "imported"].includes(item.status)
+      && { label: "accept the record as is", run: after(() => changeWork("confirm", {}, "accepted as is")) },
+    SEP,
+    { label: marks ? "add to the selection" : "select", key: "x", run: () => { markRow(i, true); paintMarks(); } },
+  ] };
+}
+
+async function setRead(item, status) {
+  const done = await post(`/api/work/${item.work_id}/read`, { status });
+  if (done.detail) { say(done.detail); return; }
+  Object.assign(item, done);
+  say(`${item.citekey}: ${status === "reading" ? "started" : status}`);
+  loadSidebar();
+  if (["unread", "reading", "read"].includes(state.view)) { search(item.id); return; }
+  const keep = state.selected;
+  renderList(); select(keep, false);
+}
+
+// The selection's menu: the batch buttons, plus copying.
+function batchMenu() {
+  const items = [...state.marked.values()];
+  const ids = items.map((i) => i.work_id).filter(Boolean);
+  const keys = items.map((i) => i.citekey).filter(Boolean);
+  const none = !items.some(primaryPath) && "none of them has a PDF yet";
+  return { title: `${items.length} selected`, items: [
+    { label: "file to…", key: "F", off: none, run: () => batchAct("move") },
+    { label: "copy to…", key: "C", off: none, run: () => batchAct("copy") },
+    { label: "add to collection…", key: "#", run: () => batchAct("collect") },
+    state.collection && { label: `take out of #${state.collection}`, run: () => batchAct("uncollect") },
+    SEP,
+    { label: "queue all", run: () => batchAct("queue") },
+    { label: "mark all read", run: () => batchAct("read") },
+    SEP,
+    keys.length && { label: "copy citekeys", run: () => copyText(keys.join(", "), `copied ${keys.length} citekeys`) },
+    keys.length && { label: "copy \\cite{…}", run: () => copyText(`\\cite{${keys.join(", ")}}`, `copied \\cite with ${keys.length} keys`) },
+    ids.length && { label: "copy BibTeX", run: () => copyBibtex(ids) },
+    SEP,
+    { label: "clear the selection", key: "esc", run: clearMarks },
+  ] };
+}
+
+function showCollection(name) {
+  state.collection = name; state.context = null; state.tag = null; state.view = "all";
+  markSidebar(); search();
+}
+
+// A course's or project's menu (and a part's).
+function collectionMenu(el) {
+  const name = el.dataset.collection, c = state.collectionInfo?.[name];
+  if (!c) return null;
+  const top = !name.includes("/"), project = top && c.kind !== "course";
+  const shown = projectOrder().filter((n) => !state.collectionInfo[n]?.hidden || state.showHidden.project);
+  const at = shown.indexOf(name);
+  const folderOnly = c.implicit && "its papers are in it because of their folder: rename or move the folder instead";
+  return { title: `#${name}`, items: [
+    { label: "show its papers", run: () => showCollection(name) },
+    { label: "new part…", run: () => renderNewCollection(state.collectionInfo[topName(name)]?.kind ?? c.kind, name + "/") },
+    SEP,
+    { label: `copy BibTeX (${c.works} ${c.works === 1 ? "paper" : "papers"})`, off: !c.works,
+      run: () => copyText(get(`/api/collections/bibtex?name=${encodeURIComponent(name)}`).then((d) => d.bibtex ?? ""),
+                          `copied BibTeX for #${name}'s ${c.works} papers`) },
+    { label: `copy #${name}`, run: () => copyText(`#${name}`, `copied #${name}`) },
+    SEP,
+    c.folder && { label: "show its folder in Finder", run: () => openCollectionPlace(name, "folder") },
+    c.bib_file && { label: "show its .bib in Finder", run: () => openCollectionPlace(name, "bib") },
+    SEP,
+    project && { label: "move up", off: at <= 0, run: () => stepProject(name, "up") },
+    project && { label: "move down", off: at < 0 || at >= shown.length - 1, run: () => stepProject(name, "down") },
+    project && { label: "move to the top", off: at <= 0, run: () => stepProject(name, "top") },
+    top && { label: c.hidden ? "show in the sidebar" : "hide from the sidebar", run: () => hideCollections([name], !c.hidden) },
+    SEP,
+    { label: "edit details…", run: () => renderNewCollection(c.kind, "", c) },
+    { label: "rename…", off: folderOnly, run: () => renameCollection(c) },
+    { label: "delete…", danger: true, off: folderOnly, run: () => deleteCollection(c) },
+  ] };
+}
+
+async function openCollectionPlace(name, what) {
+  const answer = await post("/api/collections/open", { name, what });
+  if (answer.detail) say(answer.detail, 8000);
+}
+
+async function renameCollection(c) {
+  const typed = prompt(`Rename #${c.name} (its parts follow) to:`, c.name);
+  if (typed == null || !typed.trim() || typed.trim() === c.name) return;
+  const answer = await post("/api/collections/rename", { old: c.name, new: typed.trim() });
+  if (answer.detail) { say(answer.detail, 8000); return; }
+  collectionList = null;
+  const stays = c.from_folders ? "; papers in it because of their folder keep the old name" : "";
+  say(`renamed #${answer.old} to #${answer.name} (${answer.papers} papers)${stays}`, 9000);
+  if (state.collection && (state.collection === answer.old || state.collection.startsWith(answer.old + "/"))) {
+    state.collection = answer.name + state.collection.slice(answer.old.length);
+  }
+  await loadSidebar(); markSidebar(); search();
+}
+
+async function deleteCollection(c) {
+  const papers = c.works === 1 ? "1 paper" : `${c.works} papers`;
+  if (!confirm(`Delete #${c.name}${c.name.includes("/") ? "" : " and its parts"}?\n\n` +
+               `${c.works ? `Its ${papers} leave it but stay in the library` : "It has no papers"}` +
+               `${c.from_folders ? " (papers in it because of their folder stay in it)" : ""}. ` +
+               `Its details (term, folder, .bib) are forgotten; no file is touched.`)) return;
+  const answer = await post("/api/collections/delete", { name: c.name });
+  if (answer.detail) { say(answer.detail, 8000); return; }
+  collectionList = null;
+  say(`deleted #${answer.name} (${answer.papers} papers taken out)`, 8000);
+  if (state.collection && (state.collection === answer.name || state.collection.startsWith(answer.name + "/"))) {
+    state.collection = null; state.view = "all";
+  }
+  await loadSidebar(); markSidebar(); search();
+}
+
+// A term heading: hide or show all its courses at once.
+function termMenu(el) {
+  const term = el.dataset.term || null;
+  const courses = (state.sidebar?.collections ?? [])
+    .filter((c) => !c.name.includes("/") && c.kind === "course" && (c.term ?? null) === term);
+  const shown = courses.filter((c) => !c.hidden).map((c) => c.name);
+  const hidden = courses.filter((c) => c.hidden).map((c) => c.name);
+  const n = (k) => `${k} ${k === 1 ? "course" : "courses"}`;
+  return { title: term ?? "no term", items: [
+    shown.length && { label: `hide its ${n(shown.length)}`, run: () => hideCollections(shown) },
+    hidden.length && { label: `show its ${n(hidden.length)} hidden`, run: () => hideCollections(hidden, false) },
+  ] };
+}
+
+// Projects or Courses (its label, "N hidden" line or "+ new").
+function sectionMenu(el) {
+  const kind = el.dataset.section ?? el.dataset.showHidden ?? el.dataset.newcoll;
+  const tops = (state.sidebar?.collections ?? []).filter((c) => !c.name.includes("/")
+    && (kind === "course" ? c.kind === "course" : c.kind !== "course"));
+  const hidden = tops.filter((c) => c.hidden).map((c) => c.name);
+  return { title: kind === "course" ? "Courses" : "Projects", items: [
+    { label: `new ${kind}…`, run: () => renderNewCollection(kind) },
+    SEP,
+    hidden.length && { label: state.showHidden[kind] ? `fold the ${hidden.length} hidden` : `show the ${hidden.length} hidden`,
+      run: () => { state.showHidden[kind] = !state.showHidden[kind]; drawSidebar(); } },
+    hidden.length && { label: `show all ${hidden.length} in the sidebar again`, run: () => hideCollections(hidden, false) },
+    kind === "project" && { label: "sort A–Z", off: !tops.some((c) => c.order != null) && "they are A–Z already",
+      run: () => arrangeProjects(tops.map((c) => c.name), true) },
+  ] };
+}
+
+// A column header: sort, hide, sizes.
+function columnMenu(el) {
+  const id = el.dataset.col, column = COLUMNS[id];
+  const sorted = layout.sort?.col === id ? layout.sort.dir : null;
+  return { title: column.name ?? column.label, items: [
+    { label: "sort ascending", off: sorted === "asc", run: () => setSort({ col: id, dir: "asc" }) },
+    { label: "sort descending", off: sorted === "desc", run: () => setSort({ col: id, dir: "desc" }) },
+    layout.sort && { label: "default order", run: () => setSort(null) },
+    SEP,
+    { label: "hide this column", off: visibleColumns().length === 1, run: () => {
+      layout.hidden = [...layout.hidden, id];
+      if (layout.sort?.col === id) layout.sort = null;
+      saveLayout(); applyLayout(); sortItems(); renderList(); } },
+    { label: "columns…", run: () => { renderColumnMenu(); $("colmenu").hidden = false; } },
+    layout.widths[id] != null && { label: "reset its width", run: () => {
+      delete layout.widths[id]; saveLayout(); applyLayout(); } },
+    { label: "reset all columns", run: () => {
+      Object.assign(layout, { order: [...DEFAULT_LAYOUT.order], hidden: [], widths: {}, sort: null });
+      saveLayout(); applyLayout(); sortItems(); renderList(); } },
+  ] };
+}
+
+// One PDF of the paper in the detail pane.
+function fileMenu(el) {
+  const path = el.dataset.path, item = state.items[state.selected];
+  const several = (item?.locations.length ?? 0) > 1;
+  const name = path.split("/").pop();
+  return { title: name, items: [
+    { label: "open", run: () => window.open(`/file?path=${encodeURIComponent(path)}`, "_blank") },
+    { label: "open in Preview", run: () => post("/api/open", { path }) },
+    { label: "show in Finder", run: () => post("/api/open", { path, reveal: true }) },
+    SEP,
+    { label: "file to…", run: () => openPicker([path], "move") },
+    { label: "copy to…", run: () => openPicker([path], "copy") },
+    el.querySelector("[data-pull]") && { label: "bring its marks into the library copy", run: () => pullMarks(path) },
+    SEP,
+    { label: "copy the file name", run: () => copyText(name, `copied ${name}`) },
+    SEP,
+    { label: "move this copy to the Trash…", danger: true,
+      off: !several && "the only copy: refs never trashes the last one", run: () => trashCopy(path) },
+  ] };
+}
+
+// A collection chip in the detail pane.
+function chipMenu(el) {
+  const name = el.dataset.collShow, own = el.closest(".chip")?.querySelector("[data-coll-out]");
+  const w = state.items[state.selected]?.work_id;
+  return { title: `#${name}`, items: [
+    { label: "show its papers", run: () => showCollection(name) },
+    w && { label: "take this paper out", off: !own && "it is in it because of its folder", run: () => collect([w], name, false) },
+  ] };
+}
+
+// A tag in the detail pane (or a field in the sidebar).
+function tagMenu(el) {
+  const tag = el.dataset.tag, term = `tag:${tag.replace(/\s+/g, "-")}`;
+  return { title: tag, items: [
+    { label: "show papers with this tag", run: () => {
+      state.tag = tag; state.context = null; state.collection = null; state.view = "all"; markSidebar(); search(); } },
+    { label: "add to the search", run: () => {
+      state.query = [state.query, term].filter(Boolean).join(" "); setAdding(false); search(); } },
+  ] };
+}
+
+// Most specific first: a file inside the detail pane before the pane, etc.
+const MENUS = [
+  ["#detail .loc[data-path]", fileMenu],
+  ["#detail .chip .tag[data-coll-show]", chipMenu],
+  ["#detail .tag[data-tag], #side .nav[data-tag]", tagMenu],
+  ["#list .hc[data-col]", columnMenu],
+  ["#list .row[data-i]", rowMenu],
+  ["#side .nav[data-collection]", collectionMenu],
+  ["#side .group[data-term]", termMenu],
+  ["#side [data-section], #side [data-show-hidden], #side [data-newcoll]", sectionMenu],
+];
+
+document.addEventListener("contextmenu", (event) => {
+  closeMenu();
+  const target = event.target;
+  if (!(target instanceof Element) || $("onboard") || $("help").open) return;
+  if (target.closest("input, textarea, select, [contenteditable]")) return;       // the browser's: paste, spelling
+  const selection = getSelection();
+  if (selection && !selection.isCollapsed && selection.containsNode(target, true)) return;   // copy what you selected
+  for (const [selector, build] of MENUS) {
+    const el = target.closest(selector);
+    if (!el) continue;
+    const menu = build(el);
+    const anchor = el.closest(".nav, .row, .hc, .loc, .group, .label, .tag") ?? el;
+    if (menu && openMenu(event.clientX, event.clientY, menu.title, menu.items, anchor)) event.preventDefault();
+    return;
+  }
+});
+
+// The highlighted paper's menu from the keyboard, under its row.
+function rowMenuFromKeys() {
+  const row = $("list").querySelector(".row.sel");
+  if (!row) return;
+  const menu = rowMenu(row), box = row.getBoundingClientRect();
+  if (menu) openMenu(box.left + 6 * charWidth, box.bottom, menu.title, menu.items, row, true);
+}
+
+// While a menu is open it has the keyboard: ↑/↓ (or j/k) choose, Enter runs,
+// Esc closes; any other key closes it and does what it always does.
+window.addEventListener("keydown", (event) => {
+  if (!ctx.el) return;
+  const moves = { ArrowDown: 1, j: 1, ArrowUp: -1, k: -1 };
+  if (event.key in moves) moveMenu(moves[event.key]);
+  else if (event.key === "Enter" || event.key === " ") runMenu(ctx.at);
+  else if (event.key === "Escape") closeMenu();
+  else { closeMenu(); return; }
+  event.preventDefault();
+  event.stopPropagation();
+}, true);
+window.addEventListener("mousedown", (event) => { if (ctx.el && !ctx.el.contains(event.target)) closeMenu(); }, true);
+window.addEventListener("wheel", (event) => { if (ctx.el && !ctx.el.contains(event.target)) closeMenu(); }, { capture: true, passive: true });
+window.addEventListener("blur", closeMenu);
+window.addEventListener("resize", closeMenu);
+document.addEventListener("mousemove", (event) => {
+  const row = ctx.el && event.target.closest?.(".ctxitem:not(.off)");
+  if (row && Number(row.dataset.n) !== ctx.at) {
+    ctx.at = Number(row.dataset.n);
+    for (const r of ctx.el.querySelectorAll(".ctxitem")) r.classList.toggle("at", r === row);
+  }
+});
+document.addEventListener("click", (event) => {
+  const row = ctx.el && event.target.closest?.(".ctxitem");
+  if (!row) return;
+  event.stopPropagation();          // the page's own click handlers (which close the columns menu) stay out
+  runMenu(Number(row.dataset.n));
+}, true);
 
 // --- keyboard ---------------------------------------------------------------------------
 
@@ -2242,6 +2797,9 @@ const HELP = `keys
   j / k  or  ↓ / ↑     move
   g / G                top / bottom
   /                    search          esc   clear
+  .  or  ⇧F10          this paper's menu (or the selection's): everything you can do with it
+  right-click          a menu for whatever is under the pointer: a paper, a course or project,
+                       a term, a column header, a file, a tag
   enter  or  o         open the pdf in a new tab
   p                    open in Preview
   f                    show in Finder
@@ -2270,6 +2828,12 @@ selecting many
   w                    the folder watcher: what it is reading now, and what it did
   ,                    settings (folders, notes, AI, API key)
   t                    light / dark
+
+sidebar
+
+  drag a project       move it among the projects (or right-click: move up / down)
+  right-click          hide a course or project (a term's courses at once), rename, edit, delete;
+                       "N hidden" at the end of a section shows the hidden ones
 
 review (sidebar)
 
@@ -2323,6 +2887,7 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "/") { event.preventDefault(); setAdding(false); $("q").focus(); $("q").select(); }
   else if (key === "a") { event.preventDefault(); setAdding(true); }
   else if (key === "Enter" || key === "o") act("open");
+  else if (key === "." || (key === "F10" && event.shiftKey)) { event.preventDefault(); rowMenuFromKeys(); }
   else if (key === "p") act("preview");
   else if (key === "f") act("reveal");
   else if (key === "F" || key === "C") {

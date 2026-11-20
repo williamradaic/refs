@@ -628,7 +628,8 @@ def create_app(watch: bool = False) -> FastAPI:
                         x_refs: str | None = Header(default=None)) -> dict:
         """A new collection (or new details for one): `refs project new` on the page."""
         guard(x_refs)
-        folder = (folder or "").strip() or None
+        # None leaves the folder as it is; "" (the edit form, emptied) clears it.
+        folder = folder.strip() if folder is not None else None
         if shared and not folder:
             raise HTTPException(400, "a shared collection needs its shared folder")
         if make_folder and not folder:
@@ -652,6 +653,88 @@ def create_app(watch: bool = False) -> FastAPI:
         collections_moved()                    # a shared folder is watched from now on
         watched = bool(entry["folder"]) and cfg.is_watched(entry["folder"])
         return {"name": name, "entry": entry, "watched": watched}
+
+    @app.post("/api/collections/arrange")
+    def collections_arrange(names: list[str] = Body(embed=True), reset: bool = Body(default=False, embed=True),
+                            x_refs: str | None = Header(default=None)) -> dict:
+        """The sidebar's order of projects: `names` in the order wanted, or
+        with `reset`, back to A–Z for those names."""
+        guard(x_refs)
+        try:
+            if reset:
+                collection.unarrange(cfg, names)
+            else:
+                names = collection.arrange(cfg, names, index.connect(cfg))
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        return {"names": names}
+
+    @app.post("/api/collections/hide")
+    def collections_hide(names: list[str] = Body(embed=True), hidden: bool = Body(default=True, embed=True),
+                         x_refs: str | None = Header(default=None)) -> dict:
+        """Leave collections out of the sidebar, or bring them back. Nothing
+        else changes: their papers, memberships and #name searches stay."""
+        guard(x_refs)
+        try:
+            names = collection.set_hidden(cfg, names, hidden, index.connect(cfg))
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        return {"names": names, "hidden": hidden}
+
+    @app.post("/api/collections/rename")
+    def collections_rename(old: str = Body(embed=True), new: str = Body(embed=True),
+                           x_refs: str | None = Header(default=None)) -> dict:
+        """`refs collection rename` on the page: the collection, its parts and
+        every paper's membership. Papers in it by their folder stay as they are."""
+        guard(x_refs)
+        try:
+            old, new = collection.clean_name(old), collection.clean_name(new)
+            if old == new:
+                raise collection.Invalid("that is its name already")
+            if any(collection.matches(c["name"], new) for c in collection.listing(cfg, index.connect(cfg))):
+                raise collection.Invalid(f"#{new} exists already")
+            count = collection.rename(cfg, old, new)
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        conn = index.connect(cfg)
+        index.refresh_derived(cfg, conn)
+        conn.commit()
+        library_changed()
+        collections_moved()
+        return {"old": old, "name": new, "papers": count}
+
+    @app.get("/api/collections/bibtex")
+    def collections_bibtex(name: str) -> dict:
+        """The BibTeX of every paper in a collection (its parts included)."""
+        try:
+            name = collection.clean_name(name)
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        terms, filters = _split_query([f"#{name}"])
+        all_works = works.load_all(cfg)
+        ids = dict.fromkeys(i["work_id"] for i in index.search(index.connect(cfg), terms, filters, limit=None)
+                            if i["work_id"] in all_works and "meta" in all_works[i["work_id"]])
+        found = sorted((all_works[i] for i in ids), key=lambda w: w["citekey"] or "")
+        return {"name": name, "count": len(found), "bibtex": "\n".join(bib.entry(w) for w in found)}
+
+    @app.post("/api/collections/open")
+    def collections_open(name: str = Body(embed=True), what: str = Body(default="folder", embed=True),
+                         x_refs: str | None = Header(default=None)) -> dict:
+        """Show a collection's folder (or its .bib file) in Finder. Only the
+        places its registry entry names, never a path sent by the page."""
+        guard(x_refs)
+        try:
+            entry = collection.load(cfg).get(collection.clean_name(name))
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        if entry is None:
+            raise HTTPException(404, "that collection has no details saved")
+        place = (cfg.absolute(entry["folder"]) if what == "folder" and entry.get("folder")
+                 else collection.bib_path(cfg, entry) if what == "bib" else None)
+        if place is None or not place.exists():
+            raise HTTPException(404, f"no {'folder' if what == 'folder' else '.bib file'} for #{name} on this Mac")
+        subprocess.run(["open", "-R", str(place)])
+        return {"ok": True}
 
     @app.post("/api/work/{work_id}/edit")
     def edit(work_id: str, fields: dict = Body(embed=True),

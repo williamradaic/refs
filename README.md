@@ -181,7 +181,17 @@ its own (× takes it out) and, dotted, the ones its folder stands for; *add to�
 collects a whole selection. The sidebar lists projects, then courses by
 term; *+ new project* and *+ new course* at the end of each make one, with a
 folder, whether that folder is shared with coauthors, a `.bib` and, for a
-course, its term. In the terminal:
+course, its term. Drag a project to put the projects in your own order.
+
+**Right-click.** Anything with actions of its own has a menu: a paper (or the
+selection: file, collect, queue, copy citekeys, `\cite{…}` or BibTeX), a
+course or project (show its folder or `.bib`, copy its BibTeX, new part, move
+up or down, hide, edit, rename, delete), a term heading (hide all its
+courses), a column header, a file or collection on a paper. Each item shows
+its key where it has one; `.` opens the highlighted paper's menu. A hidden
+course or project keeps its papers and is still found by `#name`; *N hidden*
+at the end of its section shows it again. Order and hiding are saved in
+`collections.json`, so they follow you to your other Macs. In the terminal:
 
 ```sh
 refs project new bets --folder phd/research/bets/readings/lit --shared --bib ~/phd/research/bets/refs.bib

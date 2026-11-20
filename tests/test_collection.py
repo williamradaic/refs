@@ -226,3 +226,60 @@ def test_delete_forgets_the_collection_and_its_parts(lib):
     assert collection.delete(lib.cfg, "219a") == 1
     assert works.load_all(lib.cfg)[salience]["user"]["collections"] == ["thesis"]
     assert set(collection.load(lib.cfg)) == {"thesis"}
+
+
+# --- The sidebar: order and hidden collections ---------------------------------------------
+
+def test_arrange_orders_projects_and_registers_folder_born_ones(lib):
+    collection.change(lib.cfg, [lib.work[SALIENCE]], "thesis")
+    assert collection.arrange(lib.cfg, ["thesis", "bets"], lib.conn) == ["thesis", "bets"]
+    rows = {r["name"]: r for r in collection.listing(lib.cfg, lib.conn)}
+    assert (rows["thesis"]["order"], rows["bets"]["order"]) == (1, 2)
+    # bets existed only through its folder: registered now, with the kind its folder gives it.
+    assert collection.load(lib.cfg)["bets"]["kind"] == "project" and rows["bets"]["from_folders"]
+    collection.unarrange(lib.cfg, ["thesis", "bets"])
+    assert all(r["order"] is None for r in collection.listing(lib.cfg, lib.conn))
+
+
+def test_hidden_collections_keep_their_papers_and_details(lib):
+    collection.register(lib.cfg, "220a", kind="course", term="2026-fall", folder="phd/coursework/2026-fall/220a")
+    assert collection.set_hidden(lib.cfg, ["220a"], True, lib.conn) == ["220a"]
+    rows = {r["name"]: r for r in collection.listing(lib.cfg, lib.conn)}
+    assert rows["220a"]["hidden"] and rows["220a"]["works"] == 1 and rows["220a"]["term"] == "2026-fall"
+    # Hiding a folder-born collection registers it (here a project, from its folder).
+    collection.set_hidden(lib.cfg, ["bets"], True, lib.conn)
+    assert collection.load(lib.cfg)["bets"]["hidden"]
+    # A rename keeps it hidden; showing it again leaves the rest of the entry.
+    collection.rename(lib.cfg, "220a", "econ-220a")
+    assert collection.load(lib.cfg)["econ-220a"]["hidden"]
+    collection.set_hidden(lib.cfg, ["econ-220a"], False)
+    entry = collection.load(lib.cfg)["econ-220a"]
+    assert "hidden" not in entry and entry["folder"] == "phd/coursework/2026-fall/220a"
+
+
+def test_sidebar_endpoints_hide_arrange_rename_and_export(lib):
+    from fastapi.testclient import TestClient
+
+    from refs.web.app import create_app
+
+    H = {"X-Refs": "1"}
+    client = TestClient(create_app())
+    collection.change(lib.cfg, [lib.work[SALIENCE]], "thesis")
+    assert client.post("/api/collections/hide", json={"names": ["thesis"]}).status_code == 403   # no X-Refs
+    assert client.post("/api/collections/hide", json={"names": ["thesis"]}, headers=H).json()["hidden"]
+    assert client.post("/api/collections/arrange", json={"names": ["thesis", "bets"]}, headers=H).json()["names"] \
+        == ["thesis", "bets"]
+    rows = {c["name"]: c for c in client.get("/api/sidebar").json()["collections"]}
+    assert rows["thesis"]["hidden"] and rows["thesis"]["order"] == 1
+    # Rename: refused onto an existing name, else memberships and details follow.
+    assert client.post("/api/collections/rename", json={"old": "thesis", "new": "bets"}, headers=H).status_code == 400
+    answer = client.post("/api/collections/rename", json={"old": "thesis", "new": "job-market"}, headers=H).json()
+    assert answer == {"old": "thesis", "name": "job-market", "papers": 1}
+    rows = {c["name"]: c for c in client.get("/api/sidebar").json()["collections"]}
+    assert rows["job-market"]["hidden"] and "thesis" not in rows
+    assert works.load_all(lib.cfg)[lib.work[SALIENCE]]["user"]["collections"] == ["job-market"]
+    # BibTeX of a collection: every paper in it, folder-born members too.
+    bibtex = client.get("/api/collections/bibtex", params={"name": "bets"}).json()
+    assert bibtex["count"] == 1 and "Procrastination" in bibtex["bibtex"]
+    # Finder: only a place the registry names.
+    assert client.post("/api/collections/open", json={"name": "job-market"}, headers=H).status_code == 404

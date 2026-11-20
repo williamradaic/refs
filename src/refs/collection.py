@@ -104,7 +104,8 @@ def register(cfg: Config, name: str, *, kind: str | None = None, term: str | Non
     Returns its entry. A detail left as None stays as it was. `folder` is
     relative to the library (Dropbox) root. `order` and `label` place a part
     in its course's reading list ("03-demand-estimation-ii" -> 3, "Demand
-    estimation II"). `registry` lets a caller register several and save once.
+    estimation II"); for a project, `order` is its place in the
+    sidebar. `registry` lets a caller register several and save once.
     """
     own = registry is None
     registry = load(cfg) if own else registry
@@ -280,6 +281,53 @@ def rename(cfg: Config, old: str, new: str) -> int:
     return count
 
 
+# --- The sidebar: order and hidden collections --------------------------------------------
+# Both are details on registry entries, so they sync with the library, follow
+# a rename and go with a delete. `order` is a collection's place among its
+# siblings: projects in the sidebar, as a part's `order` is its place in the
+# course's reading list. A folder-derived collection is registered when first
+# placed or hidden, with the kind and term its folders give it.
+
+def _ensure(cfg: Config, registry: dict[str, dict], name: str, derived: dict[str, dict]) -> dict:
+    if name not in registry:
+        found = derived.get(name) or {}
+        register(cfg, name, kind=found.get("kind"), term=found.get("term") or "", registry=registry)
+    return registry[name]
+
+
+def arrange(cfg: Config, names: list[str], conn: sqlite3.Connection | None = None) -> list[str]:
+    """Put collections in this order (order 1, 2, …). Returns the cleaned names."""
+    registry, derived = load(cfg), derived_details(conn) if conn is not None else {}
+    names = list(dict.fromkeys(clean_name(n) for n in names))
+    for at, name in enumerate(names, start=1):
+        _ensure(cfg, registry, name, derived)["order"] = at
+    save(cfg, registry)
+    return names
+
+
+def unarrange(cfg: Config, names: list[str]) -> None:
+    """Forget the order of these collections (they go back to A–Z)."""
+    registry = load(cfg)
+    for name in (clean_name(n) for n in names):
+        registry.get(name, {}).pop("order", None)
+    save(cfg, registry)
+
+
+def set_hidden(cfg: Config, names: list[str], hidden: bool = True,
+               conn: sqlite3.Connection | None = None) -> list[str]:
+    """Hide collections from the sidebar, or show them again. Their papers,
+    memberships and search (#name) are untouched. Returns the cleaned names."""
+    registry, derived = load(cfg), derived_details(conn) if conn is not None else {}
+    names = list(dict.fromkeys(clean_name(n) for n in names))
+    for name in names:
+        if hidden:
+            _ensure(cfg, registry, name, derived)["hidden"] = True
+        elif name in registry:
+            registry[name].pop("hidden", None)
+    save(cfg, registry)
+    return names
+
+
 def delete(cfg: Config, name: str) -> int:
     """Forget a collection and its parts: the registry entries and every paper's
     explicit membership. Returns the number of papers taken out. Papers in it
@@ -304,8 +352,10 @@ def delete(cfg: Config, name: str) -> int:
 def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None) -> list[dict]:
     """Every collection with at least one paper, or registered: name, kind, term,
     folder, shared, bib_file, `works` (papers in it, sub-collections included),
-    `own` (papers in it directly) and `implicit` (true if it exists only
-    because of folders, so it cannot be renamed or emptied from refs).
+    `own` (papers in it directly), `implicit` (true if it exists only
+    because of folders, so it cannot be renamed or emptied from refs),
+    `from_folders` (some papers are in it by their folder) and `hidden`
+    (left out of the sidebar).
     """
     import json
 
@@ -347,6 +397,9 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
             "registered": name in registry,
             "implicit": name not in registry and bool(derived)
                         and not any(name in explicit(w) for w in all_works.values()),
+            # Some papers are in it because of their folder (a rename leaves those).
+            "from_folders": bool(derived),
+            "hidden": bool(entry.get("hidden")),
             "works": len(inside),
             "own": len(members.get(name, set())),
         })
