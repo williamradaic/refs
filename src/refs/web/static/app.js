@@ -230,23 +230,24 @@ function collectionsNav(list) {
     return `<div class="nav" data-collection="${esc(c.name)}" title="#${esc(c.name)}: ${esc(about)}"
       style="padding-left:${4 + 2 * depth}ch"><span>${esc(label)}</span><span class="n">${c.works}</span></div>`;
   };
-  let html = "";
-  // Courses: grouped by term, newest first; courses without a term first.
+  // Each section ends with its own "+ new", which makes one of that kind.
+  const adder = (kind) => `<div class="nav" data-newcoll="${kind}" style="padding-left:4ch">` +
+    `<span>+ new ${kind}</span><span class="n"></span></div>`;
+  // Projects first, by name.
+  let html = `<div class="label">Projects</div>`;
+  for (const c of list.filter((c) => top(c).kind !== "course")) html += entry(c);
+  html += adder("project");
+  // Then courses, grouped by term, newest first; courses without a term first.
   const courses = list.filter((c) => top(c).kind === "course")
     .sort((a, b) => termRank(top(b).term) - termRank(top(a).term) || a.name.localeCompare(b.name));
-  if (courses.length) {
-    html += `<div class="label">Courses</div>`;
-    let term;
-    for (const c of courses) {
-      const t = top(c).term ?? null;
-      if (t !== term) { term = t; html += `<div class="group">${esc(t ?? "no term")}</div>`; }
-      html += entry(c);
-    }
+  html += `<div class="label">Courses</div>`;
+  let term;
+  for (const c of courses) {
+    const t = top(c).term ?? null;
+    if (t !== term) { term = t; html += `<div class="group">${esc(t ?? "no term")}</div>`; }
+    html += entry(c);
   }
-  const projects = list.filter((c) => top(c).kind !== "course");
-  html += `<div class="label">Projects</div>`;
-  for (const c of projects) html += entry(c);
-  html += `<div class="nav" data-newcoll="1" style="padding-left:4ch"><span>+ new</span><span class="n"></span></div>`;
+  html += adder("course");
   return html;
 }
 
@@ -263,7 +264,7 @@ function markSidebar() {
 $("side").addEventListener("click", (event) => {
   const el = event.target.closest(".nav");
   if (!el) return;
-  if (el.dataset.newcoll) { renderNewCollection(); return; }
+  if (el.dataset.newcoll) { renderNewCollection(el.dataset.newcoll); return; }
   state.collection = el.dataset.collection ?? null;
   state.context = el.dataset.context ?? null;
   state.tag = el.dataset.tag ?? null;
@@ -1814,24 +1815,28 @@ async function collect(ids, name, add = true) {
   else renderDetail();
 }
 
-// A new collection, on the page (`refs project new` in the terminal).
-function renderNewCollection() {
+// A new project or course, on the page (`refs project new` in the terminal):
+// the "+ new" of the sidebar section it was opened from decides which.
+function renderNewCollection(kind = "project") {
   ++detailToken;
+  const course = kind === "course";
   const field = (name, label, hint = "") => `<label><span>${label}</span>
     <input name="${name}" placeholder="${esc(hint)}" autocomplete="off" spellcheck="false"></label>`;
   const tick = (name, label) => `<label><span></span><span class="tickline">
     <input type="checkbox" name="${name}"> ${label}</span></label>`;
-  $("detail").innerHTML = `<h1>New collection</h1>
-    <p class="where">A course or a project: a set of papers, whichever folders their PDFs are in.
-    A paper can be in any number of them; a / makes a part (219a/public-economics).</p>
+  $("detail").innerHTML = `<h1>New ${kind}</h1>
+    <p class="where">A set of papers, whichever folders their PDFs are in. A paper can be in
+    any number of courses and projects; a / makes a part (${course ? "219a/public-economics" : "bets/lit"}).</p>
     <form class="edit" id="newcoll">
-      ${field("name", "name", "bets, 220a, 219a/public-economics")}
-      <label><span>kind</span><select name="kind"><option>project</option><option>course</option></select></label>
-      ${field("term", "term", "2026-fall (a course's term)")}
-      ${field("folder", "folder", "optional: phd/research/bets/readings")}
+      <input type="hidden" name="kind" value="${kind}">
+      ${field("name", "name", course ? "220a, 219a/public-economics" : "bets, thesis")}
+      ${course ? field("term", "term", "2026-fall") : ""}
+      ${field("folder", "folder", course ? "optional: phd/coursework/2026-fall/220a/readings"
+                                         : "optional: phd/research/bets/readings")}
       ${tick("make_folder", "make the folder")}
       ${tick("shared", "the folder is shared with coauthors")}
-      ${field("bib_file", ".bib", "optional: ~/phd/research/bets/overleaf/refs.bib")}
+      ${field("bib_file", ".bib", course ? "optional: a .bib for the course"
+                                         : "optional: ~/phd/research/bets/overleaf/refs.bib")}
       <div class="acts">
         <button class="act" type="submit">create</button>
         <button class="act" type="button" data-act="cancel-new">cancel</button>

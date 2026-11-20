@@ -175,9 +175,10 @@ their PDFs are. A paper can be in any number of them, and a slash makes a part
 (`219a/public-economics`, included in `219a`). On a paper, *Collections* lists
 its own (× takes it out) and, dotted, the ones its folder stands for; *add to…*
 (`#`) puts it in one, or in a new one if you type a new name. The same key
-collects a whole selection. The sidebar lists courses by term, then projects;
-*+ new* makes one with its details (kind, term, a folder, whether that folder
-is shared with coauthors, the project's `.bib`). In the terminal:
+collects a whole selection. The sidebar lists projects, then courses by
+term; *+ new project* and *+ new course* at the end of each make one, with a
+folder, whether that folder is shared with coauthors, a `.bib` and, for a
+course, its term. In the terminal:
 
 ```sh
 refs project new bets --folder phd/research/bets/readings/lit --shared --bib ~/phd/research/bets/refs.bib

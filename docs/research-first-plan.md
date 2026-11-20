@@ -171,7 +171,7 @@ Feel free to revise implementation details.
 - CLI: `refs collection [list|add|remove|rename|new|delete]`,
   `refs project new`, `refs bib --library`, `refs bib '#x' --append` (the
   collection's .bib). Collection .bib files also feed `bibkeys`.
-- Page: collections in the sidebar (courses by term, projects, `+ new`),
+- Page: collections in the sidebar (projects, then courses by term; each with its own `+ new`),
   chips on a paper, a picker (`#`) for a paper or a selection, "take out of",
   delete an empty collection.
 - `librarybib.py`: `<state>/library.bib`, JabRef `file` format, relative path,
