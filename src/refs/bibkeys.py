@@ -23,13 +23,17 @@ from .config import Config
 
 
 def bib_paths(cfg: Config) -> list[Path]:
-    """The .bib files the `bib_files` patterns point to.
+    """The .bib files the `bib_files` patterns, and the collections, point to.
 
     A pattern starting with "~" or "/" is a path on this Mac; anything else is
     relative to the Dropbox root. `**` matches any depth of folders.
     """
+    from . import collection
+
     found: set[Path] = set()
-    for pattern in cfg.bib_files:
+    # Also the .bib file of each registered collection (`refs project new --bib`).
+    own = [e["bib_file"] for e in collection.load(cfg).values() if e.get("bib_file")]
+    for pattern in [*cfg.bib_files, *own]:
         base = os.path.expanduser(pattern) if pattern.startswith(("~", "/")) \
             else str(cfg.dropbox_root / pattern)
         for match in glob.glob(base, recursive=True):

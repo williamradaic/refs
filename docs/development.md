@@ -47,6 +47,8 @@ there unless you mean to pay for it.
 | `settings.py` | the settings page's back end: checks a change, writes it with tomlkit (comments kept) |
 | `onboarding.py` | first run: library candidates, the folder survey, private-folder and term-rule suggestions |
 | `contexts.py` | folders → course or project (`Layout`: own rules, a preset, a generic rule per watched folder) |
+| `collection.py` | collections (courses, projects): the registry, memberships on works, the collections folders stand for |
+| `librarybib.py` | `library.bib`, every work with its PDF and collections, rewritten by the watcher's process |
 | `storage.py`, `scan.py` | walk the watched folders, hash, reconcile with the index |
 | `index.py`, `embed.py` | the SQLite index (a rebuildable cache) and semantic search |
 | `extract.py`, `llm.py`, `resolve.py`, `pipeline.py` | reading a PDF: text and identifiers, Claude Haiku's transcription, registry lookup, status |
@@ -74,6 +76,7 @@ A file is its content (SHA-256 hash), not its path. One scan classifies every PD
 | New path, known content, old path vanished | hash | moved |
 | New path, known content, old path still there | hash | copy |
 | Same path, new content | hash; new version points to the old | modified |
+| New path, inode of a vanished path, new content | moved, then edited between scans; new version points to the old | moved + modified |
 
 ## How metadata is produced
 
@@ -100,7 +103,7 @@ have no usable registry record and end as extracted or needs-review.
 | Settings | `~/.config/refs/config.toml` (`.bak` = the version before the last save) |
 | Index (rebuildable cache), search vectors, Haiku answers, reading ledger | `~/Library/Application Support/refs/index.db` |
 | Search model (about 70 MB, downloaded once), registry cache | `~/Library/Caches/refs/` |
-| Works, read records, rename journal, `review.json` (synced) | `<library>/<state_dir>/`, `.refs/` by default |
+| Works, read records, rename journal, `review.json`, `collections.json`, `library.bib` (synced) | `<library>/<state_dir>/`, `.refs/` by default |
 | Reading notes | `<vault>/<obsidian_folder>/<citekey>.md` |
 | API key | macOS Keychain, item `refs` |
 | Login service, log | `~/Library/LaunchAgents/com.williamradaic.refs.plist`, `~/Library/Logs/refs.log` |
@@ -111,6 +114,33 @@ would get wrong, and teach `records.read_json` to upgrade older files. refs
 never overwrites a file from a newer version (`records.NewerData`), so an old
 copy on a second Mac cannot undo a newer one's data. The index has its own
 `SCHEMA_VERSION` and is simply rebuilt when it changes.
+
+## Collections
+
+A work's collections are two lists, merged wherever they are shown:
+
+- **explicit**, `user.collections` in the work file: what you put it in. Kept
+  apart from `tags` (the model's fields and topics) and `user.tags` (free tags,
+  from Zotero).
+- **from folders**: each PDF's context (`contexts.py`) stands for a collection
+  of the same name, `collection.implicit()` (`phd/coursework/2026-fall/220a` →
+  `220a`, a course). These keep courses and projects working while readings
+  still live in course folders; they cannot be removed except by moving the file.
+
+`index.refresh_derived` writes the merged list, per work, into
+`files.collections` (an added column, so no rebuild), and the `#name` /
+`collection:` / `course:` / `project:` filters read it; a parent matches its
+parts. A page or CLI change updates the column at once
+(`index.update_collections`), without a scan. `collections.json` (the
+registry) holds only details: kind, term, folder, shared, `bib_file`. A name
+can have members without an entry.
+
+`library.bib` runs in the watching process only (one per Mac): the watcher
+pokes it after a pass that changed anything, the page after any edit, and it
+compares a fingerprint of the work files once a minute for changes from the
+command line or another Mac. The `file` field is JabRef's `:path:PDF` with a
+path relative to the .bib; the PDF is the copy in the quick-add (library)
+folder when there is one.
 
 ## Calibration
 

@@ -251,3 +251,41 @@ def test_an_index_missing_a_column_is_still_upgraded(lib):
     conn.close()
     have = {r["name"] for r in index.connect(cfg).execute("PRAGMA table_info(files)")}
     assert "queued" in have
+
+
+def test_move_then_edit_between_scans_is_one_file(lib):
+    # Filed into a course folder, then annotated, all while refs was not
+    # looking: the inode survives, size and time do not.
+    lib.write("papers-dump/blp.pdf", b"blp content")
+    lib.scan()
+    old_hash = lib.conn.execute("SELECT hash FROM paths").fetchone()["hash"]
+    target = lib.root / BLP
+    target.parent.mkdir(parents=True)
+    os.rename(lib.root / "papers-dump/blp.pdf", target)
+    with target.open("ab") as handle:                    # same inode, new bytes
+        handle.write(b", now with highlights")
+
+    report = lib.scan()
+    assert report.moved == [("papers-dump/blp.pdf", BLP)]
+    assert report.modified == [BLP]
+    assert report.added == [] and report.removed == []
+    row = lib.conn.execute(
+        "SELECT f.hash, f.supersedes FROM paths p JOIN files f ON f.hash = p.hash").fetchone()
+    assert row["hash"] != old_hash and row["supersedes"] == old_hash
+    kinds = [r["kind"] for r in lib.conn.execute("SELECT kind FROM events ORDER BY id")]
+    assert kinds[-2:] == ["moved", "modified"]
+
+
+def test_new_file_with_known_content_is_not_taken_for_a_moved_edit(lib):
+    # B4 applies only to new content: a vanished path whose inode turns up
+    # holding bytes refs already knows is an ordinary move by content.
+    lib.write("papers-dump/a.pdf", b"first")
+    lib.write("papers-dump/b.pdf", b"second")
+    lib.scan()
+    (lib.root / "papers-dump/b.pdf").unlink()
+    os.rename(lib.root / "papers-dump/a.pdf", lib.root / "papers-dump/c.pdf")
+    (lib.root / "papers-dump/c.pdf").write_bytes(b"second")   # same inode, b's bytes
+
+    report = lib.scan()
+    assert report.modified == []
+    assert lib.paths() == {"papers-dump/c.pdf"}

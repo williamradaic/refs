@@ -17,8 +17,8 @@ already in the library.
 
 To learn this library: `refs status --json` gives the library folder, the
 watched folders (`roots`), the quick-add folder (`dump`), the folders whose
-text must never go to an AI (`never_sent_to_ai`) and totals; `refs contexts
---json` lists the courses and projects. If `refs` says it is not set up, tell
+text must never go to an AI (`never_sent_to_ai`) and totals; `refs collection
+list --json` lists the courses and projects (collections). If `refs` says it is not set up, tell
 the user to run `refs init` (or open the page); do not set it up for them.
 
 ## Finding papers
@@ -26,7 +26,7 @@ the user to run `refs init` (or open the page); do not set it up for them.
 ```sh
 refs find <words> [filters] --json          # best matches first; default limit 50
 refs find berry levinsohn pakes --json --limit 3
-refs find course:<slug> kind:paper --json --all
+refs find collection:<name> kind:paper --json --all
 ```
 
 Words match title, authors, author initials ("blp"), citekeys, file names,
@@ -34,8 +34,10 @@ tags, descriptions and the user's reading notes, as prefixes. A query of
 several words is also matched by meaning (a local embedding model, free), so a
 description works: `refs find paper on misperceived nonlinear tax schedules
 --json`. Field abbreviations such as `IO`, `PF`, `RDD` match their spelled-out
-tags. Filters: `course:` / `project:` (the folder slug that `refs contexts`
-shows), `term:` (`2026-fall`), `area:`, `in:` (context contains), `topic:`,
+tags. Filters: `collection:<name>` (also written `#<name>`, quoted in a shell:
+a course or project; `219a` includes its parts such as `219a/public-economics`),
+`course:` / `project:` (a collection, or a folder name), `term:` (`2026-fall`),
+`area:`, `in:` (context contains), `topic:`,
 `kind:` (`paper`, `book`, `chapter`, `slides`, `syllabus`, `notes`,
 `problem-set`, ...), `year:`, `author:`, `tag:`, `status:`, `read:` (`read`,
 `reading`, `unread`), `queued:yes`.
@@ -44,8 +46,8 @@ Each JSON result has `title`, `authors` (surnames), `year`, `venue`, `doi`,
 `citekey`, `status`, `kind`, `tags`, `description` (a short summary written
 from the paper itself), `read_status` (set by the user, or detected from their
 highlights in the PDF), `queued` (when they put it on their reading queue, or
-null) and `locations` (`path` relative to the library folder, plus `context`
-and `topic`). Library works have a `citekey`; course material such as slides
+null), `collections` (the courses and projects it belongs to) and `locations`
+(`path` relative to the library folder, plus `context` and `topic`). Library works have a `citekey`; course material such as slides
 has none.
 
 `status` says how far to trust the metadata: `verified` (a registry record
@@ -65,7 +67,8 @@ Other read-only commands:
 ```sh
 refs path <query>       # absolute path of the best match (to read the PDF)
 refs open <query>       # open it in the default PDF viewer (only when asked to show it)
-refs contexts --json    # the courses and projects refs knows
+refs collection list --json   # collections: name, kind, term, folder, shared, bib_file, works
+refs contexts --json    # the folders refs reads courses and projects from
 refs wanted             # papers saved without a PDF yet
 refs status             # the library's folders and totals
 refs doctor --offline   # whether refs is set up and working
@@ -76,7 +79,8 @@ refs doctor --offline   # whether refs is set up and working
 ```sh
 refs bib <query>                       # BibTeX of the best match
 refs bib <query> --limit 5             # several matches
-refs bib project:<slug>                # every work filed under a project
+refs bib collection:<name>             # every work in a collection (course or project)
+refs bib collection:<name> --append    # into the collection's own .bib file, if it has one
 refs bib <query> --append path/to/references.bib
 ```
 
@@ -111,6 +115,23 @@ attaches itself when the PDF later lands in the quick-add folder. Run it when
 asked to save or add a paper. A PDF saved into the quick-add folder by any
 other means is picked up by the running refs service on its own, so there is
 no need to call `add` for it.
+
+## Collections
+
+A paper belongs to any number of collections (courses and projects), whatever
+folder its PDF is in. Put a paper in one when the user asks (for instance "add
+this to my bets reading list"):
+
+```sh
+refs collection add <name> <search>      # the best match; --all for every match
+refs collection remove <name> <search>
+refs project new <name> [--course --term 2026-fall] [--folder F] [--shared] [--bib F]
+```
+
+A new name makes a new collection, so check the existing names first
+(`refs collection list --json`) rather than inventing a near-duplicate.
+`library.bib` in refs' folder holds every paper with its PDF and collections;
+it is for the user's other reference managers, not for citing (use `refs bib`).
 
 ## The reading queue
 

@@ -18,7 +18,7 @@ import re
 import sqlite3
 from pathlib import PurePosixPath
 
-from . import contexts, embed, naming, notes, query, reading, records, works
+from . import collection, contexts, embed, naming, notes, query, reading, records, works
 from .config import Config
 
 # Bump when the tables change. An older index is simply dropped and rebuilt.
@@ -49,8 +49,9 @@ CREATE TABLE IF NOT EXISTS files (
     marked_pages INTEGER,           --   carry your marks, and the marks; NULL = not
     marks       INTEGER,            --   counted yet. Counted once per content.
     read_status TEXT,               -- the work's read status and queue time, copied
-    queued      TEXT                --   from its work file for the read:/queued: filters
-);
+    queued      TEXT,               --   from its work file for the read:/queued: filters
+    collections TEXT                -- JSON list: the work's collections, yours and the
+);                                  --   ones its folders stand for (collection.py)
 
 CREATE TABLE IF NOT EXISTS paths (
     path        TEXT PRIMARY KEY,   -- relative to the Dropbox root
@@ -136,7 +137,7 @@ def connect(cfg: Config) -> sqlite3.Connection:
 
 # Columns of `files` newer than the table itself (added by connect()).
 ADDED_COLUMNS = [("pages", "INTEGER"), ("marked_pages", "INTEGER"), ("marks", "INTEGER"),
-                 ("read_status", "TEXT"), ("queued", "TEXT")]
+                 ("read_status", "TEXT"), ("queued", "TEXT"), ("collections", "TEXT")]
 
 # What connect() creates, so it can tell, by reading only, that there is nothing to do.
 _TABLES = {"meta", "files", "paths", "events", "search", "vectors"}
@@ -296,6 +297,25 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
     file_to_work = works.sync(cfg)          # also writes new or changed work files
     all_works = works.load_all(cfg)
     note_text = notes.bodies(cfg)           # your reading notes, by citekey
+
+    # Collections (collection.py). A work is in the collections its PDFs'
+    # folders stand for, wherever each PDF is, and in those you put it in.
+    # Worked out per work first, so every file of a work carries the same
+    # list and a filter finds the work through any of its files.
+    def owner(file_hash: str) -> str:
+        versions = _ancestors(file_hash, supersedes)
+        return next((file_to_work[h] for h in versions if h in file_to_work), None) or file_hash
+    from_folders: dict[str, dict[str, None]] = {}       # work id (or hash) -> names, in order
+    for file_hash, located in by_hash.items():
+        names = from_folders.setdefault(owner(file_hash), {})
+        for _, ctx in located:
+            if (found := collection.implicit(ctx)) is not None:
+                names[found[0]] = None
+
+    def collections_of(work_id: str | None, file_hash: str) -> list[str]:
+        mine = collection.explicit(all_works.get(work_id) or {}) if work_id else []
+        return list(dict.fromkeys([*mine, *from_folders.get(work_id or file_hash, {})]))
+
     conn.execute("DELETE FROM search")
     for file_hash, located in by_hash.items():
         guesses = [(naming.parse_filename(PurePosixPath(p).name), p, ctx) for p, ctx in located]
@@ -343,18 +363,21 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
             title, year = meta.get("title") or title, meta.get("year") or year
             authors = [a["family"] for a in meta.get("authors") or [] if a.get("family")] or authors
             venue, doi, status = meta.get("venue"), meta.get("doi"), meta.get("status")
-            tags = list(dict.fromkeys([*tags, *work["user"].get("tags", []),
-                                       *work["user"].get("collections", [])]))   # no repeats, order kept
+            # Your own tags join the model's (no repeats, order kept); collections
+            # are kept apart, in their own column (collection.py).
+            tags = list(dict.fromkeys([*tags, *work["user"].get("tags", [])]))
             ids.update({f"alias{n}": a for n, a in enumerate(
                 [*work.get("aliases", []), *work.get("bib_keys", {})])})
             former_names = work["user"].get("former_names", [])
 
         conn.execute(
             "UPDATE files SET g_title=?, g_authors=?, g_year=?, g_ids=?, kind=?, kind_source=?, "
-            "status=?, venue=?, doi=?, description=?, tags=?, work_id=?, citekey=? WHERE hash=?",
+            "status=?, venue=?, doi=?, description=?, tags=?, work_id=?, citekey=?, collections=? "
+            "WHERE hash=?",
             (title, json.dumps(authors, ensure_ascii=False), year, json.dumps(ids), kind,
              kind_source, status, venue, doi, description,
-             json.dumps(tags, ensure_ascii=False), work_id, citekey, file_hash),
+             json.dumps(tags, ensure_ascii=False), work_id, citekey,
+             json.dumps(collections_of(work_id, file_hash), ensure_ascii=False), file_hash),
         )
 
         # 3. One search row per file. `aliases` holds author initials, so that
@@ -370,7 +393,8 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
                 " ".join(filter(None, [initials, citekey, *ids.values()])),
                 " ".join([*(PurePosixPath(p).stem for p, _ in located),
                           *(PurePosixPath(n).stem for n in former_names)]),
-                " ".join(f"{ctx.key} {ctx.topic or ''} {ctx.section or ''}" for _, ctx in located),
+                " ".join([*(f"{ctx.key} {ctx.topic or ''} {ctx.section or ''}" for _, ctx in located),
+                          *collections_of(work_id, file_hash)]),
                 venue or "",
                 " ".join(tags),
                 description or "",
@@ -390,16 +414,16 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
             continue
         meta, user = work["meta"], work["user"]
         authors = [a["family"] for a in meta.get("authors") or [] if a.get("family")]
-        tags = list(dict.fromkeys([*work.get("tags", []), *user.get("tags", []),
-                                   *user.get("collections", [])]))
+        tags = list(dict.fromkeys([*work.get("tags", []), *user.get("tags", [])]))
         conn.execute(
             "INSERT INTO files (hash, size, first_seen, work_id, citekey, kind, kind_source, "
             "g_title, g_authors, g_year, g_ids, status, venue, doi, description, tags, "
-            "read_status, queued) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "read_status, queued, collections) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (f"work:{work_id}", 0, work["created"], work_id, work["citekey"], meta.get("kind"),
              "work", meta.get("title"), json.dumps(authors, ensure_ascii=False), meta.get("year"),
              "{}", "no-file", meta.get("venue"), meta.get("doi"), work.get("description"),
-             json.dumps(tags, ensure_ascii=False), reading.effective(work)[0], user.get("queued")),
+             json.dumps(tags, ensure_ascii=False), reading.effective(work)[0], user.get("queued"),
+             json.dumps(collection.explicit(work), ensure_ascii=False)),
         )
         initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
         conn.execute(
@@ -408,18 +432,37 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
             (f"work:{work_id}", meta.get("title") or "", " ".join(authors),
              " ".join(filter(None, [initials, work["citekey"], *work.get("aliases", []),
                                     *work.get("bib_keys", {})])),
-             "", "", meta.get("venue") or "", " ".join(tags), work.get("description") or "",
+             "", " ".join(collection.explicit(work)), meta.get("venue") or "", " ".join(tags),
+             work.get("description") or "",
              note_text.get(work["citekey"], "")),
         )
     return finished
 
 
+def update_collections(conn: sqlite3.Connection, work: dict) -> list[str]:
+    """Copy a work's collections into the index after you changed them, so
+    filters see the change at once (no scan). Returns the work's full list."""
+    names: dict[str, None] = dict.fromkeys(collection.explicit(work))
+    for row in conn.execute("SELECT DISTINCT p.context, p.area, p.term, p.slug FROM paths p "
+                            "JOIN files f ON f.hash = p.hash WHERE f.work_id = ?", (work["id"],)):
+        ctx = contexts.Context(row["context"], row["area"] or "", row["term"], row["slug"])
+        if (found := collection.implicit(ctx)) is not None:
+            names[found[0]] = None
+    conn.execute("UPDATE files SET collections=? WHERE work_id=?",
+                 (json.dumps(list(names), ensure_ascii=False), work["id"]))
+    conn.commit()
+    return list(names)
+
+
 # --- Queries --------------------------------------------------------------------
 
 # `key:value` filters accepted by search(), mapped to what they compare against.
-FILTER_ALIASES = {"course": "slug", "project": "slug", "in": "context"}
+# `#220a` is `collection:220a` (cli._split_query). course: and project: name a
+# collection too, and also still match the folder's own name (slug).
+FILTER_ALIASES = {"in": "context"}
 PATH_FILTERS = {"slug", "term", "area", "context", "topic", "section"}
-FILE_FILTERS = {"kind", "year", "author", "status", "tag", "read", "queued"}
+FILE_FILTERS = {"kind", "year", "author", "status", "tag", "read", "queued", "collection",
+                "course", "project"}
 
 
 def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
@@ -442,6 +485,7 @@ def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
         "read_status": row["read_status"],
         "queued": row["queued"],
         "first_seen": row["first_seen"],      # when refs first indexed this content
+        "collections": json.loads(row["collections"] or "[]"),
         "locations": [
             {
                 "path": loc["path"], "context": loc["context"], "area": loc["area"],
@@ -580,6 +624,16 @@ def search(
                 return False
             if key == "queued" and bool(row["queued"]) != (wanted in {"yes", "true", "1"}):
                 return False
+            if key in {"collection", "course", "project"}:
+                have = json.loads(row["collections"] or "[]")
+                # Several #names (joined with commas) must all hold; a parent
+                # takes in its sub-collections.
+                for name in wanted.split(","):
+                    in_it = any(collection.matches(n, name) for n in have)
+                    by_folder = key != "collection" and any((loc["slug"] or "").lower() == name
+                                                            for loc in locs)
+                    if not (in_it or by_folder):
+                        return False
             if key in PATH_FILTERS:
                 def hit(loc: sqlite3.Row) -> bool:
                     value = (loc[key] or "").lower()

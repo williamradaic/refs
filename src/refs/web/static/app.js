@@ -4,7 +4,8 @@
 const state = {
   query: "",          // what is typed in the search bar
   view: "all",        // sidebar preset: all | queue | unread | reading | read | review | wanted | renames | copies | downloads
-  context: null,      // selected course or project key, e.g. "coursework/2026-fall/220a"
+  context: null,      // selected folder key, e.g. "dump" or "referee/econometrica"
+  collection: null,   // selected collection (course or project), e.g. "220a" or "219a/public-economics"
   tag: null,          // selected field tag
   scope: "library",   // "library" = papers only, "all" = course material too
   items: [],          // current search results
@@ -168,23 +169,26 @@ async function loadSidebar() {
   // that arrived through Finder). Shown only when there are some.
   if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
 
-  // Contexts arrive as keys like "coursework/2026-fall/220a", each with its
-  // area and term. The layout (contexts.py) says which areas get a heading of
-  // their own, in order; within an area that has terms, group by term, newest
-  // first.
+  // Folders that are not collections (the quick-add folder; anything the
+  // layout does not read as a course or project) arrive as keys like
+  // "referee/econometrica", each with its area and term. The layout
+  // (contexts.py) says which areas get a heading of their own, in order;
+  // within an area that has terms, group by term, newest first.
   const areas = {};
-  for (const { key, count, area, term } of data.contexts) {
+  for (const { key, count, area, term, collection } of data.contexts) {
+    if (collection) continue;                      // listed above, as a collection
     const name = area ?? key.split("/")[0];
     const rest = key.split("/").slice(1);          // the key below the area
     (areas[name] ??= []).push({ key, rest, count, term });
   }
   const listed = ["dump", ...data.areas];
+  // The quick-add folder, then collections (collection.py): courses by term,
+  // newest first, then projects. A sub-collection (219a/public-economics)
+  // sits under its parent and goes with the parent's term.
+  if (areas.dump) html += nav(state.dump, areas.dump[0].count, `data-context="dump"`);
+  html += collectionsNav(data.collections ?? []);
   for (const area of listed) {
-    if (!areas[area]) continue;
-    if (area === "dump") {
-      html += nav(state.dump, areas.dump[0].count, `data-context="dump"`);
-      continue;
-    }
+    if (!areas[area] || area === "dump") continue;
     html += `<div class="label">${esc(area)}</div>`;
     let term = null;
     const termed = areas[area].some((c) => c.term);
@@ -215,11 +219,44 @@ async function loadSidebar() {
   markSidebar();
 }
 
+function collectionsNav(list) {
+  const byName = Object.fromEntries(list.map((c) => [c.name, c]));
+  const top = (c) => byName[c.name.split("/")[0]] ?? c;
+  const entry = (c) => {
+    const depth = c.name.split("/").length - 1;
+    const label = c.name.split("/").pop() + (c.shared ? " ⇄" : "");
+    const about = [c.kind, c.term, c.shared ? "shared with coauthors" : "", c.implicit ? "from its folder" : "",
+                   c.folder ? `folder ${c.folder}` : ""].filter(Boolean).join(" · ");
+    return `<div class="nav" data-collection="${esc(c.name)}" title="#${esc(c.name)}: ${esc(about)}"
+      style="padding-left:${4 + 2 * depth}ch"><span>${esc(label)}</span><span class="n">${c.works}</span></div>`;
+  };
+  // Each section ends with its own "+ new", which makes one of that kind.
+  const adder = (kind) => `<div class="nav" data-newcoll="${kind}" style="padding-left:4ch">` +
+    `<span>+ new ${kind}</span><span class="n"></span></div>`;
+  // Projects first, by name.
+  let html = `<div class="label">Projects</div>`;
+  for (const c of list.filter((c) => top(c).kind !== "course")) html += entry(c);
+  html += adder("project");
+  // Then courses, grouped by term, newest first; courses without a term first.
+  const courses = list.filter((c) => top(c).kind === "course")
+    .sort((a, b) => termRank(top(b).term) - termRank(top(a).term) || a.name.localeCompare(b.name));
+  html += `<div class="label">Courses</div>`;
+  let term;
+  for (const c of courses) {
+    const t = top(c).term ?? null;
+    if (t !== term) { term = t; html += `<div class="group">${esc(t ?? "no term")}</div>`; }
+    html += entry(c);
+  }
+  html += adder("course");
+  return html;
+}
+
 function markSidebar() {
   for (const el of $("side").querySelectorAll(".nav")) {
-    const on = el.dataset.context ? el.dataset.context === state.context
+    const on = el.dataset.collection ? el.dataset.collection === state.collection
+      : el.dataset.context ? el.dataset.context === state.context
       : el.dataset.tag ? el.dataset.tag === state.tag
-      : !state.context && !state.tag && el.dataset.view === state.view;
+      : !state.context && !state.tag && !state.collection && el.dataset.view === state.view;
     el.classList.toggle("on", on);
   }
 }
@@ -227,6 +264,8 @@ function markSidebar() {
 $("side").addEventListener("click", (event) => {
   const el = event.target.closest(".nav");
   if (!el) return;
+  if (el.dataset.newcoll) { renderNewCollection(el.dataset.newcoll); return; }
+  state.collection = el.dataset.collection ?? null;
   state.context = el.dataset.context ?? null;
   state.tag = el.dataset.tag ?? null;
   state.view = el.dataset.view ?? "all";
@@ -251,9 +290,12 @@ let listToken = 0;
 // local results look unsure, or when it starts with "?".
 async function search(keepId = null, ask = "off") {
   const token = ++listToken;
-  if (REVIEW_VIEWS[state.view] && !state.context && !state.tag) return REVIEW_VIEWS[state.view](token);
+  if (REVIEW_VIEWS[state.view] && !state.context && !state.tag && !state.collection) {
+    return REVIEW_VIEWS[state.view](token);
+  }
   // The sidebar selection becomes ordinary filters in front of the typed query.
   const parts = [];
+  if (state.collection) parts.push(`#${state.collection}`);
   if (state.context) parts.push(state.context === "dump" ? "area:dump" : `in:${state.context}`);
   if (state.tag) parts.push(`tag:${state.tag.replace(/\s+/g, "-")}`);
   if (state.query) parts.push(state.query);
@@ -318,7 +360,10 @@ function renderList() {
   const items = state.items;
   $("count").textContent = `${items.length} ${state.scope === "all" ? "items" : "works"}`;
   if (!items.length) {
-    $("list").innerHTML = renderHead() + `<div class="empty">nothing here.</div>`;
+    // An empty collection (a typo in the box, a finished course) can go.
+    const drop = state.collection && !state.query
+      ? ` <button class="act" data-coll-delete="${esc(state.collection)}">delete #${esc(state.collection)}</button>` : "";
+    $("list").innerHTML = renderHead() + `<div class="empty">nothing here.${drop}</div>`;
     return;
   }
   // Inside a course, with no search words and no chosen sort, show the
@@ -526,6 +571,8 @@ function renderBatch() {
     <div class="acts" style="margin-top:6px">
       <button class="act" data-batch="move" ${withPdf.length ? "" : "disabled"}>file to…</button>
       <button class="act" data-batch="copy" ${withPdf.length ? "" : "disabled"}>copy to…</button>
+      <button class="act" data-batch="collect">add to collection…</button>
+      ${state.collection ? `<button class="act" data-batch="uncollect">take out of #${esc(state.collection)}</button>` : ""}
       <button class="act" data-batch="queue">queue all</button>
       <button class="act" data-batch="read">mark read</button>
       <button class="act" data-batch="clear">clear</button>
@@ -553,6 +600,9 @@ async function batchAct(name) {
     if (paths.length) openPicker(paths, name, $("batchpicker"));
     return;
   }
+  const ids = items.map((i) => i.work_id).filter(Boolean);
+  if (name === "collect") { openCollectionPicker(ids, $("batchpicker")); return; }
+  if (name === "uncollect") { collect(ids, state.collection, false); return; }
   // Queue or mark read, one paper at a time (each is a small write).
   const works = items.filter((i) => i.work_id);
   for (const item of works) {
@@ -628,6 +678,7 @@ async function renderDetail() {
         ? `<button class="act" data-act="revert">undo my edits</button>` : ""}
     </div><div id="editor"></div>`;
   }
+  if (item.work_id) html += collectionsHtml(item);
   if (work && noteData) html += noteHtml(work, noteData);
   if (work?.user?.notes) html += `<div class="label">From Zotero</div><p class="notes">${esc(work.user.notes)}</p>`;
 
@@ -825,6 +876,8 @@ async function changeWork(path, body, message) {
 
 $("detail").addEventListener("submit", (event) => {
   event.preventDefault();
+  if (event.target.id === "newcoll") { createCollection(event.target); return; }
+  if (event.target.id !== "editform") return;
   const form = new FormData(event.target), fields = {};
   for (const [name, value] of form) fields[name] = String(value).trim();
   fields.authors = parseAuthors(fields.authors);
@@ -851,6 +904,14 @@ $("detail").addEventListener("click", (event) => {
     else pickerChoose(choice.dataset.folder, choice.dataset.create === "1");
   }
   else if (el.dataset.dl) takeDownloads(el.dataset.dl);
+  else if (el.dataset.collAdd) openCollectionPicker([state.items[state.selected]?.work_id].filter(Boolean), $("collpicker"));
+  else if (el.dataset.collOut) collect([state.items[state.selected]?.work_id].filter(Boolean), el.dataset.collOut, false);
+  else if (el.dataset.collShow) {
+    state.collection = el.dataset.collShow; state.context = null; state.tag = null; state.view = "all";
+    markSidebar(); search();
+  }
+  else if (el.closest(".opt")) collect(cpick.ids, el.closest(".opt").dataset.coll);
+  else if (el.dataset.act === "cancel-new") renderDetail();
   else if (el.dataset.act === "edit") showEditor();
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
   else if (el.dataset.act === "note-reload") renderDetail();
@@ -863,7 +924,7 @@ $("detail").addEventListener("click", (event) => {
   }
   else if (el.dataset.act) act(el.dataset.act);
   else if (el.dataset.tag) {
-    state.tag = el.dataset.tag; state.context = null; state.view = "all";
+    state.tag = el.dataset.tag; state.context = null; state.collection = null; state.view = "all";
     markSidebar(); search();
   }
 });
@@ -913,7 +974,7 @@ function setAdding(on) {
   $("q").value = on ? "" : state.query;
   $("q").placeholder = on
     ? "add a paper: paste a URL, DOI, arXiv id or NBER number, then Enter (shift+Enter: add and queue)"
-    : "search   author:smith   course:101   tag:theory   year:2019";
+    : "search   #220a   author:smith   tag:theory   year:2019";
   if (on) $("q").focus();
 }
 
@@ -1503,6 +1564,16 @@ $("list").addEventListener("click", async (event) => {
   }
   else if (el.dataset.dlOthers) { state.dlOthers = !state.dlOthers; search(); return; }
   else if (el.dataset.dlTrash) { event.preventDefault(); await trashDownloads(el.dataset.dlTrash); return; }
+  else if (el.dataset.collDelete) {
+    const name = el.dataset.collDelete;
+    const answer = await post("/api/collections/delete", { name });
+    if (answer.detail) { say(answer.detail, 8000); return; }
+    collectionList = null;
+    say(`deleted #${answer.name}`);
+    state.collection = null; state.view = "all";
+    await loadSidebar(); markSidebar(); search();
+    return;
+  }
   else if (el.dataset.apply) await applyRenames();
   else if (el.dataset.undo) await undoBatch(Number(el.dataset.undo));
   else if (el.dataset.reveal) post("/api/open", { path: el.dataset.reveal, reveal: true });
@@ -1643,6 +1714,156 @@ async function fileTo(paths, folder, mode = "move", create = false) {
   search(state.items[state.selected]?.id ?? null);
 }
 
+// --- collections (collection.py) -------------------------------------------------------------
+// A paper's courses and projects, under "Collections" in the detail pane:
+// yours (× takes the paper out) and, dotted, the ones its folder stands for
+// (they change only when the file moves). "add to…" (key #) opens a box over
+// every collection: the newest term's courses first, then projects, then
+// older courses; a new name makes a new collection. The same box takes in a
+// whole selection.
+
+let collectionList = null;               // /api/collections, dropped after any change
+let cpick = { ids: [], box: null, at: 0 };
+
+function collectionsHtml(item) {
+  const own = new Set(item.own_collections ?? []);
+  const chips = (item.collections ?? []).map((n) => own.has(n)
+    ? `<span class="chip"><span class="tag" data-coll-show="${esc(n)}">#${esc(n)}</span>` +
+      `<button class="act" data-coll-out="${esc(n)}" title="take it out of ${esc(n)}">×</button></span>`
+    : `<span class="chip fixed" title="its PDF is in ${esc(n)}'s folder: moving the file changes this">` +
+      `<span class="tag" data-coll-show="${esc(n)}">#${esc(n)}</span></span>`).join("");
+  return `<div class="label">Collections</div><div class="chips">${chips}` +
+    `<button class="act" data-coll-add="1" title="key: #">add to…</button></div>` +
+    `<div class="picker" id="collpicker"></div>`;
+}
+
+function collectionOrder(list) {
+  const terms = list.filter((c) => c.kind === "course" && c.term).map((c) => c.term);
+  const now = terms.sort((a, b) => termRank(b) - termRank(a))[0];
+  const rank = (c) => (c.kind === "course" && c.term === now ? 0 : c.kind === "course" ? 2 : 1);
+  return [...list].sort((a, b) => rank(a) - rank(b)
+    || (rank(a) === 2 ? termRank(b.term) - termRank(a.term) : 0) || a.name.localeCompare(b.name));
+}
+
+async function openCollectionPicker(ids, box) {
+  if (!box || !ids.length) return;
+  cpick = { ids, box, at: 0 };
+  const what = ids.length > 1 ? `${ids.length} papers` : "it";
+  box.innerHTML = `<input class="pick" placeholder="put ${what} in: type a course or project (a new name makes one; 219a/topic for a part)" spellcheck="false" autocomplete="off">
+    <div class="choices"><div class="where">loading …</div></div>`;
+  const input = box.querySelector("input");
+  input.focus();
+  collectionList ??= (await get("/api/collections")).collections;
+  input.addEventListener("input", () => { cpick.at = 0; drawCollectionPicker(); });
+  input.addEventListener("keydown", (event) => {
+    const choices = [...box.querySelectorAll(".opt")];
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      cpick.at = Math.max(0, Math.min(choices.length - 1, cpick.at + (event.key === "ArrowDown" ? 1 : -1)));
+      drawCollectionPicker();
+    } else if (event.key === "Enter" && choices[cpick.at]) {
+      event.preventDefault();
+      collect(cpick.ids, choices[cpick.at].dataset.coll);
+    }
+  });
+  drawCollectionPicker();
+}
+
+const COLLECTION_NAME = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)*$/;
+
+function drawCollectionPicker() {
+  const box = cpick.box, input = box.querySelector("input");
+  const typed = input.value.trim().replace(/^#/, "").toLowerCase();
+  const words = typed.split(/\s+/).filter(Boolean);
+  const hits = collectionOrder(collectionList)
+    .filter((c) => words.every((w) => c.name.includes(w))).slice(0, 14);
+  const rows = hits.map((c) => {
+    const about = [c.kind === "course" ? (c.term ?? "course") : "project", c.shared ? "shared" : "",
+                   `${c.works} ${c.works === 1 ? "paper" : "papers"}`].filter(Boolean).join(" · ");
+    return `<div class="opt" data-coll="${esc(c.name)}"><span>#${esc(c.name)}</span><span class="badge">${esc(about)}</span></div>`;
+  });
+  // A name no collection has yet: offered last, so Enter on a near match
+  // ("220" while 220a exists) never makes a new collection by accident.
+  const fresh = typed.replace(/\s*\/\s*/g, "/").replace(/\s+/g, "-");
+  if (fresh && COLLECTION_NAME.test(fresh) && !collectionList.some((c) => c.name === fresh)) {
+    rows.push(`<div class="opt new" data-coll="${esc(fresh)}">+ new collection #${esc(fresh)}</div>`);
+  }
+  cpick.at = Math.min(cpick.at, Math.max(0, rows.length - 1));
+  box.querySelector(".choices").innerHTML = rows.map((r, n) =>
+    n === cpick.at ? r.replace('class="opt', 'class="opt at') : r).join("")
+    || `<div class="where">letters, digits and - only; a / makes a part (219a/public-economics)</div>`;
+}
+
+// Put works into a collection (add) or take them out, then update the rows
+// in place: no new search, so the list keeps its place.
+async function collect(ids, name, add = true) {
+  if (!ids.length || !name) return;
+  const answer = await post("/api/collections/change", { work_ids: ids, name, add });
+  if (answer.detail) { say(answer.detail, 8000); return; }
+  collectionList = null;
+  for (const item of [...state.items, ...state.marked.values()]) {
+    if (answer.works[item.work_id]) Object.assign(item, answer.works[item.work_id]);
+  }
+  const n = answer.changed.length, papers = n === 1 ? "1 paper" : `${n} papers`;
+  const stays = !add && n < ids.length ? " (a paper in it by its folder stays in it)" : "";
+  say(add ? (n ? `put ${papers} in #${answer.name}` : `already in #${answer.name}`)
+          : (n ? `took ${papers} out of #${answer.name}${stays}` : `not taken out of #${answer.name}${stays}`), 6000);
+  cpick.box?.replaceChildren();
+  loadSidebar();
+  // Taken out of the collection the list shows: it leaves the list.
+  if (!add && state.collection && n) search(state.items[state.selected]?.id ?? null);
+  else renderDetail();
+}
+
+// A new project or course, on the page (`refs project new` in the terminal):
+// the "+ new" of the sidebar section it was opened from decides which.
+function renderNewCollection(kind = "project") {
+  ++detailToken;
+  const course = kind === "course";
+  const field = (name, label, hint = "") => `<label><span>${label}</span>
+    <input name="${name}" placeholder="${esc(hint)}" autocomplete="off" spellcheck="false"></label>`;
+  const tick = (name, label) => `<label><span></span><span class="tickline">
+    <input type="checkbox" name="${name}"> ${label}</span></label>`;
+  $("detail").innerHTML = `<h1>New ${kind}</h1>
+    <p class="where">A set of papers, whichever folders their PDFs are in. A paper can be in
+    any number of courses and projects; a / makes a part (${course ? "219a/public-economics" : "bets/lit"}).</p>
+    <form class="edit" id="newcoll">
+      <input type="hidden" name="kind" value="${kind}">
+      ${field("name", "name", course ? "220a, 219a/public-economics" : "bets, thesis")}
+      ${course ? field("term", "term", "2026-fall") : ""}
+      ${field("folder", "folder", course ? "optional: phd/coursework/2026-fall/220a/readings"
+                                         : "optional: phd/research/bets/readings")}
+      ${tick("make_folder", "make the folder")}
+      ${tick("shared", "the folder is shared with coauthors")}
+      ${field("bib_file", ".bib", course ? "optional: a .bib for the course"
+                                         : "optional: ~/phd/research/bets/overleaf/refs.bib")}
+      <div class="acts">
+        <button class="act" type="submit">create</button>
+        <button class="act" type="button" data-act="cancel-new">cancel</button>
+      </div>
+      <p class="bad" id="newcollbad"></p>
+    </form>`;
+  $("newcoll").name.focus();
+}
+
+async function createCollection(form) {
+  const f = new FormData(form);
+  const body = { name: String(f.get("name") ?? "").trim(), kind: f.get("kind"),
+                 term: String(f.get("term") ?? "").trim() || null,
+                 folder: String(f.get("folder") ?? "").trim() || null,
+                 bib_file: String(f.get("bib_file") ?? "").trim() || null,
+                 make_folder: f.has("make_folder"), shared: f.has("shared") };
+  if (!body.name) { $("newcollbad").textContent = "give it a name"; return; }
+  const answer = await post("/api/collections/new", body);
+  if (answer.detail) { $("newcollbad").textContent = answer.detail; return; }
+  collectionList = null;
+  const where = answer.entry.folder && !answer.watched ? " (refs does not watch its folder)" : "";
+  say(`new ${answer.entry.kind} #${answer.name}${where}. Add papers with #`, 8000);
+  state.collection = answer.name; state.context = null; state.tag = null; state.view = "all";
+  await loadSidebar();
+  search();
+}
+
 // --- keyboard ---------------------------------------------------------------------------
 
 const HELP = `keys
@@ -1657,6 +1878,8 @@ const HELP = `keys
   C                    copy to… (same, but the original stays where it is)
                        in the box: ↑/↓ choose, Tab then a name = new folder
   u                    undo the last file to… / copy to…
+  #                    add to a collection (a course or project; a new name makes one)
+                       × on a collection takes the paper out (dotted ones come from its folder)
 
 selecting many
 
@@ -1664,7 +1887,7 @@ selecting many
   ⌘-click  ⇧-click     add one row / a range
   ⌘A                   select every row in the list
   esc                  clear the selection
-  F  C                 file / copy the whole selection (buttons: queue all, mark read)
+  F  C  #              file / copy / collect the whole selection (buttons: queue all, mark read)
   y                    copy citekey
   b                    copy BibTeX
   r                    toggle read / unread
@@ -1686,6 +1909,7 @@ bookmarklet            open /bookmarklet and drag "+ refs" to the bookmarks bar
 
 search filters
 
+  #220a   #219a/public-economics   (a collection; a parent includes its parts)
   author:smith   year:2019   course:101   project:thesis
   tag:theory    kind:book   status:needs-review   topic:demand
   read:read     read:reading   read:unread   queued:yes
@@ -1736,6 +1960,12 @@ document.addEventListener("keydown", async (event) => {
     const p = state.items[state.selected]?.locations[0]?.path;
     if (p) openPicker([p], key === "C" ? "copy" : "move");
   }
+  else if (key === "#") {
+    event.preventDefault();
+    if (state.marked.size) { batchAct("collect"); return; }
+    const id = state.items[state.selected]?.work_id;
+    if (id) openCollectionPicker([id], $("collpicker"));
+  }
   else if (key === "x" && state.items.length) {
     markRow(state.selected);
     select(state.selected + 1);              // also redraws the detail pane
@@ -1768,7 +1998,7 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "w") toggleWatchPanel();
   else if (key === "Escape" && !$("watchpanel").hidden) toggleWatchPanel(false);
   else if (key === ",") {
-    state.context = null; state.tag = null; state.view = "settings";
+    state.context = null; state.tag = null; state.collection = null; state.view = "settings";
     markSidebar(); search();
   }
 });
@@ -2307,7 +2537,7 @@ $("notice").addEventListener("click", async (event) => {
     noticeDismissed = Number(button.dataset.pdfs);
     $("notice").innerHTML = "";
   } else if (button.dataset.notice === "settings") {
-    state.context = null; state.tag = null; state.view = "settings";
+    state.context = null; state.tag = null; state.collection = null; state.view = "settings";
     markSidebar(); search();
   }
 });

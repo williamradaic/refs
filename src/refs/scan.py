@@ -11,6 +11,9 @@ Identity rules, in order:
                                                 or a copy (if it is still there).
   4. Same path, different content            -> modified; the new version
                                                 remembers which one it replaced.
+  5. A new path whose inode matches a vanished path, but whose size or time
+     differ and whose content is new         -> moved *and* modified (moved,
+                                                then annotated, between scans).
 """
 
 from __future__ import annotations
@@ -111,6 +114,8 @@ def scan(cfg: Config, conn: sqlite3.Connection,
     # "from" side of a move. Indexed two ways so a new path can claim one.
     gone = set(known) - set(disk)
     gone_by_inode = {(known[p]["inode"], known[p]["size"], known[p]["mtime"]): p for p in gone}
+    # By inode alone, for a file that was moved and then edited (rule 5).
+    gone_by_inode_only = {known[p]["inode"]: p for p in gone if known[p]["inode"]}
     gone_by_hash: dict[str, list[str]] = defaultdict(list)
     for p in gone:
         gone_by_hash[known[p]["hash"]].append(p)
@@ -175,6 +180,24 @@ def scan(cfg: Config, conn: sqlite3.Connection,
             _put_path(conn, f, file_hash, now)
             _log(conn, now, "moved", rel, file_hash, old_path)
             report.moved.append((old_path, rel))
+            continue
+
+        # B4. Same inode as a vanished path, new content: moved, then edited
+        #     (annotated, say) before this scan. Without this it would look
+        #     like a new paper and its old self like a deletion. The new
+        #     content remembers the version it replaced, as an edit in place does.
+        old_path = gone_by_inode_only.get(f.inode)
+        if old_path is not None and old_path not in claimed \
+                and conn.execute("SELECT 1 FROM files WHERE hash=?", (file_hash,)).fetchone() is None:
+            claimed.add(old_path)
+            old_hash = known[old_path]["hash"]
+            conn.execute("DELETE FROM paths WHERE path=?", (old_path,))
+            _ensure_file(conn, file_hash, f.size, now, supersedes=old_hash)
+            _put_path(conn, f, file_hash, now)
+            _log(conn, now, "moved", rel, old_hash, old_path)
+            _log(conn, now, "modified", rel, file_hash)
+            report.moved.append((old_path, rel))
+            report.modified.append(rel)
             continue
 
         # B3. Not a move. New content, a copy, or known content coming back.

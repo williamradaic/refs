@@ -26,8 +26,8 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import (bib, capture, config, downloads, index, ingest, keys, notes, onboarding, organize, reading, records, rename,
-                resolve, settings, venues, works)
+from .. import (bib, capture, collection, config, downloads, index, ingest, keys, notes, onboarding, organize, reading,
+                records, rename, resolve, settings, venues, works)
 from .. import ask as asking
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
 from .. import scan as scanner
@@ -248,6 +248,9 @@ def create_app(watch: bool = False) -> FastAPI:
             "venue": item["venue"], "kind": item["kind"], "status": item["status"],
             "tags": item["tags"], "description": item["description"],
             "locations": item["locations"],
+            # Collections: all of them (yours and the folders'), and yours alone.
+            "collections": item.get("collections") or [],
+            "own_collections": collection.explicit(work or {}),
             **read_fields(work),
         }
 
@@ -269,6 +272,7 @@ def create_app(watch: bool = False) -> FastAPI:
             "authors": [a["family"] for a in meta.get("authors") or [] if a.get("family")],
             "kind": meta.get("kind"), "status": "no-file", "tags": work.get("tags") or [],
             "description": work.get("description"), "locations": [],
+            "collections": collection.explicit(work), "own_collections": collection.explicit(work),
             **read_fields(work),
         }
 
@@ -352,15 +356,23 @@ def create_app(watch: bool = False) -> FastAPI:
         library = [i for i in everything if i["work_id"]]
         contexts: dict[str, set] = {}
         fields: dict[str, int] = {}
+        slug_of: dict[str, str | None] = {}                   # context key -> its folder's name
         for item in library:
             for loc in item["locations"]:
                 contexts.setdefault(loc["context"], set()).add(item["work_id"])
+                slug_of.setdefault(loc["context"], loc["slug"])
             for tag in item["tags"][:2]:           # the first tags are the broad fields
                 fields[tag] = fields.get(tag, 0) + 1
         # Each context's area and term, so the page groups without parsing keys.
         about = {row["context"]: {"area": row["area"], "term": row["term"]} for row in conn.execute(
             "SELECT context, MIN(area) AS area, MIN(term) AS term FROM paths GROUP BY context")}
         user = lambda i: (all_works.get(i["work_id"]) or {}).get("user", {})   # noqa: E731
+        def stands_for(key: str) -> str | None:
+            info = about.get(key) or {}
+            found = collection.implicit(contexts_mod.Context(key, info.get("area") or "", info.get("term"),
+                                                             slug_of.get(key)))
+            return found[0] if found else None
+
         return {
             "presets": {
                 "all": len(library),
@@ -382,8 +394,11 @@ def create_app(watch: bool = False) -> FastAPI:
                     "SELECT COUNT(*) FROM files WHERE status IS NULL "
                     "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
             },
-            "contexts": [{"key": key, "count": len(ids), **about.get(key, {})}
+            # Folders; `collection` names the collection a folder stands for
+            # (listed under courses and projects instead).
+            "contexts": [{"key": key, "count": len(ids), **about.get(key, {}), "collection": stands_for(key)}
                          for key, ids in sorted(contexts.items())],
+            "collections": collection.listing(cfg, conn, all_works),
             # Areas the sidebar lists by name, in order (others go under "Other").
             "areas": contexts_mod.layout_for(cfg).areas,
             "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
@@ -462,7 +477,93 @@ def create_app(watch: bool = False) -> FastAPI:
         """Write a work, re-derive its metadata, and refresh the index."""
         records.write_json(works.works_dir(cfg) / f"{found['id']}.json", found)
         scanner.scan(cfg, index.connect(cfg))       # runs works.sync and rebuilds search
+        library_changed()
         return {"work": works.load_all(cfg)[found["id"]]}
+
+    def library_changed() -> None:
+        """Works or collections changed: library.bib follows in a few seconds."""
+        if watcher is not None and watcher.exporter is not None:
+            watcher.exporter.poke()
+
+    # --- collections (collection.py) ------------------------------------------------------
+
+    @app.get("/api/collections")
+    def collections_list() -> dict:
+        """Every collection, for the picker and the sidebar."""
+        return {"collections": collection.listing(cfg, index.connect(cfg))}
+
+    @app.post("/api/collections/change")
+    def collections_change(work_ids: list[str] = Body(embed=True), name: str = Body(embed=True),
+                           add: bool = Body(default=True, embed=True),
+                           x_refs: str | None = Header(default=None)) -> dict:
+        """Put works into a collection (a new name makes a new collection), or
+        take them out. Returns each work's collections afterwards."""
+        guard(x_refs)
+        try:
+            name = collection.clean_name(name)
+            changed = collection.change(cfg, work_ids, name, add=add)
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        conn = index.connect(cfg)
+        all_works = works.load_all(cfg)
+        after = {}
+        for work_id in work_ids:
+            if work_id in all_works:
+                after[work_id] = {"collections": index.update_collections(conn, all_works[work_id]),
+                                  "own_collections": collection.explicit(all_works[work_id])}
+        if changed:
+            library_changed()
+        return {"name": name, "changed": changed, "works": after}
+
+    @app.post("/api/collections/delete")
+    def collections_delete(name: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
+        """Forget a collection: its registry entry and your memberships (the
+        page offers this for an empty one)."""
+        guard(x_refs)
+        try:
+            count = collection.delete(cfg, name)
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        conn = index.connect(cfg)
+        index.refresh_derived(cfg, conn)
+        conn.commit()
+        library_changed()
+        return {"name": collection.clean_name(name), "papers": count}
+
+    @app.post("/api/collections/new")
+    def collections_new(name: str = Body(embed=True), kind: str = Body(default="project", embed=True),
+                        term: str | None = Body(default=None, embed=True),
+                        folder: str | None = Body(default=None, embed=True),
+                        shared: bool = Body(default=False, embed=True),
+                        bib_file: str | None = Body(default=None, embed=True),
+                        make_folder: bool = Body(default=False, embed=True),
+                        x_refs: str | None = Header(default=None)) -> dict:
+        """A new collection (or new details for one): `refs project new` on the page."""
+        guard(x_refs)
+        folder = (folder or "").strip() or None
+        if shared and not folder:
+            raise HTTPException(400, "a shared collection needs its shared folder")
+        if make_folder and not folder:
+            raise HTTPException(400, "say which folder to make")
+        try:
+            name = collection.clean_name(name)
+            if term and not contexts_mod.term_of(term):
+                raise collection.Invalid(f"{term!r} is not a term (say 2026-fall)")
+            if make_folder:
+                # The same checks as a new folder from "file to…": inside the
+                # watched folders, a place refs may write. Made before the
+                # collection is saved, so a refused folder saves nothing.
+                folder = organize.make_folder(cfg, folder)
+            entry = collection.register(cfg, name, kind=kind, term=term or "", folder=folder,
+                                        shared=shared, bib_file=(bib_file or "").strip())
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        except organize.Refused as error:
+            raise refused(error)
+        library_changed()
+        watched = bool(entry["folder"]) and any(
+            entry["folder"] == r or entry["folder"].startswith(r.rstrip("/") + "/") for r in cfg.roots)
+        return {"name": name, "entry": entry, "watched": watched}
 
     @app.post("/api/work/{work_id}/edit")
     def edit(work_id: str, fields: dict = Body(embed=True),

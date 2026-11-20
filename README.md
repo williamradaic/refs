@@ -107,9 +107,11 @@ from an older version, drag it to the bookmarks bar again.
 | meaning | a small model on your Mac compares a description with each paper's title, tags, summary and note, so "frozen desserts" finds an ice-cream paper | free |
 | Claude Haiku | ranks a shortlist of about 40 local candidates and says why each fits; only when you press Enter on a description and the local result looks unsure (or the query starts with `?`) | about $0.0005, capped at $1 a month |
 
-Filters: `course:` / `project:` (folder name), `term:`, `area:`, `in:` (part of
-a folder path), `topic:`, `kind:`, `year:`, `author:`, `tag:`, `status:`,
-`read:` (read, reading, unread), `queued:` (yes, no).
+Filters: `#220a` (a collection, parts included; on the command line quote it,
+`'#220a'`, or write `collection:220a`), `course:` / `project:` (a collection,
+or a folder name), `term:`, `area:`, `in:` (part of a folder path), `topic:`,
+`kind:`, `year:`, `author:`, `tag:`, `status:`, `read:` (read, reading,
+unread), `queued:` (yes, no).
 
 **The record status** in the list says how far to trust a paper's details:
 
@@ -168,7 +170,37 @@ app gives refs its own window. Raycast users can import
 
 ## Courses and projects
 
-refs reads a PDF's course or project off its folders. By default each folder
+**Collections.** A course or project is a collection: a set of papers, wherever
+their PDFs are. A paper can be in any number of them, and a slash makes a part
+(`219a/public-economics`, included in `219a`). On a paper, *Collections* lists
+its own (× takes it out) and, dotted, the ones its folder stands for; *add to…*
+(`#`) puts it in one, or in a new one if you type a new name. The same key
+collects a whole selection. The sidebar lists projects, then courses by
+term; *+ new project* and *+ new course* at the end of each make one, with a
+folder, whether that folder is shared with coauthors, a `.bib` and, for a
+course, its term. In the terminal:
+
+```sh
+refs project new bets --folder phd/research/bets/readings/lit --shared --bib ~/phd/research/bets/refs.bib
+refs project new 220a --course --term 2026-fall
+refs collection add bets o'donoghue procrastination   # the best match (--all: every match)
+refs collection remove bets o'donoghue
+refs collection                                      # every collection, with counts
+refs collection rename 219a/pf 219a/public-economics
+refs bib '#bets' --append                            # into the collection's own .bib
+```
+
+Collections live in refs' folder in the library: `collections.json` describes
+them, and each paper's file lists the ones you put it in.
+
+**library.bib.** refs keeps `library.bib` in the same folder: every paper,
+with `file` (its PDF, relative to the .bib) and `keywords` (its collections).
+JabRef and Zotero import both fields, so your courses and projects survive
+without refs. The background service rewrites it a few seconds after anything
+changes; `refs bib --library` writes it now.
+
+**From folders.** refs also reads a PDF's course or project off its folders,
+and treats each as a collection of that name. By default each folder
 directly inside a watched folder is one (`Papers/IO/x.pdf` → `Papers/IO`).
 Rules under settings say more, tried in order:
 
@@ -220,6 +252,8 @@ refs find course:240a kind:paper topic:demand
 refs find IO paper on ice cream   # a description works too (matched by meaning)
 refs ask demand for frozen desserts   # let Claude pick from ~40 candidates (~$0.0005)
 refs contexts                  # courses and projects recognised from folders
+refs collection                # collections (courses, projects); add, remove, rename, new, delete
+refs project new bets          # a new project (--course --term 2026-fall for a course)
 refs dupes                     # files stored in more than one place
 refs open blp                  # open the best match
 refs path blp                  # print its full path
@@ -230,6 +264,7 @@ refs queue                     # the reading queue, oldest first
 refs wanted                    # papers saved without a PDF yet
 refs bib blp                   # BibTeX for the best match (or `refs bib project:thesis`)
 refs bib blp --append references.bib   # add it unless the file already has it
+refs bib --library             # write library.bib (every paper, PDF and collections) now
 refs rename in:dump            # propose tidy names; add --apply to rename
 refs rename --undo 3           # reverse the last 3 renames and moves
 
@@ -241,7 +276,7 @@ refs serve --open              # run the page in this terminal instead of the ba
 refs service status            # the background service (install, restart, uninstall)
 ```
 
-`--json` on `find`, `status`, `contexts`, `dupes` and `scan` gives
+`--json` on `find`, `status`, `contexts`, `collection`, `dupes` and `scan` gives
 machine-readable output.
 
 ## Troubleshooting and removal

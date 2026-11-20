@@ -315,6 +315,15 @@ details.kept > summary { cursor: pointer; }
 .picker .choice.at { border-left-color: var(--accent); background: var(--sel); }
 .picker .choice.new { color: var(--accent); }
 .picker .choice .inside { visibility: hidden; padding: 0 .6ch; }
+/* The collection box (app.js openCollectionPicker): same look as the folder box. */
+.picker .opt { display: flex; gap: 1ch; align-items: baseline; padding-left: 1ch; cursor: pointer;
+               color: var(--link); border-left: 2px solid transparent; overflow-wrap: anywhere; }
+.picker .opt > span:first-child { flex: 1; }
+.picker .opt:hover > span:first-child, .picker .opt.new:hover { text-decoration: underline; }
+.picker .opt.at { border-left-color: var(--accent); background: var(--sel); }
+.picker .opt.new { color: var(--accent); }
+.edit .tickline input { accent-color: var(--accent); margin: 0 1ch 0 0; }
+#detail .chips .tag { cursor: pointer; }
 .picker .choice:hover .inside, .picker .choice.at .inside { visibility: visible; }
 #detail code { color: var(--fg); }
 
