@@ -179,14 +179,21 @@ def apply(cfg: Config, conn: sqlite3.Connection, the_plan: Plan, work_ids: set[s
         if added:
             records.write_json(works.works_dir(cfg) / f"{row.work_id}.json", work)
         for name in added:
+            # The course or project itself first, with its kind and term, so
+            # that neither a paper filed directly in it nor one of its parts
+            # registers it first without them. A term it lacks is filled in.
+            top = name.split("/")[0]
+            if top in the_plan.tops:
+                known = the_plan.tops[top]
+                if top not in registry:
+                    collection.register(cfg, top, kind=known["kind"], term=known["term"] or "",
+                                        registry=registry)
+                elif known["term"] and not registry[top].get("term"):
+                    registry[top]["term"] = known["term"]
             details = the_plan.parts.get(name) or {}
             if name not in registry:
                 collection.register(cfg, name, order=details.get("order"), label=details.get("label"),
                                     registry=registry)
-            top = name.split("/")[0]
-            if top not in registry and top in the_plan.tops:
-                collection.register(cfg, top, kind=the_plan.tops[top]["kind"],
-                                    term=the_plan.tops[top]["term"] or "", registry=registry)
         row.collections = added                     # what undo takes back
         done.append(row)
     collection.save(cfg, registry)

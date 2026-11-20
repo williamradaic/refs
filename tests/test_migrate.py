@@ -129,3 +129,18 @@ def test_finish_renames_the_library_and_watches_it_alone(lib):
     found = index.search(conn, [], {"collection": "220a"})
     assert [f["citekey"] for f in found] == ["berry1995automobile"]
     assert found[0]["locations"][0]["path"] == f"refs-library/{CANONICAL}"
+
+
+def test_a_paper_filed_directly_in_a_course_keeps_the_courses_term(lib):
+    # No readings/<topic> folder: the paper's collection is the course itself,
+    # which must still be registered as a course with its term.
+    direct = "phd/coursework/2025-summer/de-la-fuente-2000-mathematical-methods.pdf"
+    (lib.root / direct).parent.mkdir(parents=True, exist_ok=True)
+    (lib.root / direct).write_bytes(pdf_bytes("Mathematical methods"))
+    scan.scan(lib.cfg, lib.conn)
+    read_paper(lib.cfg, lib.conn, direct, "Mathematical Methods and Models for Economists", "de la Fuente", 2000)
+    scan.scan(lib.cfg, lib.conn)
+    migrate.apply(lib.cfg, lib.conn, migrate.plan(lib.cfg, lib.conn))
+    registry = collection.load(lib.cfg)
+    assert (registry["2025-summer"]["kind"], registry["2025-summer"]["term"]) == ("course", "2025-summer")
+    assert (registry["219a"]["kind"], registry["219a"]["term"]) == ("course", "2025-fall")
