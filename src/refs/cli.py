@@ -565,6 +565,50 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_marks(args: argparse.Namespace) -> int:
+    """`refs marks <search>`: each copy of the best match, with whose marks it
+    holds; `--pull FROM` brings one copy's marks into the library copy
+    (FROM: a shared collection, #bets, or a path)."""
+    from . import annotations, ingest, works
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    terms, filters = _split_query(args.query)
+    all_works = works.load_all(cfg)
+    found = [r for r in index.search(conn, terms, filters, limit=None, semantic=True) if r["work_id"] in all_works]
+    if not found:
+        print("No matching paper.", file=sys.stderr)
+        return 1
+    item = found[0]
+    copies = annotations.copies(cfg, conn, item["work_id"])
+    if not args.pull:
+        print(_headline(item) + f"  @{item['citekey']}")
+        for c in copies:
+            others = ", ".join(f"{n} by {a or 'no name'}" for a, n in c["others"].items())
+            mine = f"your marks on {c['your_pages']} pages" if c["your_pages"] else ""
+            print(f"  {c['where']:<20} {' · '.join(x for x in (mine, others) if x) or 'no marks'}"
+                  + (f" · last {c['latest'][:10]}" if c["latest"] else "") + (f"  ⚑ {c['flag']}" if c["flag"] else ""))
+            print(f"    {c['path']}")
+        return 0
+    wanted = args.pull.lstrip("#")
+    source = next((c["path"] for c in copies if c["path"] == args.pull or c["shared"] == wanted), None)
+    if source is None:
+        print(f"No copy of this paper in {args.pull}.", file=sys.stderr)
+        return 1
+    with ingest.exclusive(cfg):
+        try:
+            result = annotations.pull(cfg, conn, item["work_id"], source)
+        except annotations.Refused as error:
+            print(f"refs: {error}.", file=sys.stderr)
+            return 1
+        if result["added"]:
+            scanner.scan(cfg, conn)
+    print(f"Brought {result['added']} marks into the library copy"
+          + (f" ({result['skipped']} could not be redrawn)" if result["skipped"] else "")
+          + (f"; the previous version is in {result['backup']}." if result["backup"] else "."))
+    return 0
+
+
 def cmd_dupes(args: argparse.Namespace) -> int:
     cfg = config.load()
     conn = index.connect(cfg)
@@ -1380,6 +1424,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--yes", action="store_true", help="with --finish: do not ask")
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_migrate)
+
+    p = sub.add_parser("marks", help="a paper's copies and whose marks each holds; --pull merges them")
+    p.add_argument("query", nargs="+", help="words and key:value filters; the best match")
+    p.add_argument("--pull", metavar="FROM",
+                   help="bring this copy's marks into the library copy: a shared collection (#bets) or a path")
+    p.set_defaults(run=cmd_marks)
 
     p = sub.add_parser("dupes", help="files stored in more than one place")
     p.add_argument("--json", action="store_true")

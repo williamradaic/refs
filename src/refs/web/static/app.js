@@ -796,6 +796,21 @@ function marksLine(copy, several) {
   return line + `</div>`;
 }
 
+async function pullMarks(path) {
+  const item = state.items[state.selected];
+  if (!item?.work_id) return;
+  if (!confirm(`Bring the marks in ${path.split("/").pop()} into the library copy?\n\n` +
+               "Only the library copy changes; refs keeps a copy of it as it was. Marks deleted in " +
+               "one copy are not deleted in the other.")) return;
+  say("bringing the marks over …", 0);
+  const answer = await post(`/api/work/${item.work_id}/pull`, { path });
+  if (answer.detail) { say(answer.detail, 12000); return; }
+  say(answer.added ? `brought ${answer.added} marks into the library copy` +
+      (answer.skipped ? ` (${answer.skipped} of a kind refs cannot redraw)` : "") +
+      `; the previous version is in ${answer.backup}` : "the library copy has every mark already", 12000);
+  renderDetail();
+}
+
 // --- reading notes --------------------------------------------------------------------
 // The note is a Markdown file in the Obsidian vault (notes.py), so it is also
 // there in Obsidian and on the phone. The box saves a moment after you stop
@@ -963,6 +978,7 @@ $("detail").addEventListener("click", (event) => {
   else if (el.dataset.dl) takeDownloads(el.dataset.dl);
   else if (el.dataset.inbox) takeInbox();
   else if (el.dataset.mig) migrateAct(el.dataset.mig);
+  else if (el.dataset.pull) pullMarks(el.dataset.pull);
   else if (el.dataset.collAdd) openCollectionPicker([state.items[state.selected]?.work_id].filter(Boolean), $("collpicker"));
   else if (el.dataset.collOut) collect([state.items[state.selected]?.work_id].filter(Boolean), el.dataset.collOut, false);
   else if (el.dataset.collShow) {

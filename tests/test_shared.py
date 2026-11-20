@@ -244,3 +244,60 @@ def test_survey_reads_dates_and_authors(tmp_path):
     assert found["by_author"] == {"Me": 1, "": 1} and found["marks"] == 1
     assert found["latest"] == "2026-11-01T12:00:00"
     assert reading.pdf_date("garbage") is None
+
+
+# --- Phase 4: bringing marks over --------------------------------------------------------------------
+
+def two_copies(lib, mine, theirs):
+    """The library copy and a shared copy of the same paper, with marks."""
+    import shutil
+    base = lib.root / "base.pdf"
+    base.write_bytes(pdf_bytes("Automobile prices"))
+    for rel, marks in ((LIBRARY_BLP, mine), (f"{SHARED}/blp.pdf", theirs)):
+        (lib.root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(base, lib.root / rel)
+        doc = pymupdf.open(lib.root / rel)
+        page = doc[0]                           # kept: a mark comes loose from a freed page
+        for n, (author, date) in enumerate(marks):
+            annot = page.add_highlight_annot(pymupdf.Rect(72, 60 + 20 * n, 200, 76 + 20 * n))
+            annot.set_info(title=author, modDate=date, content=f"note {author} {n}")
+            annot.update()
+        doc.saveIncr()
+        doc.close()
+    base.unlink()
+    lib.rescan()
+    lib.conn.execute("UPDATE files SET work_id=? WHERE hash IN (SELECT hash FROM paths WHERE path LIKE ?)",
+                     (lib.work, SHARED + "/%"))
+    lib.conn.commit()
+
+
+def test_pull_brings_the_other_copys_marks_once(lib):
+    import time
+    two_copies(lib, [("William", "D:20261112090000")], [("Jane", "D:20261118090000"), ("Jane", "D:20261117090000")])
+    later = time.time() + 3600
+    with pytest.raises(annotations.Refused, match="last few minutes"):
+        annotations.pull(lib.cfg, lib.conn, lib.work, f"{SHARED}/blp.pdf")
+    result = annotations.pull(lib.cfg, lib.conn, lib.work, f"{SHARED}/blp.pdf", now=later)
+    assert result["added"] == 2 and result["skipped"] == 0
+    assert (lib.root / result["backup"]).is_file()
+    doc = pymupdf.open(lib.root / LIBRARY_BLP)
+    marks = sorted((a.info["title"], a.info["content"]) for a in doc[0].annots())
+    doc.close()
+    assert marks == [("Jane", "note Jane 0"), ("Jane", "note Jane 1"), ("William", "note William 0")]
+    # The shared copy is untouched, and a second pull adds nothing.
+    assert annotations.pull(lib.cfg, lib.conn, lib.work, f"{SHARED}/blp.pdf", now=later + 1) == \
+        {"added": 0, "skipped": 0, "backup": None}
+
+
+def test_pull_refuses_different_versions_and_strangers(lib):
+    import time
+    two_copies(lib, [], [("Jane", "D:20261118090000")])
+    doc = pymupdf.open(lib.root / f"{SHARED}/blp.pdf")
+    doc.new_page()
+    doc.saveIncr()
+    doc.close()
+    later = time.time() + 3600
+    with pytest.raises(annotations.Refused, match="different versions"):
+        annotations.pull(lib.cfg, lib.conn, lib.work, f"{SHARED}/blp.pdf", now=later)
+    with pytest.raises(annotations.Refused, match="not another copy"):
+        annotations.pull(lib.cfg, lib.conn, lib.work, "phd/elsewhere.pdf", now=later)

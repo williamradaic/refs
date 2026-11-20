@@ -460,6 +460,21 @@ def create_app(watch: bool = False) -> FastAPI:
                 # Each copy's marks and whether to flag it (annotations.py).
                 "copies": annotations.copies(cfg, index.connect(cfg), work_id)}
 
+    @app.post("/api/work/{work_id}/pull")
+    def pull_marks(work_id: str, path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
+        """Bring the marks of another copy (`path`) into the library copy
+        (annotations.pull): a copy of the library file is kept first."""
+        guard(x_refs)
+        with ingest.exclusive(cfg):
+            conn = index.connect(cfg)
+            try:
+                result = annotations.pull(cfg, conn, work_id, path)
+            except annotations.Refused as error:
+                raise HTTPException(409, str(error))
+            if result["added"]:
+                scanner.scan(cfg, conn)          # the library copy is a new version now
+        return result
+
     @app.get("/file")
     def file(path: str) -> FileResponse:
         """Serve one PDF, but only a path the index knows (no arbitrary files)."""
