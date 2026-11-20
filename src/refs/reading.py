@@ -53,23 +53,53 @@ def count_marks(path: Path, authors: set[str]) -> tuple[int, int, int]:
     a mark with no author. A file that cannot be opened counts as (0, 0, 0),
     so it is not tried again until its content changes. About 4 ms a file.
     """
+    found = survey(path, authors)
+    return found["pages"], found["marked_pages"], found["marks"]
+
+
+def pdf_date(text: str | None) -> str | None:
+    """A PDF date ("D:20261112093000-08'00'") as an ISO day-and-time, or None."""
+    digits = "".join(ch for ch in (text or "").removeprefix("D:")[:14] if ch.isdigit())
+    if len(digits) < 8:
+        return None
+    digits = digits.ljust(14, "0")
+    try:
+        return datetime(int(digits[:4]), int(digits[4:6]), int(digits[6:8]), int(digits[8:10]),
+                        int(digits[10:12]), int(digits[12:14])).isoformat(timespec="seconds")
+    except ValueError:
+        return None
+
+
+def survey(path: Path, authors: set[str]) -> dict:
+    """Everything refs keeps about the marks in one PDF: `pages`, and for your
+    marks (`authors`, as in count_marks) `marked_pages` and `marks`; for
+    everyone's, `by_author` ({name as written: marks}) and `latest` (the
+    newest mark's date, ISO, None when the marks carry no date)."""
+    found = {"pages": 0, "marked_pages": 0, "marks": 0, "by_author": {}, "latest": None}
     try:
         doc = pymupdf.open(path)
     except Exception:                                   # noqa: BLE001 (damaged, encrypted, not a PDF)
-        return 0, 0, 0
-    marked_pages = marks = 0
+        return found
     try:
+        found["pages"] = doc.page_count
         for page in doc:
-            here = sum(1 for a in page.annots() or []
-                       if a.type[1] in MARKUP
-                       and (a.info.get("title") or "").strip().lower() in authors)
-            marks += here
-            marked_pages += here > 0
-        return doc.page_count, marked_pages, marks
+            here = 0
+            for a in page.annots() or []:
+                if a.type[1] not in MARKUP:
+                    continue
+                name = (a.info.get("title") or "").strip()
+                found["by_author"][name] = found["by_author"].get(name, 0) + 1
+                when = pdf_date(a.info.get("modDate")) or pdf_date(a.info.get("creationDate"))
+                if when and (found["latest"] is None or when > found["latest"]):
+                    found["latest"] = when
+                here += name.lower() in authors
+            found["marks"] += here
+            found["marked_pages"] += here > 0
     except Exception:                                   # noqa: BLE001 (broken page tree)
-        return doc.page_count, marked_pages, marks
+        pass
     finally:
         doc.close()
+    return found
 
 
 def marks_by_author(path: Path) -> dict[str, int]:

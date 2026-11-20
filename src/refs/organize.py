@@ -52,10 +52,23 @@ def _hash_of(conn: sqlite3.Connection, rel: str) -> str:
 
 def copies(cfg: Config, conn: sqlite3.Connection, *, kept: bool = False) -> list[dict]:
     """Files stored in more than one place: the sets still to review, or with
-    `kept=True` the sets you marked as on purpose (so they can be un-kept)."""
+    `kept=True` the sets you marked as on purpose (so they can be un-kept).
+
+    A library copy plus copies in the shared folders of collections the paper
+    is in (shared.py) is how it should be, so such a set is never listed.
+    """
+    from . import shared                                # shared.py uses this module
     kept_hashes = set(_review(cfg)["kept_copies"])
-    return [item for item in index.search(conn, [], {}, limit=None)
-            if len(item["locations"]) > 1 and (item["hash"] in kept_hashes) == kept]
+    shared_folders = shared.folders(cfg)
+    found = []
+    for item in index.search(conn, [], {}, limit=None):
+        paths = [loc["path"] for loc in item["locations"]]
+        if len(paths) < 2 or (item["hash"] in kept_hashes) != kept:
+            continue
+        if shared.recorded(cfg, paths, item.get("collections") or [], shared_folders):
+            continue
+        found.append(item)
+    return found
 
 
 def keep_copies(cfg: Config, file_hash: str) -> None:
@@ -102,7 +115,7 @@ def destinations(cfg: Config, conn: sqlite3.Connection) -> list[str]:
     """Folders a PDF can be filed into: every folder that already holds an
     indexed PDF, and the folders above them, minus managed ones and the dump."""
     folders: set[str] = set()
-    roots = set(cfg.roots)
+    roots = set(cfg.watched)
     for (path,) in conn.execute("SELECT path FROM paths"):
         folder = PurePosixPath(path).parent
         while str(folder) not in roots and str(folder) != ".":
@@ -116,7 +129,7 @@ def destinations(cfg: Config, conn: sqlite3.Connection) -> list[str]:
 def _target(cfg: Config, conn: sqlite3.Connection, rel: str, folder: str) -> tuple[str, Path, Path]:
     """Check that `rel` may be filed into `folder`. Returns (hash, source, target)."""
     file_hash = _hash_of(conn, rel)
-    if not any(folder == root or folder.startswith(root + "/") for root in cfg.roots):
+    if not cfg.is_watched(folder):
         raise Refused("that folder is outside the folders refs scans")
     if reason := _folder_allowed(cfg, folder):
         raise Refused(f"cannot file into that folder: {reason}")
@@ -161,13 +174,15 @@ def copy(cfg: Config, conn: sqlite3.Connection, rel: str, folder: str) -> str:
 
 # --- New folders ------------------------------------------------------------------------------
 
-def make_folder(cfg: Config, folder: str) -> str:
+def make_folder(cfg: Config, folder: str, *, anywhere: bool = False) -> str:
     """Create `folder` (library-relative), with any missing folders above it,
     so PDFs can be filed into it. Returns the cleaned path.
 
     Same limits as filing: inside the scanned roots, never in a managed folder
     (overleaf, Git repositories, ...) or refs' own. Names that start with "."
     or contain ".." are refused, so nothing can point outside the library.
+    `anywhere` lifts the first limit for a shared collection's folder, which
+    is watched because it is shared.
     """
     parts = [p.strip() for p in folder.strip().strip("/").split("/")]
     if not parts or any(not p or p.startswith(".") for p in parts):
@@ -175,7 +190,7 @@ def make_folder(cfg: Config, folder: str) -> str:
     if any(ch in p for p in parts for ch in ("\\", ":", "\0")):
         raise Refused("folder names cannot contain \\, : or control characters")
     clean = "/".join(parts)
-    if not any(clean.startswith(root + "/") for root in cfg.roots):
+    if not anywhere and not any(clean.startswith(root + "/") for root in cfg.watched):
         raise Refused("new folders go inside one of the folders refs scans")
     if reason := _folder_allowed(cfg, clean):
         raise Refused(f"cannot create a folder there: {reason}")

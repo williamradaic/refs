@@ -189,3 +189,14 @@ def test_a_skipped_file_is_listed_with_the_reason(lib):
     watcher.run_pass()
     skipped = [e for e in watcher.status()["recent"] if e["outcome"] == "skipped"]
     assert len(skipped) == 1 and "incomplete" in skipped[0]["text"]
+
+
+def test_every_pass_asks_for_library_bib_even_without_changes(lib):
+    # The first pass after a start fills the index's collections; library.bib
+    # must follow it even when the folders did not change while refs was off.
+    watcher = lib.watcher()
+    pokes = []
+    watcher.exporter = type("Exporter", (), {"poke": lambda self: pokes.append(1)})()
+    watcher.run_pass()
+    watcher.run_pass()                   # nothing changed in between
+    assert len(pokes) == 2

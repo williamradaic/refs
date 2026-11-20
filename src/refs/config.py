@@ -39,7 +39,12 @@ def _macos_full_name() -> str:
 DEFAULTS: dict = {
     # Folders (relative to the Dropbox root) that are scanned for PDFs. None
     # until you choose: refs never guesses which of your folders hold papers.
+    # The folders of shared collections (collections.json) are watched too.
     "roots": [],
+    # Inboxes: folders refs lists but does not index (course folders, a course
+    # site's sync folder). The Inbox view shows the papers in them that the
+    # library lacks, to take in with their course filled in.
+    "inboxes": [],
     # The quick-add folder: the one place the app is allowed to rename freely.
     "dump": "papers-dump",
     # Where the app keeps its own record files inside Dropbox. Never scanned.
@@ -133,6 +138,11 @@ class Config:
     dropbox_root: Path          # absolute, symlinks resolved
     index_db: Path              # local SQLite index (rebuildable cache)
     roots: list[str] = field(default_factory=list)
+    inboxes: list[str] = field(default_factory=list)
+    # Folders of collections shared with coauthors (collections.json), watched
+    # like roots, and the collection each belongs to. Read when the settings load.
+    shared_folders: list[str] = field(default_factory=list)
+    shared_collections: dict[str, str] = field(default_factory=dict)   # folder -> name
     dump: str = "papers-dump"
     state_dir: str = ".refs"
     exclude_paths: list[str] = field(default_factory=list)
@@ -158,6 +168,19 @@ class Config:
     def absolute(self, rel: str) -> Path:
         """Turn a Dropbox-relative path into a real path on this machine."""
         return self.dropbox_root / rel
+
+    @property
+    def watched(self) -> list[str]:
+        """Every folder refs indexes: the roots, plus each shared collection's
+        folder that is not inside one of them already."""
+        extra = [f for f in self.shared_folders
+                 if not any(f == r or f.startswith(r.rstrip("/") + "/") for r in self.roots)]
+        return list(dict.fromkeys([*self.roots, *extra]))
+
+    def is_watched(self, rel: str) -> bool:
+        """Is this library-relative path (a file or a folder) inside a watched folder?"""
+        rel = rel.strip("/")
+        return any(rel == r or rel.startswith(r.rstrip("/") + "/") for r in self.watched)
 
 
 # --- Loading ----------------------------------------------------------------
@@ -240,6 +263,9 @@ def load(config_file: Path | None = None) -> Config:
         dropbox_root=dropbox_root,
         index_db=index_db,
         roots=list(settings["roots"]),
+        inboxes=[str(f).strip("/") for f in settings["inboxes"]],
+        shared_folders=sorted(shared := _shared_folders(dropbox_root / settings["state_dir"] / "collections.json")),
+        shared_collections=shared,
         dump=settings["dump"],
         state_dir=settings["state_dir"],
         exclude_paths=list(settings["exclude_paths"]),
@@ -266,6 +292,19 @@ def load(config_file: Path | None = None) -> Config:
         downloads_folder=(Path(settings["downloads_folder"]).expanduser()
                           if str(settings["downloads_folder"]).strip() else None),
     )
+
+
+def _shared_folders(registry: Path) -> dict[str, str]:
+    """The folders of shared collections in collections.json (collection.py),
+    each with its collection's name, read directly: a missing or half-written
+    file means none."""
+    import json
+    try:
+        entries = json.loads(registry.read_text()).get("collections") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return {str(e["folder"]).strip("/"): name for name, e in sorted(entries.items())
+            if isinstance(e, dict) and e.get("shared") and e.get("folder")}
 
 
 def not_set_up(cfg: Config) -> str | None:

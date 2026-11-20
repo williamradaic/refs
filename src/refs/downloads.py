@@ -292,7 +292,7 @@ def destination(cfg: Config, folder_rel: str | None) -> tuple[str, Path]:
     if not rel or ".." in PurePosixPath(rel).parts or rel.startswith("."):
         raise Refused("not a folder in the library")
     in_dump = rel.startswith(cfg.dump.strip("/") + "/")
-    if not in_dump and not any(rel == root or rel.startswith(root + "/") for root in cfg.roots):
+    if not in_dump and not cfg.is_watched(rel):
         raise Refused("that folder is outside the folders refs scans")
     if reason := organize._folder_allowed(cfg, rel):
         raise Refused(f"cannot put PDFs in that folder: {reason}")

@@ -97,12 +97,14 @@ def save(cfg: Config, registry: dict[str, dict]) -> None:
 
 def register(cfg: Config, name: str, *, kind: str | None = None, term: str | None = None,
              folder: str | None = None, shared: bool | None = None, bib_file: str | None = None,
+             order: int | None = None, label: str | None = None,
              registry: dict[str, dict] | None = None) -> dict:
     """Add a collection to the registry, or update the details given for one.
 
     Returns its entry. A detail left as None stays as it was. `folder` is
-    relative to the library (Dropbox) root. `registry` lets a caller register
-    several and save once.
+    relative to the library (Dropbox) root. `order` and `label` place a part
+    in its course's reading list ("03-demand-estimation-ii" -> 3, "Demand
+    estimation II"). `registry` lets a caller register several and save once.
     """
     own = registry is None
     registry = load(cfg) if own else registry
@@ -131,6 +133,10 @@ def register(cfg: Config, name: str, *, kind: str | None = None, term: str | Non
         entry["shared"] = bool(shared)
     if bib_file is not None:
         entry["bib_file"] = bib_file or None
+    if order is not None:
+        entry["order"] = order
+    if label is not None:
+        entry["label"] = label or None
     registry[name] = entry
     if own:
         save(cfg, registry)
@@ -170,6 +176,31 @@ def implicit(ctx: contexts.Context) -> tuple[str, str, str | None] | None:
         return None
     kind = "course" if ctx.term or ctx.area.lower() in COURSE_AREAS else "project"
     return name, kind, ctx.term
+
+
+def topic_part(topic: str | None) -> str | None:
+    """A topic folder's name as a sub-collection part: "03-demand-estimation-ii"
+    -> "demand-estimation-ii", "9 & 10 - Application to Public Economics" ->
+    "application-to-public-economics". Leading numbers (the order) go."""
+    if not topic:
+        return None
+    text = re.sub(r"^[\d\s&,.+_-]+", "", topic.strip()) or topic
+    try:
+        return clean_name(text.replace("/", "-"))
+    except Invalid:
+        return None
+
+
+def suggested(ctx: contexts.Context) -> str | None:
+    """The collection a PDF at this place belongs in: its course or project,
+    and for a course, inside a readings/<topic> folder, that topic as a part
+    ("220a/demand-estimation-ii"). A project's readings folders (bets/readings/
+    lit) are not topics."""
+    found = implicit(ctx)
+    if found is None:
+        return None
+    part = topic_part(ctx.topic_folder) if found[1] == "course" else None
+    return f"{found[0]}/{part}" if part else found[0]
 
 
 # --- Membership on works ------------------------------------------------------------------
@@ -311,6 +342,8 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
             "folder": entry.get("folder"),
             "shared": bool(entry.get("shared")),
             "bib_file": entry.get("bib_file"),
+            "order": entry.get("order"),
+            "label": entry.get("label"),
             "registered": name in registry,
             "implicit": name not in registry and bool(derived)
                         and not any(name in explicit(w) for w in all_works.values()),

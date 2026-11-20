@@ -182,6 +182,25 @@ Feel free to revise implementation details.
   (watched and copied into), not the whole project folder. The `roots` switch
   happens at the end of phase 3's migration, not in phase 2.
 
+## Phases 2–4 as built (2026-11-20, one branch with the PR #5 fix)
+
+- Phase 2: `cfg.watched` = roots + shared collections' folders; `inboxes`
+  setting (skipped by the scan, listed by `inbox.py`); `shared.py` (copy on
+  add, offer to trash on remove, recorded copies out of the Copies review);
+  `library.py` (place under the canonical name, journaled); marks per copy
+  (`marks_by`, `marks_latest` columns; ⚑ flags); collections on add (CLI
+  `--to`, add bar `#name` + Tab, bookmarklet "into" field remembered,
+  Downloads field, drop onto a shown collection). Collections list like
+  reading lists again (parts carry `order` and `label`).
+- Phase 3: `migrate.py` + `refs migrate` + the migration view. Best file per
+  paper = most of your marks, then newest. Copy from shared and managed
+  folders, move otherwise. Records in `<state>/migrations/` for undo (undo
+  before finishing: after the rename the recorded paths are gone). `finish`
+  renames the folder and saves dump/roots/inboxes through settings.py.
+- Phase 4: `annotations.pull` + `refs marks --pull` + the page button.
+  Pushing into the shared copy is not built (the plan's "separate, explicit
+  action"); nor the per-scan snapshot for a three-way merge.
+
 ## Defaults (confirm or change)
 
 | Decision | Default |

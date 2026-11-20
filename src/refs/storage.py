@@ -39,12 +39,14 @@ def _normalise(rel: str) -> str:
 
 
 def walk_pdfs(cfg: Config) -> Iterator[DiskFile]:
-    """Yield every PDF under the configured roots, skipping ignored folders."""
-    # Never entered or read: the app's own state folder and excluded paths
-    # (folders or single files).
-    skipped = {str(cfg.absolute(rel)) for rel in [cfg.state_dir, *cfg.exclude_paths]}
+    """Yield every PDF under the watched folders, skipping ignored folders."""
+    # Never entered or read: the app's own state folder, excluded paths
+    # (folders or single files) and inboxes (listed by inbox.py, not indexed).
+    # A watched folder inside an inbox (a shared collection's) is still walked:
+    # only folders met on the way down are checked.
+    skipped = {str(cfg.absolute(rel)) for rel in [cfg.state_dir, *cfg.exclude_paths, *cfg.inboxes]}
 
-    for root in cfg.roots:
+    for root in cfg.watched:
         top = cfg.absolute(root)
         if not top.is_dir():
             continue

@@ -133,7 +133,7 @@ class Watcher:
         root = str(cfg.dropbox_root)
         # Folders whose changes never matter: the app's own records (written
         # by every pass, so watching them would loop) and excluded paths.
-        self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths]]
+        self._skip = [os.path.join(root, rel) for rel in [cfg.state_dir, *cfg.exclude_paths, *cfg.inboxes]]
         # Reading notes (in the Obsidian vault, outside Dropbox): an edited note
         # changes what search finds, so it too starts a pass.
         # None when no vault is set (notes off): then no note path is relevant.
@@ -143,7 +143,7 @@ class Watcher:
         """Ask FSEvents for changes in the watched folders and the notes folder."""
         self._observer.unschedule_all()
         handler = _Handler(self)
-        for root in self.cfg.roots:
+        for root in self.cfg.watched:
             top = self.cfg.absolute(root)
             if top.is_dir():
                 self._observer.schedule(handler, str(top), recursive=True)
@@ -162,7 +162,7 @@ class Watcher:
         self._use(cfg)
         if self._observer is not None:
             self._schedule()
-            _log(f"settings changed: watching {', '.join(cfg.roots)} (reading new PDFs: {cfg.auto_process})")
+            _log(f"settings changed: watching {', '.join(cfg.watched)} (reading new PDFs: {cfg.auto_process})")
             self.poke()
 
     # --- events ----------------------------------------------------------------------
@@ -210,7 +210,7 @@ class Watcher:
         self._schedule()
         self._observer.daemon = True
         self._observer.start()
-        _log(f"watching {', '.join(self.cfg.roots)} (reading new PDFs: {self.cfg.auto_process})")
+        _log(f"watching {', '.join(self.cfg.watched)} (reading new PDFs: {self.cfg.auto_process})")
 
         self._wake.set()                     # first pass now: catch up on changes made while off
         threading.Thread(target=self._loop, name="refs-watch", daemon=True).start()
@@ -291,8 +291,11 @@ class Watcher:
                 self.pass_started = None
         self.last_pass = datetime.now().isoformat(timespec="seconds")
         self._report(report, results)
-        if self.exporter is not None and (report.changes or results):
-            self.exporter.poke()             # moved PDFs or new works change library.bib
+        # Every pass, not only one that changed something: the first pass after
+        # a start (or an upgrade) is what fills the index's collections, and
+        # library.bib is written only if its text actually changes.
+        if self.exporter is not None:
+            self.exporter.poke()
         return results
 
     def _stage(self, stage: str, done: int, total: int, file: str | None = None) -> None:
@@ -396,7 +399,7 @@ class Watcher:
                 "message": self.last_message,
                 "progress": self.progress, "pass_started": self.pass_started,
                 "pending": self._wake.is_set(), "now": time.time(),
-                "roots": list(self.cfg.roots), "auto_process": self.cfg.auto_process,
+                "roots": list(self.cfg.watched), "auto_process": self.cfg.auto_process,
                 "recent": list(reversed(self.recent)),          # newest first
                 "held": self.held, "limit_reached": self.limit_reached,
                 "library_bib": None if self.exporter is None else

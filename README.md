@@ -193,6 +193,47 @@ refs bib '#bets' --append                            # into the collection's own
 Collections live in refs' folder in the library: `collections.json` describes
 them, and each paper's file lists the ones you put it in.
 
+**One library folder.** Every reading lives once in the library folder (the
+quick-add folder, `refs-library` once migrated), named
+`surname-year-short-title.pdf`; courses and projects are collections, not
+folders. Course folders keep their slides and problem sets and can be listed
+as *inboxes* (settings): the **Inbox** view (under Review) shows the papers in
+them that the library lacks, with the course, and the topic as a part
+(`220a/demand-estimation-ii`), filled in. Taking one in moves it into the
+library, or copies it out of a folder another tool manages (a course site's
+sync folder). `u` undoes.
+
+**Shared projects.** A project whose folder is a Dropbox folder shared with
+coauthors is marked *shared* (`--shared`, or the box on *+ new project*).
+Its folder is watched; putting a paper in the project copies it there for
+them; a PDF a coauthor adds turns up in the Inbox, to copy into the library;
+taking a paper out asks before trashing the shared copy. Library copy plus
+shared copies are expected, so they stay out of the Copies review.
+
+**Marks across copies.** A paper with several copies shows each one's marks
+(yours, and others' by name, with the newest mark's date) and flags ⚑ a copy
+with marks the library copy lacks. *Bring them into the library copy* redraws
+those marks there (author, text, colour), after keeping the library copy as
+it was in refs' folder; `refs marks <search> --pull '#bets'` does the same.
+Marks deleted in one copy are not deleted in the other, and the two must be
+the same version.
+
+**Adding into a collection.** In the add bar, `#220a` after the link files
+the paper (Tab completes, this term's courses first); the bookmarklet window
+has an *into* field it remembers between papers (for a literature review);
+the Downloads view has one too; a PDF dropped on the page while a
+collection is shown goes into it; `refs add <link> --to bets`.
+
+**Migration.** `refs migrate` (or *migration* in the sidebar) moves every
+reading that lives only in a course or project folder into the library
+(copied out of shared and managed folders), and turns the courses and
+projects its folders gave it into collections of its own, readings/<topic>
+folders as parts. You review the plan and untick anything; one batch, undone
+as one (`refs migrate --undo`); `readings.md` in each course folder lists its
+readings. Then `refs migrate --finish` renames the library folder and has
+refs watch it alone (plus shared folders), with the course folders as
+inboxes.
+
 **library.bib.** refs keeps `library.bib` in the same folder: every paper,
 with `file` (its PDF, relative to the .bib) and `keywords` (its collections).
 JabRef and Zotero import both fields, so your courses and projects survive
@@ -264,6 +305,10 @@ refs queue                     # the reading queue, oldest first
 refs wanted                    # papers saved without a PDF yet
 refs bib blp                   # BibTeX for the best match (or `refs bib project:thesis`)
 refs bib blp --append references.bib   # add it unless the file already has it
+refs add <link> --to 220a      # add straight into a collection
+refs marks blp                 # the copies of a paper and whose marks each holds
+refs marks blp --pull '#bets'  # bring the bets copy's marks into the library copy
+refs migrate                   # the plan to move every reading into the library (--apply, --undo, --finish)
 refs bib --library             # write library.bib (every paper, PDF and collections) now
 refs rename in:dump            # propose tidy names; add --apply to rename
 refs rename --undo 3           # reverse the last 3 renames and moves

@@ -147,6 +147,8 @@ function say(text, ms = 4000) {
 async function loadSidebar() {
   const data = await get("/api/sidebar");
   state.dump = data.dump || state.dump;
+  // Each collection's details, for the reading-list headings (groupOf).
+  state.collectionInfo = Object.fromEntries((data.collections ?? []).map((c) => [c.name, c]));
   state.proxy = data.proxy ?? "";     // the library proxy (settings), "" = none
   const nav = (label, count, attrs, sub = false) =>
     `<div class="nav${sub ? " sub" : ""}" ${attrs}><span>${esc(label)}</span><span class="n">${count}</span></div>`;
@@ -165,6 +167,8 @@ async function loadSidebar() {
   html += nav("copies", data.presets.copies, `data-view="copies"`);
   // PDFs in ~/Downloads that look like papers (null: no Downloads folder set).
   if (data.presets.downloads != null) html += nav("downloads", data.presets.downloads, `data-view="downloads"`);
+  // Papers in course (inbox) folders and shared folders that the library lacks.
+  if (data.presets.inbox != null) html += nav("inbox", data.presets.inbox, `data-view="inbox"`);
   // PDFs that are on disk but were never read (an interrupted add, or a file
   // that arrived through Finder). Shown only when there are some.
   if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
@@ -214,6 +218,7 @@ async function loadSidebar() {
   html += `<div class="label">Fields</div>`;
   for (const [tag, count] of data.fields) html += nav(tag, count, `data-tag="${esc(tag)}"`);
   html += `<div class="label">refs</div>`;
+  html += `<div class="nav" data-view="migrate"><span>migration</span><span class="n"></span></div>`;
   html += `<div class="nav" data-view="settings"><span>settings</span><span class="n">,</span></div>`;
   $("side").innerHTML = html;
   markSidebar();
@@ -321,6 +326,29 @@ async function search(keepId = null, ask = "off") {
   renderDetail();
 }
 
+// Where a paper sits in the reading list being shown: {order, label, heading}.
+// In a collection: the part it is in (219a/public-economics, ordered and
+// labelled by the collection's details), else the readings/<topic> folder its
+// PDF sits in (before the migration), else "other", last. In a folder: the topic.
+const pad = (n) => (n != null ? String(n).padStart(2, "0") + " " : "");
+function groupOf(item) {
+  if (state.collection) {
+    const part = (item.collections ?? []).find((n) => n.startsWith(state.collection + "/"));
+    if (part) {
+      const info = state.collectionInfo?.[part] ?? {};
+      const label = info.label ?? part.slice(state.collection.length + 1).replace(/-/g, " ");
+      return { order: info.order ?? 500, label, heading: pad(info.order) + label };
+    }
+    const top = state.collection.split("/")[0];
+    const loc = item.locations.find((l) => l.topic && (l.slug ?? "").toLowerCase() === top);
+    if (loc) return { order: loc.topic_order ?? 500, label: loc.topic, heading: pad(loc.topic_order) + loc.topic };
+    return { order: 999, label: "", heading: "other" };
+  }
+  const loc = item.locations.find((l) => l.context === state.context) ?? item.locations[0];
+  const label = loc?.topic ?? loc?.section ?? "unfiled";
+  return { order: loc?.topic_order ?? 999, label, heading: pad(loc?.topic_order) + label };
+}
+
 function sortItems() {
   state.items = [...(state.raw ?? [])];
   const chosen = state.asked ? null : layout.sort;
@@ -329,6 +357,14 @@ function sortItems() {
     state.items.sort((a, b) => {
       const x = key(a), y = key(b);
       return (x < y ? -1 : x > y ? 1 : 0) * direction;
+    });
+  } else if (state.collection && !state.query) {
+    // A collection: like a reading list, part by part (groupOf), each part's
+    // papers in the server's order.
+    const at = new Map(state.items.map((item, i) => [item, i]));
+    state.items.sort((a, b) => {
+      const x = groupOf(a), y = groupOf(b);
+      return x.order - y.order || x.label.localeCompare(y.label) || at.get(a) - at.get(b);
     });
   } else if (!state.context && !state.query) {
     // No column chosen, no course, nothing typed: list like a bibliography.
@@ -366,16 +402,16 @@ function renderList() {
     $("list").innerHTML = renderHead() + `<div class="empty">nothing here.${drop}</div>`;
     return;
   }
-  // Inside a course, with no search words and no chosen sort, show the
-  // reading-list structure: a heading whenever the topic changes.
-  const grouped = state.context && !state.query && !layout.sort;
+  // Inside a course (a collection or a folder), with no search words and no
+  // chosen sort, show the reading-list structure: a heading whenever the
+  // part or topic changes.
+  const grouped = (state.context || state.collection) && !state.query && !layout.sort;
   let html = renderHead(), lastTopic;
   items.forEach((item, i) => {
-    const loc = item.locations.find((l) => l.context === state.context) ?? item.locations[0];
-    if (grouped && loc && loc.topic !== lastTopic) {
-      lastTopic = loc.topic;
-      const number = loc.topic_order != null ? String(loc.topic_order).padStart(2, "0") + " " : "";
-      html += `<div class="topic">${esc(number + (loc.topic ?? loc.section ?? "unfiled"))}</div>`;
+    const group = grouped ? groupOf(item) : null;
+    if (group && group.heading !== lastTopic) {
+      lastTopic = group.heading;
+      html += `<div class="topic">${esc(group.heading)}</div>`;
     }
     const cls = ["row", i === state.selected ? "sel" : "", state.marked.has(item.id) ? "mk" : ""].join(" ");
     html += `<div class="${cls}" data-i="${i}">` + visibleColumns().map((id) => {
@@ -625,12 +661,13 @@ async function renderDetail() {
   const token = ++detailToken;        // ignore a slow answer for a row we already left
 
   // Full metadata (first names, volume, pages, BibTeX) exists only for works.
-  let work = null, bibtex = "", noteData = null;
+  let work = null, bibtex = "", noteData = null, copies = [];
   if (item.work_id) {
     const data = await get(`/api/work/${item.work_id}`);
     if (token !== detailToken) return;
-    work = data.work; bibtex = data.bibtex; noteData = data.note;
+    work = data.work; bibtex = data.bibtex; noteData = data.note; copies = data.copies ?? [];
   }
+  const copyAt = Object.fromEntries(copies.map((c) => [c.path, c]));
   const meta = work?.meta ?? {};
   const authors = meta.authors?.length
     ? meta.authors.map((a) => [a.given, a.family].filter(Boolean).join(" ")).join(", ")
@@ -705,9 +742,12 @@ async function renderDetail() {
     }
   }
   for (const loc of item.locations) {
-    const place = [loc.context, loc.topic ?? loc.section].filter(Boolean).join(" · ");
+    const copy = copyAt[loc.path];
+    const place = copy?.where === "library" ? "library copy"
+      : copy?.shared ? `#${copy.shared} copy · shared with coauthors`
+      : [loc.context, loc.topic ?? loc.section].filter(Boolean).join(" · ");
     html += `<div class="loc"><div>${esc(place)}</div>
-      <div class="path">${esc(loc.path.split("/").pop())}</div>
+      <div class="path">${esc(loc.path.split("/").pop())}</div>${marksLine(copy, item.locations.length > 1)}
       <div class="acts">
         <a class="act" href="/file?path=${encodeURIComponent(loc.path)}" target="_blank">open</a>
         <button class="act" data-open="${esc(loc.path)}">preview.app</button>
@@ -737,6 +777,38 @@ async function renderDetail() {
     noteSaved[work.id] = { version: noteData.version, body: noteData.body };
     noteConflict.delete(work.id);    // freshly read: saves can go ahead again
   }
+}
+
+// One copy's marks: yours, then others' by name, and the newest mark's date.
+// ⚑ when it has marks the library copy lacks or newer ones (annotations.py);
+// a flagged copy can bring them into the library copy.
+const shortDay = (iso) => new Date(iso).toLocaleDateString([], { day: "numeric", month: "short" });
+function marksLine(copy, several) {
+  if (!copy || !several) return "";
+  const parts = [];
+  if (copy.your_pages) parts.push(`your marks on ${copy.your_pages} page${copy.your_pages === 1 ? "" : "s"}`);
+  for (const [name, n] of Object.entries(copy.others ?? {})) parts.push(`${n} by ${name || "no name"}`);
+  if (!parts.length) parts.push("no marks");
+  if (copy.latest) parts.push(`last ${shortDay(copy.latest)}`);
+  let line = `<div class="marks${copy.flag ? " flagged" : ""}">${esc(parts.join(" · "))}`;
+  if (copy.flag) line += ` <span title="${esc(copy.flag)}">⚑ ${esc(copy.flag)}</span>
+    <button class="act" data-pull="${esc(copy.path)}">bring them into the library copy</button>`;
+  return line + `</div>`;
+}
+
+async function pullMarks(path) {
+  const item = state.items[state.selected];
+  if (!item?.work_id) return;
+  if (!confirm(`Bring the marks in ${path.split("/").pop()} into the library copy?\n\n` +
+               "Only the library copy changes; refs keeps a copy of it as it was. Marks deleted in " +
+               "one copy are not deleted in the other.")) return;
+  say("bringing the marks over …", 0);
+  const answer = await post(`/api/work/${item.work_id}/pull`, { path });
+  if (answer.detail) { say(answer.detail, 12000); return; }
+  say(answer.added ? `brought ${answer.added} marks into the library copy` +
+      (answer.skipped ? ` (${answer.skipped} of a kind refs cannot redraw)` : "") +
+      `; the previous version is in ${answer.backup}` : "the library copy has every mark already", 12000);
+  renderDetail();
 }
 
 // --- reading notes --------------------------------------------------------------------
@@ -904,6 +976,9 @@ $("detail").addEventListener("click", (event) => {
     else pickerChoose(choice.dataset.folder, choice.dataset.create === "1");
   }
   else if (el.dataset.dl) takeDownloads(el.dataset.dl);
+  else if (el.dataset.inbox) takeInbox();
+  else if (el.dataset.mig) migrateAct(el.dataset.mig);
+  else if (el.dataset.pull) pullMarks(el.dataset.pull);
   else if (el.dataset.collAdd) openCollectionPicker([state.items[state.selected]?.work_id].filter(Boolean), $("collpicker"));
   else if (el.dataset.collOut) collect([state.items[state.selected]?.work_id].filter(Boolean), el.dataset.collOut, false);
   else if (el.dataset.collShow) {
@@ -973,7 +1048,7 @@ function setAdding(on) {
   $("prompt").textContent = on ? "+" : "/";
   $("q").value = on ? "" : state.query;
   $("q").placeholder = on
-    ? "add a paper: paste a URL, DOI, arXiv id or NBER number, then Enter (shift+Enter: add and queue)"
+    ? "add a paper: a URL, DOI, arXiv id or NBER number, then Enter; #220a puts it in a course (Tab completes)"
     : "search   #220a   author:smith   tag:theory   year:2019";
   if (on) $("q").focus();
 }
@@ -999,12 +1074,26 @@ $("q").addEventListener("keydown", async (event) => {
       if (state.query) search(null, "auto");
       return;
     }
-    const thing = $("q").value.trim();
+    // #names are collections to put the paper in; the rest is what to add.
+    const words = $("q").value.trim().split(/\s+/).filter(Boolean);
+    const collections = words.filter((w) => w.length > 1 && w.startsWith("#")).map((w) => w.slice(1));
+    const thing = words.filter((w) => !w.startsWith("#")).join(" ");
     if (!thing) return;
     const queue = event.shiftKey;
     setAdding(false); $("q").blur();
-    say(`adding ${thing}${queue ? " to the queue" : ""} …`, 0);
-    follow(post("/api/add", { thing, queue }), thing);
+    say(`adding ${thing}${queue ? " to the queue" : ""}${collections.length ? " into #" + collections.join(" #") : ""} …`, 0);
+    follow(post("/api/add", { thing, queue, collections }), thing);
+  }
+  // Tab after "#22" completes a collection: this term's courses first.
+  if (event.key === "Tab" && state.adding) {
+    const value = $("q").value, fragment = value.match(/#([^\s#]*)$/)?.[1];
+    if (fragment == null) return;
+    event.preventDefault();
+    collectionList ??= (await get("/api/collections")).collections;
+    const hits = collectionOrder(collectionList).filter((c) => c.name.startsWith(fragment.toLowerCase()));
+    if (!hits.length) { say(`no collection starts with ${fragment}; a new name makes one`); return; }
+    $("q").value = value.slice(0, value.length - fragment.length) + hits[0].name + " ";
+    if (hits.length > 1) say(`also: ${hits.slice(1, 6).map((c) => "#" + c.name).join(" ")}`);
   }
   if (event.key === "ArrowDown") { event.preventDefault(); $("q").blur(); }
 });
@@ -1069,7 +1158,8 @@ window.addEventListener("drop", async (event) => {
   if (!files.length) { say("only PDF files can be added"); return; }
   for (const file of files) {
     say(`adding ${file.name} …`, 0);
-    const upload = fetch(`/api/upload?name=${encodeURIComponent(file.name)}`, {
+    const into = state.collection ? `&to=${encodeURIComponent(state.collection)}` : "";
+    const upload = fetch(`/api/upload?name=${encodeURIComponent(file.name)}${into}`, {
       method: "POST", headers: { "X-Refs": "1", "Content-Type": "application/pdf" }, body: file,
     }).then((response) => response.json());
     await follow(upload, file.name);       // one at a time, so progress stays readable
@@ -1199,6 +1289,196 @@ async function showDownloads(token) {
   drawDownloadsDetail();
 }
 
+// --- the inbox (inbox.py) ----------------------------------------------------------------
+// Papers outside the library folder that it lacks: in inbox folders (course
+// folders, a course site's sync folder; listed, not indexed) and in shared
+// folders (a coauthor's addition). Each row says the collection it would go
+// in; ticked rows are taken into the library (moved, or copied from shared and
+// managed folders), named like the library's other files.
+
+async function showInbox(token) {
+  const data = await get("/api/inbox");
+  if (token !== listToken) return;
+  state.items = [];
+  state.inbox = data;
+  const waiting = data.items.filter((i) => !i.in_library);
+  const shown = state.inboxHad ? data.items : waiting;
+  const takeable = new Set(waiting.map((i) => i.path));
+  for (const path of [...state.picked]) if (!takeable.has(path)) state.picked.delete(path);
+  $("count").textContent = `${waiting.length} in the inbox`;
+  const nav = $("side").querySelector('.nav[data-view="inbox"] .n');
+  if (nav) nav.textContent = waiting.length;
+  const had = data.items.length - waiting.length;
+  let html = `<div class="bar">
+    <button class="act" data-pick="all">select all</button>
+    <button class="act" data-pick="none">select none</button>
+    <span class="where"><span id="npicked">${state.picked.size}</span> ticked</span>
+    ${had ? `<button class="act" data-inbox-had="1">${state.inboxHad ? "hide" : "show"} the ${had} already in the library</button>` : ""}
+    ${data.unseen ? `<span class="where">looking at ${data.unseen} more PDFs …</span>` : ""}
+  </div>`;
+  if (!shown.length) {
+    html += `<div class="empty">nothing waiting. ${data.inboxes.length ? "" :
+      "Inbox folders (course folders, a course site's sync folder) are set under settings."}</div>`;
+  }
+  let folder = null;
+  for (const item of shown) {
+    if (item.folder !== folder) {
+      folder = item.folder;
+      html += `<div class="topic folder"><span>${esc(folder)}</span>
+        <button class="act" data-pick-folder="${esc(folder)}">tick all</button></div>`;
+    }
+    const can = takeable.has(item.path);
+    const who = item.title ? `${authorsShort(item.authors)}${item.year ? ` (${item.year})` : ""} ${item.title}` : item.name;
+    const into = item.suggested ? `→ #${item.suggested}` : "→ library";
+    const how = item.in_library ? "already in the library" : `${item.mode === "copy" ? "copy" : "move"} · ${item.why}`;
+    html += `<label class="prop dl${can ? "" : " off"}"><input type="checkbox" data-path="${esc(item.path)}"${
+      state.picked.has(item.path) ? " checked" : ""}${can ? "" : " disabled"}>
+      <span class="name" title="${esc(item.name)}">${esc(who)}</span>
+      <span class="about">${esc(into)}</span>
+      <span class="who ${item.kind}" title="${esc(how)}">${esc(how)}</span></label>`;
+  }
+  $("list").innerHTML = html;
+  drawInboxDetail();
+}
+
+function drawInboxDetail() {
+  $("detail").innerHTML = `<div class="label">Inbox</div>
+    <p>Papers the library lacks, in ${state.inbox.inboxes.length ? `your inbox folders (${esc(state.inbox.inboxes.join(", "))})` : "no inbox folders yet"}
+    and in folders shared with coauthors. Each goes into the collection shown after the arrow.</p>
+    <div class="acts" style="margin-top:8px">
+      <button class="act" data-inbox="take">take into the library (<span class="dln">${state.picked.size}</span>)</button>
+    </div>
+    <div class="adder" style="margin-top:6px"><input name="inboxinto" value="${esc(state.inboxInto ?? "")}"
+      placeholder="and also put them in: #bets (optional)" spellcheck="false" autocomplete="off"></div>
+    <p class="where" style="margin-top:8px">A PDF is <b>moved</b> into the library, except from a folder shared with
+    coauthors or managed by another tool (a course site's sync folder): those are <b>copied</b>, so the original
+    stays. Named like the library's other files when its record is checked. <kbd>u</kbd> undoes.
+    A PDF refs never read is read first (about $0.001), then filed.</p>`;
+  $("detail").querySelector("input[name=inboxinto]").addEventListener("input", (event) => {
+    state.inboxInto = event.target.value;
+  });
+}
+
+async function takeInbox() {
+  const byPath = Object.fromEntries((state.inbox?.items ?? []).map((i) => [i.path, i]));
+  const choices = [...state.picked].filter((p) => byPath[p])
+    .map((path) => ({ path, collections: byPath[path].suggested ? [byPath[path].suggested] : [] }));
+  if (!choices.length) { say("tick the papers to take in first"); return; }
+  const extra = (state.inboxInto ?? "").split(/[\s,]+/).map((w) => w.replace(/^#/, "")).filter(Boolean);
+  say(`taking ${choices.length} into the library …`, 0);
+  const answer = await post("/api/inbox/take", { choices, extra });
+  if (answer.detail) { say(answer.detail, 9000); return; }
+  state.picked.clear();
+  state.lastFiled = answer.taken.length;           // u undoes them (the journal)
+  const parts = [];
+  if (answer.taken.length) parts.push(`took ${answer.taken.length} into the library`);
+  if (answer.refused.length) parts.push(`${answer.refused.length} not taken (${answer.refused[0].why})`);
+  say(parts.join("; ") + (answer.jobs.length ? "; reading the new ones …" : "") + ". u: undo", 12000);
+  loadSidebar(); search();
+  for (const job of answer.jobs) await follow(Promise.resolve({ job }), "the new PDFs");
+}
+
+// --- the migration (migrate.py) ---------------------------------------------------------------
+// Every paper with no PDF in the library folder gets one (moved; copied out of
+// shared and managed folders), and keeps its courses and projects as
+// collections (readings/<topic> folders as parts). Reviewed here: untick
+// what should stay; one batch, undone as one. Then "finish" switches the
+// watched folders to the library alone.
+
+async function showMigrate(token) {
+  const data = await get("/api/migrate");
+  if (token !== listToken) return;
+  state.items = [];
+  state.migrate = data;
+  if (!state.migrateSeen) {                       // first look: everything ticked
+    state.picked = new Set(data.rows.map((r) => r.work_id));
+    state.migrateSeen = true;
+  }
+  const ids = new Set(data.rows.map((r) => r.work_id));
+  for (const id of [...state.picked]) if (!ids.has(id)) state.picked.delete(id);
+  const moving = data.rows.filter((r) => r.source);
+  $("count").textContent = `${moving.length} to bring in · ${data.rows.length - moving.length} to file`;
+  let html = `<div class="bar">
+    <button class="act" data-pick="all">select all</button>
+    <button class="act" data-pick="none">select none</button>
+    <span class="where"><span id="npicked">${state.picked.size}</span> ticked</span>
+  </div>`;
+  if (!data.rows.length) html += `<div class="empty">every paper is in the library folder with its collections.</div>`;
+  let group = null;
+  for (const row of data.rows) {
+    if (row.group !== group) {
+      group = row.group;
+      html += `<div class="topic folder"><span>${esc(group)}</span></div>`;
+    }
+    const what = row.source ? `${row.mode} ${row.source.split("/").pop()}${row.mode === "copy" ? ` (${row.why})` : ""}`
+                            : "already in the library";
+    const into = row.collections.length ? row.collections.map((n) => "#" + n).join(" ") : "no new collection";
+    html += `<label class="prop dl"><input type="checkbox" data-path="${esc(row.work_id)}"${
+      state.picked.has(row.work_id) ? " checked" : ""}>
+      <span class="name" title="${esc(row.citekey)}">${esc(row.title)}</span>
+      <span class="about" title="${esc(row.source ?? "")}">${esc(what)}</span>
+      <span class="who" title="${esc(into)}">→ ${esc(into)}</span></label>`;
+  }
+  $("list").innerHTML = html;
+  drawMigrateDetail();
+}
+
+function drawMigrateDetail() {
+  const data = state.migrate, moving = data.rows.filter((r) => r.source);
+  const copies = moving.filter((r) => r.mode === "copy").length;
+  const f = data.finish;
+  const n = (count, word) => `${count} ${word}${count === 1 ? "" : "s"}`;
+  $("detail").innerHTML = `<div class="label">Into the library</div>
+    <p>${n(moving.length, "paper")} without a PDF in <code>${esc(data.dump)}</code>: ${moving.length - copies} moved there,
+    ${copies} copied (from folders shared with coauthors, or managed by another tool, which keep theirs).
+    Each keeps its courses and projects as collections, its readings/&lt;topic&gt; folder as a part.
+    ${n(data.rows.length - moving.length, "paper")} already there just get their collections.</p>
+    <div class="acts" style="margin-top:8px">
+      <button class="act" data-mig="apply">bring the ticked papers in (<span class="dln">${state.picked.size}</span>)</button>
+      ${data.undo ? `<button class="act" data-mig="undo">undo the last batch</button>` : ""}
+    </div>
+    <div class="dlopts"><label><input type="checkbox" name="readingsmd" checked> write readings.md into each course folder</label></div>
+    ${data.unidentified.length ? `<p class="where">${n(data.unidentified.length, "PDF")} that look like papers were never read
+      and stay where they are; identify them first (they are under "not identified").</p>` : ""}
+    <div class="label" style="margin-top:14px">Then: finish</div>
+    <p>Once the papers are in, refs can watch the library alone:</p>
+    <dl class="meta">
+      <dt>library</dt><dd><input name="libname" value="${esc(f.dump)}" spellcheck="false" autocomplete="off"> (now ${esc(data.dump)})</dd>
+      <dt>watched</dt><dd>the library, plus folders shared with coauthors (now ${esc(data.roots.join(", "))})</dd>
+      <dt>inboxes</dt><dd>${esc(f.inboxes.join(", ") || "none")}: listed in the Inbox, not indexed</dd>
+    </dl>
+    <p class="where">Course material (slides, problem sets) stays in its folders and leaves the index. Undo the
+    batch above before finishing, not after.</p>
+    <div class="acts"><button class="act" data-mig="finish">finish: switch the watched folders</button></div>`;
+}
+
+async function migrateAct(name) {
+  if (name === "apply") {
+    const ids = [...state.picked];
+    if (!ids.length) { say("tick the papers to bring in first"); return; }
+    const readingsMd = $("detail").querySelector("input[name=readingsmd]")?.checked ?? true;
+    say(`bringing ${ids.length} papers into the library …`, 0);
+    const answer = await post("/api/migrate/apply", { work_ids: ids, readings_md: readingsMd });
+    if (answer.detail) { say(answer.detail, 9000); return; }
+    say(`done: ${answer.done} papers (${answer.moved} files into the library)` +
+        (answer.refused.length ? `; ${answer.refused.length} refused (${answer.refused[0].why})` : ""), 12000);
+  } else if (name === "undo") {
+    if (!confirm("Put the last batch back: files to where they were, copies to the Trash, memberships undone?")) return;
+    const answer = await post("/api/migrate/undo", {});
+    say(`put back ${answer.files} files; ${answer.papers} papers' collections undone`, 9000);
+  } else if (name === "finish") {
+    const libname = $("detail").querySelector("input[name=libname]")?.value.trim();
+    const f = state.migrate.finish;
+    if (!confirm(`Rename ${state.migrate.dump} to ${libname}, watch only it (and shared folders), and list ` +
+                 `${f.inboxes.join(", ") || "no folders"} as inboxes?\n\nThe previous settings are kept as config.toml.bak.`)) return;
+    const answer = await post("/api/migrate/finish", { library_name: libname });
+    if (answer.detail) { say(answer.detail, 12000); return; }
+    say(`finished: the library is ${answer.settings.dump}; watching it alone`, 12000);
+  }
+  folderList = null;
+  loadSidebar(); search();
+}
+
 function drawDownloadsDetail() {
   const data = state.dl;
   const copy = state.dlMode === "copy";
@@ -1213,6 +1493,8 @@ function drawDownloadsDetail() {
       <label><input type="radio" name="dlmode" value="copy"${copy ? " checked" : ""}> copy (the original stays)</label>
       <label><input type="checkbox" name="dlqueue"${state.dlQueue ? " checked" : ""}> also queue them</label>
     </div>
+    <div class="adder" style="margin-top:6px"><input name="dlinto" value="${esc(state.dlInto ?? "")}"
+      placeholder="and put them in: #220a #bets (optional)" spellcheck="false" autocomplete="off"></div>
     <div class="picker" id="dlpicker"></div>
     <p class="where" style="margin-top:8px">Each one is then read like any new paper (about $0.001 a PDF).
     A PDF refs already has, byte for byte, is left in Downloads.</p>
@@ -1225,6 +1507,9 @@ function drawDownloadsDetail() {
   }
   $("detail").querySelector("input[name=dlqueue]").addEventListener("change", (event) => {
     state.dlQueue = event.target.checked;
+  });
+  $("detail").querySelector("input[name=dlinto]").addEventListener("input", (event) => {
+    state.dlInto = event.target.value;
   });
 }
 
@@ -1247,7 +1532,8 @@ async function sendDownloads(names, folder, create) {
   say(`${copying ? "copying" : "moving"} ${names.length} PDFs …`, 0);
   const response = await fetch("/api/downloads/take", { method: "POST",
     headers: { "Content-Type": "application/json", "X-Refs": "1" },
-    body: JSON.stringify({ names, folder, create, mode: state.dlMode, queue: state.dlQueue }) });
+    body: JSON.stringify({ names, folder, create, mode: state.dlMode, queue: state.dlQueue,
+                           collections: (state.dlInto ?? "").split(/[\s,]+/).map((w) => w.replace(/^#/, "")).filter(Boolean) }) });
   const result = await response.json();
   if (!response.ok) { say(result.detail ?? "could not take them in", 9000); return; }
   folderList = null;                          // a new folder may have been made
@@ -1538,7 +1824,8 @@ $("detail").addEventListener("click", async (event) => {
   drawSettings();
 });
 
-const REVIEW_VIEWS = { renames: showRenames, copies: showCopies, downloads: showDownloads, settings: showSettings };
+const REVIEW_VIEWS = { renames: showRenames, copies: showCopies, downloads: showDownloads, inbox: showInbox,
+                       migrate: showMigrate, settings: showSettings };
 
 $("list").addEventListener("change", (event) => {
   const path = event.target.dataset?.path;
@@ -1563,6 +1850,7 @@ $("list").addEventListener("click", async (event) => {
     tick(inFolder, !boxes.filter(inFolder).every((box) => box.checked));   // toggles the folder
   }
   else if (el.dataset.dlOthers) { state.dlOthers = !state.dlOthers; search(); return; }
+  else if (el.dataset.inboxHad) { state.inboxHad = !state.inboxHad; search(); return; }
   else if (el.dataset.dlTrash) { event.preventDefault(); await trashDownloads(el.dataset.dlTrash); return; }
   else if (el.dataset.collDelete) {
     const name = el.dataset.collDelete;
@@ -1806,8 +2094,23 @@ async function collect(ids, name, add = true) {
   }
   const n = answer.changed.length, papers = n === 1 ? "1 paper" : `${n} papers`;
   const stays = !add && n < ids.length ? " (a paper in it by its folder stays in it)" : "";
-  say(add ? (n ? `put ${papers} in #${answer.name}` : `already in #${answer.name}`)
-          : (n ? `took ${papers} out of #${answer.name}${stays}` : `not taken out of #${answer.name}${stays}`), 6000);
+  // A shared collection: the copies made for coauthors, or an offer to trash
+  // the ones a paper taken out leaves behind (never without asking).
+  const copied = answer.copied?.length ? `; copied ${answer.copied.length} into the shared folder` : "";
+  const notCopied = answer.not_copied?.length ? `; ${answer.not_copied.length} not copied (${answer.not_copied[0].why})` : "";
+  say(add ? (n ? `put ${papers} in #${answer.name}${copied}${notCopied}` : `already in #${answer.name}${copied}${notCopied}`)
+          : (n ? `took ${papers} out of #${answer.name}${stays}` : `not taken out of #${answer.name}${stays}`), 8000);
+  const left = answer.shared_copies ?? [];
+  if (left.length && confirm(`#${answer.name} is shared with coauthors. Move ${left.length === 1 ? "its copy" : `the ${left.length} copies`} ` +
+                             `in the shared folder to the Trash?\n\n${left.join("\n")}\n\nCoauthors would no longer see ${left.length === 1 ? "it" : "them"}.`)) {
+    let trashed = 0;
+    for (const path of left) {
+      const done = await post("/api/trash", { path });
+      if (!done.detail) trashed += 1;
+      else say(`${path.split("/").pop()}: ${done.detail}`, 9000);
+    }
+    if (trashed) say(`moved ${trashed} shared ${trashed === 1 ? "copy" : "copies"} to the Trash`, 6000);
+  }
   cpick.box?.replaceChildren();
   loadSidebar();
   // Taken out of the collection the list shows: it leaves the list.

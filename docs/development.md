@@ -49,6 +49,11 @@ there unless you mean to pay for it.
 | `contexts.py` | folders → course or project (`Layout`: own rules, a preset, a generic rule per watched folder) |
 | `collection.py` | collections (courses, projects): the registry, memberships on works, the collections folders stand for |
 | `librarybib.py` | `library.bib`, every work with its PDF and collections, rewritten by the watcher's process |
+| `library.py` | the library folder: which copy is the library's, placing a PDF there under its canonical name (journaled) |
+| `shared.py` | collections shared with coauthors: copies in their folders, recorded copies, `collect` (memberships + copies + index) |
+| `inbox.py` | papers in inbox folders (listed, not indexed) and shared folders that the library lacks; taking them in |
+| `annotations.py` | each copy's marks by author and date, flags, and the pull merge into the library copy |
+| `migrate.py` | phase 3: the plan, apply/undo (records in `<state>/migrations/`), readings.md, the finish switch |
 | `storage.py`, `scan.py` | walk the watched folders, hash, reconcile with the index |
 | `index.py`, `embed.py` | the SQLite index (a rebuildable cache) and semantic search |
 | `extract.py`, `llm.py`, `resolve.py`, `pipeline.py` | reading a PDF: text and identifiers, Claude Haiku's transcription, registry lookup, status |
@@ -103,7 +108,7 @@ have no usable registry record and end as extracted or needs-review.
 | Settings | `~/.config/refs/config.toml` (`.bak` = the version before the last save) |
 | Index (rebuildable cache), search vectors, Haiku answers, reading ledger | `~/Library/Application Support/refs/index.db` |
 | Search model (about 70 MB, downloaded once), registry cache | `~/Library/Caches/refs/` |
-| Works, read records, rename journal, `review.json`, `collections.json`, `library.bib` (synced) | `<library>/<state_dir>/`, `.refs/` by default |
+| Works, read records, rename journal, `review.json`, `collections.json`, `library.bib`, migration records, annotation backups (synced) | `<library>/<state_dir>/`, `.refs/` by default |
 | Reading notes | `<vault>/<obsidian_folder>/<citekey>.md` |
 | API key | macOS Keychain, item `refs` |
 | Login service, log | `~/Library/LaunchAgents/com.williamradaic.refs.plist`, `~/Library/Logs/refs.log` |
@@ -136,11 +141,26 @@ registry) holds only details: kind, term, folder, shared, `bib_file`. A name
 can have members without an entry.
 
 `library.bib` runs in the watching process only (one per Mac): the watcher
-pokes it after a pass that changed anything, the page after any edit, and it
+pokes it after every pass (the first one, at start, fills the index), the page after any edit, and it
 compares a fingerprint of the work files once a minute for changes from the
 command line or another Mac. The `file` field is JabRef's `:path:PDF` with a
 path relative to the .bib; the PDF is the copy in the quick-add (library)
 folder when there is one.
+
+### Watched folders, inboxes, the library folder
+
+`cfg.watched` is what is indexed: `roots` plus the folders of shared
+collections (read from `collections.json` when the settings load; the server
+reloads them when the registry changes them). `inboxes` are skipped by the
+walk and listed by `inbox.py` instead, judged like Downloads (hash + verdict,
+remembered while unchanged); a file read before keeps its work through the
+`files` row, which outlives its paths. The library folder is `dump`;
+`index.search` puts its copy first in every result's locations.
+
+Per file the index also keeps `marks_by` (everyone's marks by author) and
+`marks_latest`; files counted before those columns existed are counted again
+once. PyMuPDF marks hold only a weak link to their page: keep the page
+objects alive while working with marks (`annotations._marks`).
 
 ## Calibration
 

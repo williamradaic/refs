@@ -405,6 +405,7 @@ def cmd_collection(args: argparse.Namespace) -> int:
         return 1
     adding = args.action == "add"
     changed = set(collection.change(cfg, [r["work_id"] for r in found], name, add=adding))
+    _after_collect(cfg, conn, [r["work_id"] for r in found], name, adding, changed)
     all_works = works.load_all(cfg)
     for item in found:
         index.update_collections(conn, all_works[item["work_id"]])
@@ -414,6 +415,27 @@ def cmd_collection(args: argparse.Namespace) -> int:
     if not adding and any(name in r["collections"] and r["work_id"] not in changed for r in found):
         print("(A paper in it because of its folder stays in it until the file moves.)")
     return 0
+
+
+def _after_collect(cfg, conn, work_ids: list[str], name: str, adding: bool, changed) -> None:
+    """A shared collection (shared.py): adding copies each paper into its
+    folder; taking out leaves the copies there, and says so."""
+    from . import ingest, shared
+
+    if name not in shared.folders(cfg):
+        return
+    if adding:
+        with ingest.exclusive(cfg):
+            result = shared.copy_in(cfg, conn, work_ids, name)
+            if result["copied"]:
+                scanner.scan(cfg, conn)
+        for _, path in result["copied"]:
+            print(f"copied for coauthors: {path}")
+        for _, why in result["refused"]:
+            print(f"not copied to the shared folder: {why}")
+    else:
+        for path in shared.copies_of(cfg, conn, list(changed), name):
+            print(f"left in the shared folder (coauthors may use it; trash it on the page if not): {path}")
 
 
 def _new_collection(cfg, args: argparse.Namespace, kind: str) -> int:
@@ -445,7 +467,7 @@ def _new_collection(cfg, args: argparse.Namespace, kind: str) -> int:
         if args.make_folder:
             # Inside the watched folders, never a managed one; made first, so a
             # refused folder saves nothing.
-            folder = organize.make_folder(cfg, folder)
+            folder = organize.make_folder(cfg, folder, anywhere=args.shared)
         entry = collection.register(cfg, name, kind=kind, term=args.term, folder=folder,
                                     shared=True if args.shared else None, bib_file=args.bib)
     except (collection.Invalid, organize.Refused) as error:
@@ -468,6 +490,123 @@ def cmd_project(args: argparse.Namespace) -> int:
     """`refs project new <name>`: the plan's name for making a collection."""
     cfg = config.load()
     return _new_collection(cfg, args, kind="course" if args.course else "project")
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """`refs migrate`: move every reading into the library folder, with its
+    courses and projects as collections (migrate.py). Without options it only
+    shows the plan; --apply does it, --undo puts it back, --finish switches
+    the watched folders afterwards."""
+    from . import ingest, librarybib, migrate
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    if args.undo:
+        with ingest.exclusive(cfg):
+            done = migrate.undo(cfg)
+            scanner.scan(cfg, conn)
+        print(f"Put back {_plural(done['files'], 'file')}; memberships undone on {_plural(done['papers'], 'paper')}.")
+        return 0
+    the_plan = migrate.plan(cfg, conn)
+    if args.json:
+        print(migrate.to_json(the_plan))
+        return 0
+    if args.finish:
+        changes = migrate.finish_changes(cfg, the_plan, args.library_name)
+        print(f"This renames {cfg.dump} to {changes['dump']} and saves these settings:")
+        for key, value in changes.items():
+            print(f"  {key} = {value}")
+        print("Folders no longer watched leave the index (their files stay where they are).")
+        if not args.yes and input("Go ahead? [y/N] ").strip().lower() != "y":
+            print("Nothing changed.")
+            return 1
+        result = migrate.finish(cfg, the_plan, args.library_name)
+        cfg = config.load()
+        scanner.scan(cfg, index.connect(cfg))
+        librarybib.write(cfg)
+        print("Done." + (f" The library folder is now {result['renamed'][1]}." if result["renamed"] else "")
+              + " Restart the service to use the new settings: `refs service restart`.")
+        return 0
+
+    moving = [r for r in the_plan.rows if r.source]
+    only = {collection_name.lower() for collection_name in args.only or []}
+    chosen = [r for r in the_plan.rows
+              if not only or any(n.split("/")[0] in only for n in r.collections) or r.group in only]
+    if not args.apply:
+        moves = sum(r.mode == "move" for r in moving)
+        print(f"{_plural(len(moving), 'paper')} to bring into {cfg.dump}: {moves} moved, "
+              f"{len(moving) - moves} copied; {_plural(len(the_plan.rows) - len(moving), 'paper')} already "
+              f"there get their collections.")
+        rows = chosen if (args.list or only) else chosen[:25]
+        group = None
+        for row in rows:
+            if row.group != group:
+                group = row.group
+                print(f"\n{group}")
+            what = f"{row.mode:<4} {row.source}" if row.source else "     (in the library)"
+            print(f"  {what}\n       {row.citekey}  -> {' '.join('#' + n for n in row.collections) or '(no new collection)'}")
+        if len(rows) < len(chosen):
+            print(f"\n... and {len(chosen) - len(rows)} more (--list shows all).")
+        if the_plan.unidentified:
+            print(f"\n{_plural(len(the_plan.unidentified), 'PDF')} that look like papers were never read; "
+                  "identify them first (`refs process`) or they stay where they are.")
+        print("\n`refs migrate --apply` does it (undo: `refs migrate --undo`); the page shows the same plan "
+              "under refs → migration.")
+        return 0
+    ids = {r.work_id for r in chosen}
+    with ingest.exclusive(cfg):
+        result = migrate.apply(cfg, conn, the_plan, ids, readings_md=not args.no_readings_md)
+        scanner.scan(cfg, conn)
+    librarybib.write(cfg, conn)
+    print(f"Done: {_plural(len(result['done']), 'paper')} ({result['record']}).")
+    for work_id, why in result["refused"]:
+        print(f"  not moved: {why}")
+    print("Undo with `refs migrate --undo`. When it looks right: `refs migrate --finish`.")
+    return 0
+
+
+def cmd_marks(args: argparse.Namespace) -> int:
+    """`refs marks <search>`: each copy of the best match, with whose marks it
+    holds; `--pull FROM` brings one copy's marks into the library copy
+    (FROM: a shared collection, #bets, or a path)."""
+    from . import annotations, ingest, works
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    terms, filters = _split_query(args.query)
+    all_works = works.load_all(cfg)
+    found = [r for r in index.search(conn, terms, filters, limit=None, semantic=True) if r["work_id"] in all_works]
+    if not found:
+        print("No matching paper.", file=sys.stderr)
+        return 1
+    item = found[0]
+    copies = annotations.copies(cfg, conn, item["work_id"])
+    if not args.pull:
+        print(_headline(item) + f"  @{item['citekey']}")
+        for c in copies:
+            others = ", ".join(f"{n} by {a or 'no name'}" for a, n in c["others"].items())
+            mine = f"your marks on {c['your_pages']} pages" if c["your_pages"] else ""
+            print(f"  {c['where']:<20} {' · '.join(x for x in (mine, others) if x) or 'no marks'}"
+                  + (f" · last {c['latest'][:10]}" if c["latest"] else "") + (f"  ⚑ {c['flag']}" if c["flag"] else ""))
+            print(f"    {c['path']}")
+        return 0
+    wanted = args.pull.lstrip("#")
+    source = next((c["path"] for c in copies if c["path"] == args.pull or c["shared"] == wanted), None)
+    if source is None:
+        print(f"No copy of this paper in {args.pull}.", file=sys.stderr)
+        return 1
+    with ingest.exclusive(cfg):
+        try:
+            result = annotations.pull(cfg, conn, item["work_id"], source)
+        except annotations.Refused as error:
+            print(f"refs: {error}.", file=sys.stderr)
+            return 1
+        if result["added"]:
+            scanner.scan(cfg, conn)
+    print(f"Brought {result['added']} marks into the library copy"
+          + (f" ({result['skipped']} could not be redrawn)" if result["skipped"] else "")
+          + (f"; the previous version is in {result['backup']}." if result["backup"] else "."))
+    return 0
 
 
 def cmd_dupes(args: argparse.Namespace) -> int:
@@ -706,6 +845,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         work = works.create_stub(cfg, record.to_dict(), source_url)
         if args.queue:
             _queue(cfg, work)
+        _collect_on_add(cfg, conn, work, args.to)
         print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})"
               + ("  [queued]" if args.queue else ""))
         print(f"  @{work['citekey']} . Save the PDF into {cfg.dump} and it will attach itself.")
@@ -731,9 +871,28 @@ def cmd_add(args: argparse.Namespace) -> int:
         _queue(cfg, item.work)
     print(f"Added {ingest.headline(item)}" + ("  [queued]" if args.queue and item.work else ""))
     print(f"  {item.rel}" + (f"   @{item.work['citekey']}" if item.work else ""))
+    if item.work:
+        _collect_on_add(cfg, conn, item.work, args.to)
     for issue in item.read["issues"]:
         print(f"  ! {issue}")
     return 0
+
+
+def _collect_on_add(cfg, conn, work: dict, names: list[str] | None) -> None:
+    """`refs add ... --to 220a --to bets`: put the new paper in those collections."""
+    from . import collection, works
+
+    for raw in names or []:
+        try:
+            name = collection.clean_name(raw)
+        except collection.Invalid as error:
+            print(f"  ! {error}")
+            continue
+        changed = collection.change(cfg, [work["id"]], name)
+        _after_collect(cfg, conn, [work["id"]], name, True, changed)
+        print(f"  in #{name}")
+    if names:
+        index.update_collections(conn, works.load_all(cfg)[work["id"]])
 
 
 def _queue(cfg, work: dict, on: bool = True) -> None:
@@ -1253,6 +1412,25 @@ def main(argv: list[str] | None = None) -> int:
     _collection_options(p)
     p.set_defaults(run=cmd_project)
 
+    p = sub.add_parser("migrate", help="move every reading into the library folder, courses as collections")
+    p.add_argument("--apply", action="store_true", help="do it (without: show the plan)")
+    p.add_argument("--only", action="append", metavar="COLLECTION", help="only these courses or projects")
+    p.add_argument("--list", action="store_true", help="show every row of the plan")
+    p.add_argument("--no-readings-md", action="store_true", help="do not write readings.md into course folders")
+    p.add_argument("--undo", action="store_true", help="put the last migration back")
+    p.add_argument("--finish", action="store_true",
+                   help="afterwards: watch only the library (and shared folders), course folders as inboxes")
+    p.add_argument("--library-name", help="with --finish: rename the library folder, e.g. refs-library")
+    p.add_argument("--yes", action="store_true", help="with --finish: do not ask")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_migrate)
+
+    p = sub.add_parser("marks", help="a paper's copies and whose marks each holds; --pull merges them")
+    p.add_argument("query", nargs="+", help="words and key:value filters; the best match")
+    p.add_argument("--pull", metavar="FROM",
+                   help="bring this copy's marks into the library copy: a shared collection (#bets) or a path")
+    p.set_defaults(run=cmd_marks)
+
     p = sub.add_parser("dupes", help="files stored in more than one place")
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_dupes)
@@ -1268,6 +1446,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("add", help="quick add: a URL, DOI, arXiv id, NBER number or PDF file")
     p.add_argument("thing")
     p.add_argument("--queue", action="store_true", help="also put it on the reading queue")
+    p.add_argument("--to", action="append", metavar="COLLECTION",
+                   help="also put it in this collection (a course or project); repeatable")
     # Passed by the page when the bookmarklet has read the paper's page already.
     p.add_argument("--doi", help="the paper's DOI, as its page gives it")
     p.add_argument("--pdf-url", help="a link to the PDF, tried first")
