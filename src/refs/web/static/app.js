@@ -160,6 +160,9 @@ async function loadSidebar() {
   html += nav("reading", data.presets.reading, `data-view="reading"`);
   html += nav("read", data.presets.read, `data-view="read"`);
   html += nav("no pdf yet", data.presets.wanted, `data-view="wanted"`);
+  // The library folder itself (the quick-add folder, refs-library): its PDFs.
+  const libraryFolder = data.contexts.find((c) => c.key === "dump");
+  if (libraryFolder) html += nav(state.dump, libraryFolder.count, `data-context="dump" title="the library folder"`);
   // Things that want a decision from you.
   html += `<div class="label">Review</div>`;
   html += nav("needs review", data.presets.review, `data-view="review"`);
@@ -186,10 +189,9 @@ async function loadSidebar() {
     (areas[name] ??= []).push({ key, rest, count, term });
   }
   const listed = ["dump", ...data.areas];
-  // The quick-add folder, then collections (collection.py): courses by term,
-  // newest first, then projects. A sub-collection (219a/public-economics)
-  // sits under its parent and goes with the parent's term.
-  if (areas.dump) html += nav(state.dump, areas.dump[0].count, `data-context="dump"`);
+  // Collections (collection.py): projects, then courses by term, newest
+  // first. A sub-collection (219a/public-economics) sits under its parent and
+  // goes with the parent's term. (The library folder is listed under Library.)
   html += collectionsNav(data.collections ?? []);
   for (const area of listed) {
     if (!areas[area] || area === "dump") continue;
