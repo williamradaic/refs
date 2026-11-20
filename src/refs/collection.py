@@ -207,7 +207,23 @@ def suggested(ctx: contexts.Context) -> str | None:
 # --- Membership on works ------------------------------------------------------------------
 
 def explicit(work: dict) -> list[str]:
-    return list((work.get("user") or {}).get("collections") or [])
+    """The collections you put a work in, as names refs uses ("Suburbia" ->
+    "suburbia"). Names written elsewhere (a Zotero import before it cleaned
+    them, an edited file) are read cleaned, so #suburbia, rename and delete
+    find them; put and take write the cleaned list back. A name that cannot
+    be cleaned is kept as written."""
+    return cleaned((work.get("user") or {}).get("collections") or [])
+
+
+def cleaned(names: list[str]) -> list[str]:
+    """Names as refs uses them, in order, without repeats (see explicit)."""
+    out = []
+    for raw in names:
+        try:
+            out.append(clean_name(raw))
+        except Invalid:
+            out.append(raw)
+    return list(dict.fromkeys(out))
 
 
 def put(work: dict, name: str) -> bool:
@@ -215,7 +231,7 @@ def put(work: dict, name: str) -> bool:
     have = explicit(work)
     if name in have:
         return False
-    work.setdefault("user", {})["collections"] = [*have, name]
+    work.setdefault("user", {})["collections"] = [*have, name]    # cleaned, as explicit() reads them
     return True
 
 
@@ -367,7 +383,7 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
     members: dict[str, set[str]] = {}
     for row in conn.execute("SELECT work_id, collections FROM files "
                             "WHERE work_id IS NOT NULL AND collections IS NOT NULL"):
-        for name in json.loads(row["collections"]):
+        for name in cleaned(json.loads(row["collections"])):     # an index made before names were cleaned
             members.setdefault(name, set()).add(row["work_id"])
     # Works the index has not seen yet (just added) still count by their own field.
     for work_id, work in all_works.items():

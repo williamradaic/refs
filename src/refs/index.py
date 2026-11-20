@@ -634,7 +634,7 @@ def search(
             if key == "queued" and bool(row["queued"]) != (wanted in {"yes", "true", "1"}):
                 return False
             if key in {"collection", "course", "project"}:
-                have = json.loads(row["collections"] or "[]")
+                have = collection.cleaned(json.loads(row["collections"] or "[]"))
                 # Several #names (joined with commas) must all hold; a parent
                 # takes in its sub-collections.
                 for name in wanted.split(","):

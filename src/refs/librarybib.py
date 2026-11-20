@@ -67,7 +67,7 @@ def render(cfg: Config, conn: sqlite3.Connection) -> str:
     for row in conn.execute("SELECT work_id, collections FROM files "
                             "WHERE work_id IS NOT NULL AND collections IS NOT NULL"):
         names = member_of.setdefault(row["work_id"], [])
-        names += [n for n in json.loads(row["collections"]) if n not in names]
+        names += [n for n in collection.cleaned(json.loads(row["collections"])) if n not in names]
 
     here = path(cfg).parent
     entries = []

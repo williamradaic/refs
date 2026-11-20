@@ -316,7 +316,9 @@ class Importer:
         # dict.fromkeys keeps order and drops repeats: running the import twice
         # adds nothing the second time.
         user["tags"] = list(dict.fromkeys([*user.get("tags", []), *tags]))
-        user["collections"] = list(dict.fromkeys([*user.get("collections", []), *collections]))
+        # Zotero's names ("Card-Dahl style") become names refs uses ("card-dahl-style").
+        from .collection import explicit
+        user["collections"] = explicit({"user": {"collections": [*user.get("collections", []), *collections]}})
         for note in notes:
             if note not in user.get("notes", ""):
                 user["notes"] = (user.get("notes", "") + "\n\n" + note).strip()

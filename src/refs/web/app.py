@@ -602,12 +602,21 @@ def create_app(watch: bool = False) -> FastAPI:
         if fresh.shared_folders != cfg.shared_folders:
             apply_settings(fresh)
 
+    def existing(name: str) -> str:
+        """A collection's name as refs stores it, refusing one that does not
+        exist (so a delete or rename never reports success for nothing)."""
+        name = collection.clean_name(name)
+        if name not in {c["name"] for c in collection.listing(cfg, index.connect(cfg))}:
+            raise collection.Invalid(f"there is no collection #{name}")
+        return name
+
     @app.post("/api/collections/delete")
     def collections_delete(name: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
         """Forget a collection: its registry entry and your memberships (the
         page offers this for an empty one)."""
         guard(x_refs)
         try:
+            name = existing(name)
             count = collection.delete(cfg, name)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
@@ -688,7 +697,7 @@ def create_app(watch: bool = False) -> FastAPI:
         every paper's membership. Papers in it by their folder stay as they are."""
         guard(x_refs)
         try:
-            old, new = collection.clean_name(old), collection.clean_name(new)
+            old, new = existing(old), collection.clean_name(new)
             if old == new:
                 raise collection.Invalid("that is its name already")
             if any(collection.matches(c["name"], new) for c in collection.listing(cfg, index.connect(cfg))):

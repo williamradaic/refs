@@ -283,3 +283,37 @@ def test_sidebar_endpoints_hide_arrange_rename_and_export(lib):
     assert bibtex["count"] == 1 and "Procrastination" in bibtex["bibtex"]
     # Finder: only a place the registry names.
     assert client.post("/api/collections/open", json={"name": "job-market"}, headers=H).status_code == 404
+
+
+def test_names_imported_as_written_are_read_cleaned_and_can_be_deleted(lib):
+    """A Zotero import stored "Card-Dahl style" as written: refs reads it as
+    card-dahl-style, so #card-dahl-style, rename and delete find it."""
+    from fastapi.testclient import TestClient
+
+    from refs.web.app import create_app
+
+    salience = lib.work[SALIENCE]
+    work = works.load_all(lib.cfg)[salience]
+    work["user"]["collections"] = ["Card-Dahl style", "Suburbia"]
+    records.write_json(works.works_dir(lib.cfg) / f"{salience}.json", work)
+    scan.scan(lib.cfg, lib.conn)
+    work = works.load_all(lib.cfg)[salience]
+    assert collection.explicit(work) == ["card-dahl-style", "suburbia"]
+    names = {c["name"] for c in collection.listing(lib.cfg, lib.conn)}
+    assert {"card-dahl-style", "suburbia"} <= names and "Suburbia" not in names
+    assert titles(index.search(lib.conn, [], {"collection": "suburbia"}, limit=None)) == ["Salience and Taxation"]
+    H = {"X-Refs": "1"}
+    client = TestClient(create_app())
+    assert client.post("/api/collections/delete", json={"name": "suburbia"}, headers=H).json()["papers"] == 1
+    assert works.load_all(lib.cfg)[salience]["user"]["collections"] == ["card-dahl-style"]
+    # A name no collection has is refused, not reported as deleted.
+    answer = client.post("/api/collections/delete", json={"name": "suburbia"}, headers=H)
+    assert answer.status_code == 400 and "no collection" in answer.json()["detail"]
+
+
+def test_zotero_import_cleans_collection_names(lib):
+    importer = works.Importer(lib.cfg)
+    record = {"title": "A New Paper", "year": 2020, "authors": [{"given": "B.", "family": "Doe"}]}
+    work = importer.add(record, file_hashes=[], external={}, tags=[], collections=["Card-Dahl style", "card-dahl-style"],
+                        notes=[])
+    assert work["user"]["collections"] == ["card-dahl-style"]
