@@ -302,6 +302,21 @@ header .act { white-space: nowrap; }
 details.kept { margin-top: 1.5em; }
 details.kept > summary { cursor: pointer; }
 .copy { display: flex; justify-content: space-between; gap: 2ch; padding: 1px 2ch 1px 4ch; }
+/* The Copies review's recommendation (keep.py): per copy, the action, then
+   its name, details and reason stacked, the buttons on a line of their own,
+   so the narrow list pane never squeezes the name. */
+.copyset .advice { padding: 0 2ch 2px 4ch; color: var(--dim); }
+.copyset .copy { display: grid; grid-template-columns: 7ch minmax(0, 1fr); column-gap: 1ch;
+                 padding: 3px 2ch 3px 4ch; }
+.copy .do { grid-column: 1; }
+.copy .what { grid-column: 2; display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.copy .what .where, .copy .what .why { font-size: 12px; color: var(--dim); }
+.copy .what .why { font-style: italic; }
+.copyset .copy .acts { grid-column: 2; display: flex; flex-wrap: wrap; gap: 0 1.5ch; }
+.do-kept { color: var(--ok); }
+.do-trash { color: var(--dim); }
+.do-trashq { color: var(--warn); }
+.do-merge, .do-keep { color: var(--accent); }
 .copy .path { overflow-wrap: anywhere; }
 .copy .acts { flex-wrap: nowrap; }
 .picker .pick { width: 100%; margin-top: 4px; font: inherit; color: var(--fg); background: transparent;

@@ -158,9 +158,11 @@ def _copy_look(doc, new, annot) -> None:
     new.update()
 
 
-def pull(cfg: Config, conn: sqlite3.Connection, work_id: str, source: str, *, now: float | None = None) -> dict:
+def pull(cfg: Config, conn: sqlite3.Connection, work_id: str, source: str, *, into: str | None = None,
+         now: float | None = None) -> dict:
     """Bring the marks of one copy of a paper (`source`, a path) into its
-    library copy. Returns {"added", "skipped" (kinds that cannot be redrawn),
+    library copy, or into another copy of it (`into`: the one the Copies
+    review keeps). Returns {"added", "skipped" (kinds that cannot be redrawn),
     "backup" (the library copy as it was, under refs' folder) or None}.
     Refused when there is no library copy, when the two are different
     versions (their pages do not line up), or when either changed in the last
@@ -172,9 +174,11 @@ def pull(cfg: Config, conn: sqlite3.Connection, work_id: str, source: str, *, no
     import pymupdf
 
     paths = library.paths_of(conn, work_id)
-    target = library.copy_of(cfg, paths)
+    target = into or library.copy_of(cfg, paths)
     if target is None:
         raise Refused("the paper has no copy in the library folder to bring marks into")
+    if target not in paths:
+        raise Refused("that is not a copy of this paper")
     if source not in paths or source == target:
         raise Refused("that is not another copy of this paper")
     now = time.time() if now is None else now

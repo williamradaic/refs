@@ -26,10 +26,11 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import (annotations, bib, capture, collection, config, downloads, inbox, index, ingest, keys,
+from .. import (annotations, bib, capture, collection, config, downloads, inbox, index, ingest, keys, library,
                 migrate, notes, onboarding, organize, reading, records, rename, resolve, settings, shared, venues,
                 works)
 from .. import ask as asking
+from .. import keep as keeping              # an endpoint below is called `keep`
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
 from .. import scan as scanner
 from ..cli import _split_query
@@ -461,14 +462,15 @@ def create_app(watch: bool = False) -> FastAPI:
                 "copies": annotations.copies(cfg, index.connect(cfg), work_id)}
 
     @app.post("/api/work/{work_id}/pull")
-    def pull_marks(work_id: str, path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
-        """Bring the marks of another copy (`path`) into the library copy
-        (annotations.pull): a copy of the library file is kept first."""
+    def pull_marks(work_id: str, path: str = Body(embed=True), into: str | None = Body(default=None, embed=True),
+                   x_refs: str | None = Header(default=None)) -> dict:
+        """Bring the marks of another copy (`path`) into the library copy, or
+        into `into` (annotations.pull): a copy of that file is kept first."""
         guard(x_refs)
         with ingest.exclusive(cfg):
             conn = index.connect(cfg)
             try:
-                result = annotations.pull(cfg, conn, work_id, path)
+                result = annotations.pull(cfg, conn, work_id, path, into=into)
             except annotations.Refused as error:
                 raise HTTPException(409, str(error))
             if result["added"]:
@@ -744,11 +746,45 @@ def create_app(watch: bool = False) -> FastAPI:
 
     @app.get("/api/copies")
     def copies() -> dict:
+        """Papers stored more than once, each with which copy to keep and what
+        to do with the others (keep.py); and the sets kept on purpose."""
         conn, all_works = index.connect(cfg), works.load_all(cfg)
-        def rows(found):
-            return [shape(item, all_works) | {"hash": item["hash"]} for item in found]
-        return {"items": rows(organize.copies(cfg, conn)),
-                "kept": rows(organize.copies(cfg, conn, kept=True))}
+        def rows(found, advise: bool):
+            out = []
+            for item in found:
+                row = shape(item, all_works) | {"hash": item["hash"]}
+                if advise:
+                    row["advice"] = keeping.recommend(cfg, conn, all_works.get(item["work_id"] or ""),
+                                                   [loc["path"] for loc in item["locations"]])
+                out.append(row)
+            return out
+        return {"items": rows(organize.copies(cfg, conn), True),
+                "kept": rows(organize.copies(cfg, conn, kept=True), False)}
+
+    @app.post("/api/copies/apply")
+    def copies_apply(work_ids: list[str] = Body(embed=True), optional: bool = Body(default=False, embed=True),
+                     x_refs: str | None = Header(default=None)) -> dict:
+        """Do what the recommendation says for these papers: trash the copies
+        it marks "trash" (and "trash?" when `optional`), then give the kept
+        copy its tidy name. Recomputed here, never taken from the page."""
+        guard(x_refs)
+        all_works = works.load_all(cfg)
+        trashed, renamed, refused = [], [], []
+        with ingest.exclusive(cfg):
+            conn = index.connect(cfg)
+            for work_id in dict.fromkeys(work_ids):
+                work = all_works.get(work_id)
+                if work is None:
+                    continue
+                result = keeping.apply(cfg, conn, work, library.paths_of(conn, work_id), optional=optional)
+                trashed += result["trashed"]
+                renamed += [result["renamed"]] if result["renamed"] else []
+                refused += [{"path": p, "why": why} for p, why in result["refused"]]
+            if trashed or renamed:
+                scanner.scan(cfg, conn)
+        if trashed or renamed:
+            library_changed()
+        return {"trashed": trashed, "renamed": renamed, "refused": refused}
 
     @app.post("/api/copies/keep")
     def keep(file_hash: str = Body(embed=True, alias="hash"),

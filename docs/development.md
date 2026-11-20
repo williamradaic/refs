@@ -53,6 +53,7 @@ there unless you mean to pay for it.
 | `shared.py` | collections shared with coauthors: copies in their folders, recorded copies, `collect` (memberships + copies + index) |
 | `inbox.py` | papers in inbox folders (listed, not indexed) and shared folders that the library lacks; taking them in |
 | `annotations.py` | each copy's marks by author and date, flags, and the pull merge into the library copy |
+| `keep.py` | which copy of a paper to keep (marks, version, place, name) and doing it: the Copies review |
 | `migrate.py` | phase 3: the plan, apply/undo (records in `<state>/migrations/`), readings.md, the finish switch |
 | `storage.py`, `scan.py` | walk the watched folders, hash, reconcile with the index |
 | `index.py`, `embed.py` | the SQLite index (a rebuildable cache) and semantic search |

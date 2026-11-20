@@ -86,15 +86,22 @@ def unkeep_copies(cfg: Config, file_hash: str) -> None:
         records.write_json(_review_path(cfg), review)
 
 
-def trash(cfg: Config, conn: sqlite3.Connection, rel: str) -> Path:
+def trash(cfg: Config, conn: sqlite3.Connection, rel: str, *, other_version_ok: bool = False) -> Path:
     """Move one copy of a file to the macOS Trash. Returns where it went.
 
-    Refused for the last copy of a file and inside managed folders. The file
-    keeps its name in the Trash, so it can be dragged back.
+    Refused for the last copy of a file and inside managed folders. With
+    `other_version_ok` (a recommendation of keep.py), the last copy of one
+    version may go while the paper keeps a file of another version (a working
+    paper next to the published article); never the paper's last file. The
+    file keeps its name in the Trash, so it can be dragged back.
     """
     file_hash = _hash_of(conn, rel)
     others = conn.execute("SELECT COUNT(*) FROM paths WHERE hash=? AND path<>?",
                           (file_hash, rel)).fetchone()[0]
+    if others == 0 and other_version_ok:
+        others = conn.execute(
+            "SELECT COUNT(*) FROM paths p JOIN files f ON f.hash = p.hash WHERE p.path<>? AND f.work_id = "
+            "(SELECT work_id FROM files WHERE hash=? AND work_id IS NOT NULL)", (rel, file_hash)).fetchone()[0]
     if others == 0:
         raise Refused("this is the only copy; refs never trashes the last one")
     if reason := rename.blocked_reason(cfg, rel):

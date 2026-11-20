@@ -1576,16 +1576,45 @@ async function trashDownloads(which) {
 // The same PDF in more than one place. Often on purpose (a reading for a course
 // and for a project); otherwise trash the extra copy. The last copy cannot be trashed.
 // Sets marked "keep all" are listed at the bottom, folded, where they can be un-kept.
+// A set of copies with refs' recommendation (keep.py): which copy to keep (★)
+// and, for each other one, trash (nothing is lost), trash? (another version
+// you may still want), merge (has marks the kept copy lacks) or keep.
+const COPY_ACTION = { "": "★ keep", keep: "keep", trash: "trash", "trash?": "trash?", merge: "merge" };
+function copyMarks(copy) {
+  const parts = [`${copy.pages} p.`];
+  if (copy.your_pages) parts.push(`your marks on ${copy.your_pages} p.`);
+  for (const [name, n] of Object.entries(copy.others ?? {})) parts.push(`${n} by ${name || "no name"}`);
+  if (copy.latest) parts.push(`last ${shortDay(copy.latest)}`);
+  return parts.join(" · ");
+}
 function copySet(item, kept) {
   const name = item.title ?? item.locations[0].path.split("/").pop();
   const who = item.authors?.length ? `${authorsShort(item.authors)} (${item.year ?? "n.d."}) ` : "";
-  const button = kept ? `<button class="act" data-unkeep="${esc(item.hash)}">un-keep</button>`
-                      : `<button class="act" data-keep="${esc(item.hash)}">keep all</button>`;
-  let html = `<div class="copyset"><div class="topic"><span>${esc(who + name)}</span>${button}</div>`;
-  for (const loc of item.locations) {
-    html += `<div class="copy"><span class="path">${esc(loc.path)}</span>
-      <span class="acts"><button class="act" data-reveal="${esc(loc.path)}">finder</button>
-      ${kept ? "" : `<button class="act" data-trash="${esc(loc.path)}">trash</button>`}</span></div>`;
+  const advice = item.advice;
+  const doable = advice && ["safe", "optional"].includes(advice.verdict);
+  const buttons = kept ? `<button class="act" data-unkeep="${esc(item.hash)}">un-keep</button>`
+    : (doable ? `<button class="act" data-apply-copies="${esc(item.work_id)}" title="trash what it says, then tidy the name">do it</button>` : "")
+      + `<button class="act" data-keep="${esc(item.hash)}">keep all</button>`;
+  let html = `<div class="copyset ${advice ? "v-" + advice.verdict : ""}"><div class="topic"><span>${esc(who + name)}</span>${buttons}</div>`;
+  if (advice?.summary) {
+    html += `<div class="advice">${esc(advice.summary)}${advice.rename_to
+      ? ` Then the kept copy takes the name <span class="path">${esc(advice.rename_to)}</span>.` : ""}</div>`;
+  }
+  const copies = advice?.copies?.length ? advice.copies : item.locations.map((loc) => ({ path: loc.path }));
+  for (const copy of copies) {
+    const action = advice ? (copy.path === advice.keep ? "" : copy.action) : null;
+    const folder = copy.path.slice(0, copy.path.lastIndexOf("/"));
+    html += `<div class="copy">
+      ${action != null ? `<span class="do do-${(action || "kept").replace("?", "q")}">${esc(COPY_ACTION[action] ?? action)}</span>` : ""}
+      <span class="what"><span class="path">${esc(copy.path.split("/").pop())}</span>
+        <span class="where">${esc(folder)}${copy.pages != null ? " · " + esc(copyMarks(copy)) : ""}</span>
+        ${copy.why && action ? `<span class="why">${esc(copy.why)}</span>` : ""}</span>
+      <span class="acts">
+        ${action === "merge" ? `<button class="act" data-merge="${esc(copy.path)}" data-into="${esc(advice.keep)}"
+            data-work="${esc(item.work_id)}">bring its marks over</button>` : ""}
+        <a class="act" href="/file?path=${encodeURIComponent(copy.path)}" target="_blank">open</a>
+        <button class="act" data-reveal="${esc(copy.path)}">finder</button>
+        ${kept ? "" : `<button class="act" data-trash="${esc(copy.path)}">trash</button>`}</span></div>`;
   }
   return html + `</div>`;
 }
@@ -1595,18 +1624,35 @@ async function showCopies(token) {
   if (token !== listToken) return;
   state.items = [];
   $("count").textContent = `${data.items.length} sets of copies`;
-  let html = data.items.length ? "" : `<div class="empty">no file is stored twice.</div>`;
-  html += data.items.map((item) => copySet(item, false)).join("");
+  state.copies = data.items;
+  // Sets where nothing is lost (the same file, copies without marks of their
+  // own) can be cleared in one go; the rest want a look first.
+  const safe = data.items.filter((i) => i.advice?.verdict === "safe");
+  let html = data.items.length ? `<div class="bar">
+    ${safe.length ? `<button class="act" data-apply-safe="1" title="the sets where nothing is lost: the same file, or copies without marks of their own">clear the ${safe.length} safe sets</button>` : ""}
+    <span class="where">${data.items.length - safe.length} to look at</span></div>`
+    : `<div class="empty">no file is stored twice.</div>`;
+  const rank = { merge: 0, optional: 1, keep: 2, safe: 3 };
+  const ordered = [...data.items].sort((a, b) => (rank[a.advice?.verdict] ?? 9) - (rank[b.advice?.verdict] ?? 9));
+  html += ordered.map((item) => copySet(item, false)).join("");
   if (data.kept.length) {
     html += `<details class="kept"><summary class="topic">kept on purpose (${data.kept.length})</summary>
       ${data.kept.map((item) => copySet(item, true)).join("")}</details>`;
   }
   $("list").innerHTML = html;
   $("detail").innerHTML = `<div class="label">Copies</div>
-    <p>The same PDF, byte for byte, stored in more than one place.</p>
-    <p class="where" style="margin-top:8px"><b>trash</b> moves that copy to the macOS Trash
-    (drag it back to restore). <b>keep all</b> says the copies are on purpose and moves the
-    set to <b>kept on purpose</b> at the bottom, where <b>un-keep</b> brings it back.</p>`;
+    <p>A paper stored more than once: the same file twice, a copy you marked up next to a clean one,
+    a working paper next to the published article. For each, refs says which copy to keep (★) and why:</p>
+    <dl class="meta">
+      <dt>your marks</dt><dd>the copy you highlighted is kept; one whose marks are all in it can go</dd>
+      <dt>the version</dt><dd>the published article over the working paper, a later draft over an earlier one: only suggested</dd>
+      <dt>place, name</dt><dd>the library copy, the tidy name, no "-2"</dd>
+    </dl>
+    <p class="where" style="margin-top:8px"><b>trash</b>: nothing is lost. <b>trash?</b>: another version you may
+    still want (a working paper can carry the appendix). <b>merge</b>: it has marks the kept copy lacks;
+    <b>bring its marks over</b> first. <b>do it</b> does what the set says, then gives the kept copy its tidy
+    name. Everything goes to the macOS Trash, from where it can be dragged back. <b>keep all</b> moves a set
+    to <b>kept on purpose</b> at the bottom, where <b>un-keep</b> brings it back.</p>`;
 }
 
 // --- settings ----------------------------------------------------------------------------
@@ -1871,6 +1917,26 @@ $("list").addEventListener("click", async (event) => {
     await post("/api/copies/keep", { hash: el.dataset.keep });
     say("kept: these copies are on purpose (un-keep under \"kept on purpose\")");
     loadSidebar(); search();
+  }
+  else if (el.dataset.applyCopies || el.dataset.applySafe) {
+    const ids = el.dataset.applySafe
+      ? (state.copies ?? []).filter((i) => i.advice?.verdict === "safe").map((i) => i.work_id)
+      : [el.dataset.applyCopies];
+    // One set: you looked at it, so its "trash?" go too. All safe sets: only "trash".
+    const answer = await post("/api/copies/apply", { work_ids: ids, optional: !el.dataset.applySafe });
+    if (answer.detail) { say(answer.detail, 9000); return; }
+    const parts = [`moved ${answer.trashed.length} ${answer.trashed.length === 1 ? "copy" : "copies"} to the Trash`];
+    if (answer.renamed.length) parts.push(`renamed ${answer.renamed.length}`);
+    if (answer.refused.length) parts.push(`${answer.refused.length} refused (${answer.refused[0].why})`);
+    say(parts.join("; "), 9000);
+    loadSidebar(); search();
+  }
+  else if (el.dataset.merge) {
+    if (!confirm("Bring this copy's marks into the kept copy? Only the kept copy changes; refs keeps a copy of it as it was.")) return;
+    const answer = await post(`/api/work/${el.dataset.work}/pull`, { path: el.dataset.merge, into: el.dataset.into });
+    if (answer.detail) { say(answer.detail, 12000); return; }
+    say(`brought ${answer.added} marks into the kept copy; now it can go`, 9000);
+    search();
   }
   else if (el.dataset.unkeep) {
     await post("/api/copies/unkeep", { hash: el.dataset.unkeep });

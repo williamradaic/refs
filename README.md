@@ -141,7 +141,10 @@ Obsidian.
 **Review**, in the sidebar: *needs review* (correct a record, fetch it by DOI,
 or accept it), *renames* (tidy file names, `surname-year-short-title.pdf`,
 only for files you tick; undo is offered), *copies* (the same PDF in several
-places: trash a copy or keep them on purpose).
+places, or a marked-up copy next to a clean one, or a working paper next to the
+published article: refs says which copy to keep and why, from your marks first,
+then the version, then place and name; *do it* trashes what it says and gives the
+kept copy its tidy name, *clear the safe sets* does every set where nothing is lost).
 
 **Filing into courses and projects.** **File to…** (`F`) moves a PDF into
 another folder, **Copy to…** (`C`) copies it (the original stays, say in a
