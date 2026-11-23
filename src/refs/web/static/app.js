@@ -1,11 +1,24 @@
-// refs: the page's behaviour. No framework: the state is one object, and each
-// change re-renders the pane it affects.
+// refs: the page's behaviour. Plain browser ES modules, zero build step.
+
+import { $, esc, termRank, clock, shortDay, proxyUrl, get, post, say, copyText, copyBibtex } from "./js/api.js";
+import { decodeHash, pushHash, workLink } from "./js/router.js";
+import { filterCollectionItems, renderCollectionBar, handleWorkspaceAction } from "./js/workspace.js";
+import { showUpdates, handleUpdatesClick } from "./js/updates.js";
+import { showImport, openImportView, wireImportEvents } from "./js/importer.js";
+import { showSettings, wireSettingsEvents } from "./js/settings.js";
+import { maybeOnboard } from "./js/onboarding.js";
+import {
+  READ_ORDER, readingStripHtml, tagsSectionHtml, backlinksHtml, highlightsHtml,
+  showRereadForm, openMergePicker, saveQueueNote,
+} from "./js/detail_extras.js";
 
 const state = {
   query: "",          // what is typed in the search bar
-  view: "all",        // sidebar preset: all | queue | unread | reading | read | review | wanted | renames | copies | downloads
-  context: null,      // selected folder key, e.g. "dump" or "referee/econometrica"
+  view: "all",        // sidebar preset: all | queue | unread | reading | skimmed | read | review | wanted | updates | import | renames | copies | downloads | inbox | settings | sidebar
+  context: null,      // selected folder key, e.g. "referee/econometrica"
   collection: null,   // selected collection (course or project), e.g. "220a" or "219a/public-economics"
+  collectionFilter: "all", // per-collection filter pill: all | queued | unread | reading | skimmed | read | wanted
+  collectionAll: null,     // full unfiltered items in the current collection (for workspace pill counts)
   tag: null,          // selected field tag
   scope: "library",   // "library" = papers only, "all" = course material too
   items: [],          // current search results
@@ -16,22 +29,11 @@ const state = {
   dlMode: "move",     // downloads view: "move" out of Downloads, or "copy" (the original stays)
   dlQueue: false,     // downloads view: also put what is taken in on the reading queue
   marked: new Map(),  // rows selected for a batch action (⌘-click, ⇧-click, x): id → item.
-                      //   Kept across searches, so a selection can be gathered from several.
   lastFiled: 0,       // how many files the last file to… / copy to… moved (u undoes them)
   lastBatch: 0,       // how many renames the last "rename selected" did (for undo)
-  dump: "papers-dump", // the quick-add folder's name (config.toml `dump`), from the sidebar
+  dump: "refs-library", // the library folder's name (config.toml `dump`), from the sidebar
 };
 
-const $ = (id) => document.getElementById(id);
-// Order of terms, oldest to newest: "2026-fall" -> 2026*4 + 3. Terms arrive
-// in one form (contexts.term_of). No term sorts before every term.
-const SEASONS = { winter: 0, spring: 1, summer: 2, fall: 3 };
-const termRank = (term) => {
-  const [year, season] = String(term ?? "").split("-");
-  return term ? Number(year) * 4 + (SEASONS[season] ?? 0) : Infinity;
-};
-const esc = (text) => String(text ?? "").replace(/[&<>"]/g,
-  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // Record status: squares (filled = confirmed by a registry, framed = by you,
 // half = transcribed only, empty = no PDF). Circles belong to your reading.
 const GLYPH = { verified: "■", confirmed: "▣", imported: "◆", extracted: "◧",
@@ -43,50 +45,65 @@ const GLYPH = { verified: "■", confirmed: "▣", imported: "◆", extracted: "
 const last = "￿";      // sorts after every real string: empty values go to the end
 // Sort orders for the two glyph columns, as text so every key compares alike.
 // Reading: the queue (in queue order), then started, read, unread.
-const READ_RANK = { reading: "1", read: "2", unread: "3" };
+const READ_RANK = { reading: "1", skimmed: "2", read: "3", unread: "4" };
 // Status: from the most trustworthy record to the least, then no PDF, not a paper.
 const STATUS_RANK = { confirmed: 0, verified: 1, imported: 2, extracted: 3, "needs-review": 4,
   "no-file": 5, confidential: 6, classified: 7 };
 const COLUMNS = {
-  // Your reading: ▸ on the queue, ◐ started, ● read (set by you or detected
-  // from your markup). Circles, so they never look like the status column's
-  // squares. The queue mark wins: a paper queued to re-read shows ▸.
   rd:      { label: "◐",       width: 1,  fixed: true, align: "center",
-             sort: (i) => (i.queued ? "0" + i.queued : READ_RANK[i.read_status] ?? "9"),
+             sort: (i) => (i.queued ? (i.queue_priority === "next" ? "00" : "01") + i.queued : READ_RANK[i.read_status] ?? "9"),
              cell: (i) => {
                const status = i.read_status;
                const how = i.read_source === "detected" ? " (from your markup)" : "";
-               if (i.queued) return `<span class="rd q" title="queued${status !== "unread" ? `, ${status}` : ""}">▸</span>`;
-               if (status === "reading") return `<span class="rd" title="started${how}">◐</span>`;
+               if (i.queued) {
+                 const star = i.queue_priority === "next";
+                 const tip = `${star ? "up next · " : ""}queued${status !== "unread" ? `, ${status}` : ""}${i.queue_note ? `: ${i.queue_note}` : ""}`;
+                 return `<span class="rd q" title="${esc(tip)}">${star ? "★" : "▸"}</span>`;
+               }
+               if (status === "reading") return `<span class="rd" title="reading${how}">◐</span>`;
+               if (status === "skimmed") return `<span class="rd" title="skimmed">◔</span>`;
                if (status === "read") return `<span class="rd done" title="read${how}">●</span>`;
                return `<span class="rd"></span>`; } },
   st:      { label: "■",       width: 1,  fixed: true, align: "center",
              sort: (i) => STATUS_RANK[i.status] ?? 8,
              cell: (i) => { const st = i.status ?? "classified";
                return `<span class="st ${st}" title="${st}">${GLYPH[st] ?? "·"}</span>`; } },
+  nt:      { label: "✎",       width: 2,  fixed: true, align: "center",
+             sort: (i) => (i.has_note ? "0" : i.marks ? "1" : "2"),
+             cell: (i) => {
+               const bits = [];
+               if (i.has_note) bits.push("has reading note");
+               if (i.marks) bits.push(`${i.marks} marks on ${i.marked_pages}p`);
+               if (!bits.length) return `<span class="nt"></span>`;
+               const glyph = i.has_note ? "✎" : "·";
+               return `<span class="nt${i.has_note ? " has" : ""}" title="${esc(bits.join(" · "))}">${glyph}</span>`; } },
   authors: { label: "authors", width: 20, cls: "au", sort: (i) => (i.authors?.[0] ?? last).toLowerCase(),
              text: (i) => authorsShort(i.authors) },
   year:    { label: "year",    width: 5,  cls: "yr", align: "right", sort: (i) => i.year ?? 0, text: (i) => i.year ?? "" },
   title:   { label: "title",   width: null, cls: "ti", sort: (i) => (i.title ?? last).toLowerCase(),
-             text: (i) => i.title ?? i.locations[0]?.path.split("/").pop() },
+             cell: (i) => {
+               const text = i.title ?? i.locations[0]?.path.split("/").pop() ?? "";
+               const showQueueHint = (state.view === "queue" || state.collectionFilter === "queued") && (i.queue_note || i.queue_for);
+               const hint = showQueueHint
+                 ? `<span class="qhint">— ${esc([i.queue_note, i.queue_for && `#${i.queue_for}`].filter(Boolean).join(" · "))}</span>` : "";
+               return `<span class="ti left">${esc(text)}${hint}</span>`; } },
   abbr:    { label: "jrnl",    width: 9,  cls: "ab", sort: (i) => (i.abbr ?? last).toLowerCase(),
              text: (i) => i.abbr ?? "" },
   venue:   { label: "publication", name: "publication", width: 22, cls: "ve",
              sort: (i) => (i.venue_label ?? last).toLowerCase(), text: (i) => i.venue_label ?? "" },
-  // Dates show the day (YYYY-MM-DD) but sort by the moment (`*_at`, seconds),
-  // so papers from the same day keep the order in which they came.
+  read_at: { label: "read",    name: "last read", width: 10, cls: "da",
+             sort: (i) => i.read_at ?? "", text: (i) => i.read_at ?? "" },
   added:   { label: "added",    width: 10, cls: "da", sort: (i) => i.added_at ?? -Infinity,
              text: (i) => i.added ?? "" },
   modified: { label: "modified", width: 10, cls: "da", sort: (i) => i.modified_at ?? -Infinity,
              text: (i) => i.modified ?? "" },
-  // When the paper entered refs (its record was made), as opposed to the
-  // PDF's own dates above: useful for "what did I collect last week".
   in_refs: { label: "in refs", name: "added to refs", width: 10, cls: "da", sort: (i) => i.in_refs_at ?? -Infinity,
              text: (i) => i.in_refs ?? "" },
 };
-COLUMNS.st.name = "status"; COLUMNS.abbr.name = "journal abbreviation"; COLUMNS.rd.name = "queue / reading";
-const DEFAULT_LAYOUT = { order: ["rd", "st", "authors", "year", "title", "abbr", "venue", "added", "in_refs", "modified"],
-  hidden: [], widths: {}, sort: null, side: null, detail: null };
+COLUMNS.st.name = "status"; COLUMNS.abbr.name = "journal abbreviation";
+COLUMNS.rd.name = "queue / reading"; COLUMNS.nt.name = "notes & highlights";
+const DEFAULT_LAYOUT = { order: ["rd", "st", "nt", "authors", "year", "title", "abbr", "venue", "read_at", "added", "in_refs", "modified"],
+  hidden: ["read_at"], widths: {}, sort: null, side: null, detail: null };
 
 // Column order, widths, sort and pane sizes are remembered in this browser.
 function loadLayout() {
@@ -121,26 +138,6 @@ function applyLayout() {
 }
 const visibleColumns = () => layout.order.filter((id) => !layout.hidden.includes(id));
 let layout = loadLayout();
-
-// --- talking to the server ---------------------------------------------------
-
-async function get(url, signal = undefined) {
-  return (await fetch(url, signal ? { signal } : undefined)).json();
-}
-async function post(url, body) {
-  // The X-Refs header is what the server checks before changing anything.
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Refs": "1" },
-    body: JSON.stringify(body ?? {}),
-  });
-  return response.json();
-}
-function say(text, ms = 4000) {
-  $("message").textContent = text;
-  clearTimeout(say.timer);
-  if (ms) say.timer = setTimeout(() => ($("message").textContent = ""), ms);
-}
 
 // --- sidebar -------------------------------------------------------------------
 
@@ -210,11 +207,10 @@ function drawSidebar() {
   html += nav("queue", data.presets.queue, `data-view="queue"`);
   html += nav("unread", data.presets.unread, `data-view="unread"`);
   html += nav("reading", data.presets.reading, `data-view="reading"`);
+  if (data.presets.skimmed != null) html += nav("skimmed", data.presets.skimmed, `data-view="skimmed"`);
   html += nav("read", data.presets.read, `data-view="read"`);
   html += nav("no pdf yet", data.presets.wanted, `data-view="wanted"`);
-  // The library folder itself (the quick-add folder, refs-library): its PDFs.
-  const libraryFolder = data.contexts.find((c) => c.key === "dump");
-  if (libraryFolder) html += nav(state.dump, libraryFolder.count, `data-context="dump" title="the library folder"`);
+  html += `<div class="nav" data-view="import" title="import a .bib, list of DOIs/URLs, or syllabus"><span>batch import</span><span class="n">+</span></div>`;
   add("library", "Library", html);
 
   add("pinned", "Pinned", pinnedNav(data.collections ?? []));
@@ -224,14 +220,11 @@ function drawSidebar() {
   const review = (view, label, count) => (count == null || (side.quiet && !count && state.view !== view)) ? ""
     : nav(label, count, `data-view="${view}"`);
   html = review("review", "needs review", data.presets.review);
+  html += review("updates", "published", data.presets.updates ?? 0);
   html += review("renames", "renames", data.presets.renames);
   html += review("copies", "copies", data.presets.copies);
-  // PDFs in ~/Downloads that look like papers (null: no Downloads folder set).
   html += review("downloads", "downloads", data.presets.downloads);
-  // Papers in course (inbox) folders and shared folders that the library lacks.
   html += review("inbox", "inbox", data.presets.inbox);
-  // PDFs that are on disk but were never read (an interrupted add, or a file
-  // that arrived through Finder). Shown only when there are some.
   if (data.presets.unprocessed) html += nav("not identified", data.presets.unprocessed, `data-view="unprocessed"`);
   add("review", "Review", html || `<div class="nav more"><span>nothing to decide</span><span class="n"></span></div>`);
 
@@ -390,6 +383,7 @@ $("side").addEventListener("click", (event) => {
     return;
   }
   state.collection = el.dataset.collection ?? null;
+  state.collectionFilter = "all";
   state.context = el.dataset.context ?? null;
   state.tag = el.dataset.tag ?? null;
   state.view = el.dataset.view ?? "all";
@@ -527,6 +521,7 @@ async function search(keepId = null, ask = "off") {
   searchAbort?.abort();
   searchAbort = null;
   if (REVIEW_VIEWS[state.view] && !state.context && !state.tag && !state.collection) {
+    pushHash(state, null);
     return REVIEW_VIEWS[state.view](token);
   }
   // The sidebar selection becomes ordinary filters in front of the typed query.
@@ -553,7 +548,13 @@ async function search(keepId = null, ask = "off") {
   }
   clearTimeout(waiting);
   if (token !== listToken) return;
-  state.raw = data.items;                 // the server's order, kept for "no sort"
+  if (state.collection) {
+    state.collectionAll = data.items;
+    state.raw = filterCollectionItems(data.items, state.collectionFilter);
+  } else {
+    state.collectionAll = null;
+    state.raw = data.items;                 // the server's order, kept for "no sort"
+  }
   state.asked = Boolean(data.asked);      // Haiku chose this order: keep it unsorted
   if (data.error) say(data.error);
   else if (data.message) say(`✦ ${data.message}`, 9000);
@@ -562,6 +563,7 @@ async function search(keepId = null, ask = "off") {
   for (const item of state.items) if (state.marked.has(item.id)) state.marked.set(item.id, item);
   const kept = keepId ? state.items.findIndex((i) => i.id === keepId) : -1;
   state.selected = Math.max(0, kept);
+  pushHash(state, state.items[state.selected]?.work_id ?? null, Boolean(keepId));
   renderList();
   renderDetail();
 }
@@ -597,13 +599,17 @@ function sortItems() {
     const decorated = raw.map((item, idx) => ({ item, k: key(item), idx }));
     decorated.sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : a.idx - b.idx) * direction);
     state.items = decorated.map((d) => d.item);
+  } else if (state.collection && state.collectionFilter === "queued" && !state.query) {
+    state.items = [...raw].sort((a, b) =>
+      Number(a.queue_priority !== "next") - Number(b.queue_priority !== "next")
+      || (a.queued ?? "").localeCompare(b.queued ?? ""));
   } else if (state.collection && !state.query) {
     // A collection: like a reading list, part by part (groupOf), each part's
     // papers in the server's order.
     const decorated = raw.map((item, idx) => ({ item, g: groupOf(item), idx }));
     decorated.sort((a, b) => a.g.order - b.g.order || COLLATOR.compare(a.g.label, b.g.label) || a.idx - b.idx);
     state.items = decorated.map((d) => d.item);
-  } else if (!state.context && !state.query) {
+  } else if (!state.context && !state.query && state.view !== "queue") {
     // No column chosen, no course, nothing typed: list like a bibliography.
     const decorated = raw.map((item) => ({
       item, k: `${(item.authors?.[0] ?? last).toLowerCase()} ${item.year ?? 9999}`,
@@ -637,23 +643,28 @@ function renderHead() {
 function renderList() {
   const items = state.items;
   $("count").textContent = `${items.length} ${state.scope === "all" ? "items" : "works"}`;
+  const ws = renderCollectionBar(state);
   if (!items.length) {
-    // An empty collection (a typo in the box, a finished course) can go.
-    const drop = state.collection && !state.query
+    const drop = state.collection && !state.query && state.collectionFilter === "all"
       ? ` <button class="act" data-coll-delete="${esc(state.collection)}">delete #${esc(state.collection)}</button>` : "";
-    $("list").innerHTML = renderHead() + `<div class="empty">nothing here.${drop}</div>`;
+    $("list").innerHTML = ws + renderHead() + `<div class="empty">nothing here.${drop}</div>`;
     return;
   }
-  // Inside a course (a collection or a folder), with no search words and no
-  // chosen sort, show the reading-list structure: a heading whenever the
-  // part or topic changes.
-  const grouped = (state.context || state.collection) && !state.query && !layout.sort;
+  const inQueue = (state.view === "queue" || state.collectionFilter === "queued") && !state.query && !layout.sort;
+  const hasUpNext = inQueue && items.some((i) => i.queue_priority === "next");
+  const grouped = !inQueue && (state.context || state.collection) && !state.query && !layout.sort;
   const cols = visibleColumns().map((id) => COLUMNS[id]);
-  const chunks = [renderHead()];
+  const chunks = [ws, renderHead()];
   let lastTopic;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    if (grouped) {
+    if (hasUpNext) {
+      const grp = item.queue_priority === "next" ? "★ up next" : "queue";
+      if (grp !== lastTopic) {
+        lastTopic = grp;
+        chunks.push(`<div class="topic">${esc(grp)}</div>`);
+      }
+    } else if (grouped) {
       const group = groupOf(item);
       if (group.heading !== lastTopic) {
         lastTopic = group.heading;
@@ -805,6 +816,7 @@ function select(i, scroll = true) {
     nextRow.classList.add("sel");
     if (scroll) nextRow.scrollIntoView({ block: "nearest" });
   }
+  pushHash(state, state.items[state.selected]?.work_id ?? null, true);
   return renderDetail();
 }
 
@@ -862,27 +874,26 @@ function primaryPath(item) {
 function renderBatch() {
   const items = [...state.marked.values()];
   const withPdf = items.filter(primaryPath);
+  const colBib = state.collection && state.collectionInfo?.[state.collection]?.bib_file;
   let html = `<h1>${items.length} selected</h1>
     <p class="where">⌘-click or <kbd>x</kbd> adds or removes a row, ⇧-click a range, <kbd>esc</kbd> clears.
     The selection stays while you search, so you can gather papers from several searches.</p>
     <div class="acts" style="margin-top:6px">
-      <button class="act" data-batch="move" ${withPdf.length ? "" : "disabled"}>file to…</button>
-      <button class="act" data-batch="copy" ${withPdf.length ? "" : "disabled"}>copy to…</button>
       <button class="act" data-batch="collect">add to collection…</button>
       ${state.collection ? `<button class="act" data-batch="uncollect">take out of #${esc(state.collection)}</button>` : ""}
+      ${colBib ? `<button class="act" data-batch="append-bib">append to #${esc(state.collection)} .bib</button>` : ""}
       <button class="act" data-batch="queue">queue all</button>
       <button class="act" data-batch="read">mark read</button>
+      <button class="act" data-batch="reread" ${withPdf.length ? "" : "disabled"}
+        title="Re-scan selected PDFs with Claude and refresh registry metadata">re-read pdfs${withPdf.length && withPdf.length < items.length ? ` (${withPdf.length})` : ""}</button>
       <button class="act" data-batch="clear">clear</button>
     </div><div class="picker" id="batchpicker"></div>`;
-  if (withPdf.length < items.length) {
-    html += `<p class="where">${items.length - withPdf.length} of them have no PDF yet and are left out of filing.</p>`;
-  }
   html += `<div class="label">Selected</div>`;
   for (const item of items) {
     const path = primaryPath(item);
     const who = item.authors?.length ? `${authorsShort(item.authors)} (${item.year ?? "n.d."}) ` : "";
     html += `<div class="loc"><div>${esc(who + (item.title ?? path?.split("/").pop() ?? ""))}</div>
-      <div class="path">${esc(path ? path.slice(0, path.lastIndexOf("/")) : "no pdf")}</div></div>`;
+      <div class="path">${esc(item.collections?.length ? item.collections.map((c) => "#" + c).join(" ") : (path ? "in library" : "no pdf"))}</div></div>`;
   }
   $("detail").innerHTML = html;
   $("detail").dataset.bibtex = "";
@@ -900,12 +911,28 @@ async function batchAct(name) {
   const ids = items.map((i) => i.work_id).filter(Boolean);
   if (name === "collect") { openCollectionPicker(ids, $("batchpicker")); return; }
   if (name === "uncollect") { collect(ids, state.collection, false); return; }
-  // Queue or mark read, one paper at a time (each is a small write).
+  if (name === "append-bib" && state.collection) {
+    const res = await post("/api/collections/append-bib", { name: state.collection, work_ids: ids });
+    if (res.detail) { say(res.detail, 9000); return; }
+    say(`appended ${res.added?.length ?? 0} entries to ${res.bib_file} (${res.present?.length ?? 0} already present)`, 9000);
+    return;
+  }
+  if (name === "reread") {
+    const withPdf = items.filter(primaryPath);
+    const workIds = withPdf.map((i) => i.work_id).filter(Boolean);
+    const paths = withPdf.filter((i) => !i.work_id).map(primaryPath).filter(Boolean);
+    const total = workIds.length + paths.length;
+    const label = total === 1
+      ? (withPdf[0].citekey ?? primaryPath(withPdf[0]).split("/").pop())
+      : `${total} PDFs`;
+    await rereadPdfs({ workIds, paths, label, skipped: items.length - total });
+    return;
+  }
   const works = items.filter((i) => i.work_id);
   for (const item of works) {
     const done = name === "queue"
-      ? await post(`/api/work/${item.work_id}/queue`, { on: true })
-      : await post(`/api/work/${item.work_id}/read`, { status: "read" });
+      ? await post(`/api/work/${item.work_id}/queue`, { on: true, for_collection: state.collection })
+      : await post(`/api/work/${item.work_id}/read`, { status: "read", context: state.collection });
     if (!done.detail) Object.assign(item, done);
   }
   say(`${name === "queue" ? "queued" : "marked read"}: ${works.length} papers`);
@@ -918,6 +945,36 @@ let detailToken = 0;
 let detailAbort = null;
 let detailDone = Promise.resolve();   // the detail pane's latest draw (menu actions wait for it)
 function renderDetail() { return (detailDone = drawDetail()); }
+function preferredCitekey(item) {
+  if (!item?.citekey) return { key: "", alias: false };
+  const colBib = state.collection && state.collectionInfo?.[state.collection]?.bib_file;
+  const bibKeys = item.bib_keys ?? currentWork?.bib_keys ?? {};
+  if (colBib) {
+    const clean = colBib.replace(/^(~|Dropbox)\//, "");
+    const base = clean.split("/").pop();
+    for (const [k, file] of Object.entries(bibKeys)) {
+      const f = String(file).replace(/^(~|Dropbox)\//, "");
+      if (f === clean || f.endsWith("/" + clean) || (base && f.endsWith("/" + base))) {
+        return { key: k, alias: true, file: f };
+      }
+    }
+  }
+  return { key: item.citekey, alias: false };
+}
+
+function appendBibTarget(item) {
+  const candidates = [state.collection, ...(item.collections ?? [])].filter(Boolean);
+  for (const name of candidates) {
+    const info = state.collectionInfo?.[name];
+    if (info?.bib_file) return { name, bib_file: info.bib_file };
+    const top = name.split("/")[0];
+    if (top !== name && state.collectionInfo?.[top]?.bib_file) {
+      return { name: top, bib_file: state.collectionInfo[top].bib_file };
+    }
+  }
+  return null;
+}
+
 async function drawDetail() {
   detailAbort?.abort();
   detailAbort = null;
@@ -926,8 +983,8 @@ async function drawDetail() {
   if (!item) { $("detail").innerHTML = ""; return; }
   const token = ++detailToken;        // ignore a slow answer for a row we already left
 
-  // Full metadata (first names, volume, pages, BibTeX) exists only for works.
-  let work = null, bibtex = "", noteData = null, copies = [];
+  // Full metadata (first names, volume, pages, BibTeX, highlights, backlinks) exists only for works.
+  let work = null, bibtex = "", noteData = null, copies = [], hlItems = [], backlinks = [];
   if (item.work_id) {
     const controller = new AbortController();
     detailAbort = controller;
@@ -939,7 +996,8 @@ async function drawDetail() {
       throw error;
     }
     if (token !== detailToken) return;
-    work = data.work; bibtex = data.bibtex; noteData = data.note; copies = data.copies ?? [];
+    work = data.work; bibtex = data.bibtex; noteData = data.note;
+    copies = data.copies ?? []; hlItems = data.highlights ?? []; backlinks = data.backlinks ?? [];
   }
   const copyAt = Object.fromEntries(copies.map((c) => [c.path, c]));
   const meta = work?.meta ?? {};
@@ -955,52 +1013,23 @@ async function drawDetail() {
   if (authors) html += `<p class="who">${esc(authors)}</p>`;
   if (where) html += `<p class="where">${esc(where)}</p>`;
 
-  html += `<div class="label">Record</div><dl class="meta">`;
-  html += `<dt>status</dt><dd><span class="st ${status}">${GLYPH[status] ?? "·"}</span> ${esc(status)}${
-    meta.source ? ` <span class="badge">· ${esc(meta.source === "pdf" ? "read from the pdf" : "from " + meta.source)}</span>` : ""}</dd>`;
-  if (item.citekey) html += `<dt>citekey</dt><dd>${esc(item.citekey)}</dd>`;
-  // Keys the project .bib files use for this paper (learned by refs).
-  for (const [key, file] of Object.entries(work?.bib_keys ?? {})) {
-    html += `<dt>also</dt><dd>${esc(key)} <span class="badge">· ${esc(file.replace(/^(~|Dropbox)\//, ""))}</span></dd>`;
-  }
-  if (meta.doi) html += `<dt>doi</dt><dd><a href="https://doi.org/${esc(meta.doi)}" target="_blank" rel="noreferrer">${esc(meta.doi)}</a></dd>`;
-  html += `<dt>kind</dt><dd>${esc(item.kind)}</dd>`;
-  if (item.read_status) {
-    const auto = work?.read_auto;
-    const how = item.read_source === "detected" && auto
-      ? ` <span class="badge">· from your markup on ${auto.pages}/${auto.of} pages</span>` : "";
-    html += `<dt>read</dt><dd>${esc(item.read_status)}${how}</dd>`;
-  }
-  if (item.queued) html += `<dt>queue</dt><dd><span class="rd q">▸</span> since ${esc(item.queued.slice(0, 10))}</dd>`;
-  // The detail pane gives the time too (the list shows only the day).
-  const when = (day, at) => esc(day) + (at != null ? ` <span class="badge">${clock(at)}</span>` : "");
-  if (item.added) html += `<dt>added</dt><dd>${when(item.added, item.added_at)}</dd>`;
-  if (item.in_refs) html += `<dt>in refs</dt><dd>${when(item.in_refs, item.in_refs_at)}</dd>`;
-  if (item.modified) html += `<dt>modified</dt><dd>${when(item.modified, item.modified_at)}</dd>`;
-  html += `</dl>`;
-  if (work) {
-    // Corrections: edit any field by hand, pull the record for a DOI you know,
-    // or accept the record as it stands. All three clear "needs review".
-    html += `<div class="acts" style="margin-top:6px">
-      <button class="act" data-act="edit">edit</button>
-      ${["needs-review", "extracted", "imported"].includes(status)
-        ? `<button class="act" data-act="confirm">accept as is</button>` : ""}
-      ${work.user?.overrides && Object.keys(work.user.overrides).length
-        ? `<button class="act" data-act="revert">undo my edits</button>` : ""}
-    </div><div id="editor"></div>`;
-  }
-  if (item.work_id) html += collectionsHtml(item);
-  if (work && noteData) html += noteHtml(work, noteData);
-  if (work?.user?.notes) html += `<div class="label">From Zotero</div><p class="notes">${esc(work.user.notes)}</p>`;
+  // 1. Reading status pills, reading log & queue intent right at the top.
+  if (work) html += readingStripHtml(item, work);
 
-  // A work with several PDFs keeps the description of its best one.
+  // 2. Collections & Tags (project-first).
+  if (item.work_id) html += collectionsHtml(item);
+  html += tagsSectionHtml(work, item);
+
+  // 3. Obsidian Notes (+ backlinks) & PDF Highlights.
+  if (work && noteData) html += noteHtml(work, noteData, backlinks);
+  if (work?.user?.notes) html += `<div class="label">From Zotero</div><p class="notes">${esc(work.user.notes)}</p>`;
+  if (work) html += highlightsHtml(work, hlItems, noteData?.available);
+
+  // 4. Summary.
   const about = work?.description ?? item.description;
   if (about) html += `<div class="label">About</div><p>${esc(about)}</p>`;
-  if (item.tags?.length) {
-    html += `<div class="label">Tags</div><div class="tags">` +
-      item.tags.map((t) => `<span class="tag" data-tag="${esc(t)}">${esc(t)}</span>`).join("") + `</div>`;
-  }
 
+  // 5. Files: compact single-copy library row; full multi-copy breakdown when shared/duplicated.
   if (!item.status && item.locations.length) {
     html += `<p class="where" style="margin-top:8px">This PDF is on disk but has not been read yet.</p>
       <div class="acts"><button class="act" data-identify="${esc(item.locations[0].path)}">identify it now</button></div>`;
@@ -1008,27 +1037,68 @@ async function drawDetail() {
   html += `<div class="label">Files</div>`;
   if (!item.locations.length) {
     html += `<p class="where">no pdf yet. Save it into ${esc(state.dump)} and it attaches itself.</p>`;
-    // Paywalled? Open its page through the library proxy (settings), signed in as you.
     const page = work?.user?.source_url || (meta.doi ? `https://doi.org/${meta.doi}` : "");
     if (state.proxy && page) {
-      const via = state.proxy + (/qurl=$/i.test(state.proxy) ? encodeURIComponent(page) : page);
+      const via = proxyUrl(state.proxy, page);
       html += `<div class="acts"><a class="act" href="${esc(via)}" target="_blank" rel="noreferrer">through the library</a></div>`;
     }
+  } else if (item.locations.length === 1 && copyAt[item.locations[0].path]?.where === "library") {
+    const loc = item.locations[0];
+    html += `<div class="loc filebar" data-path="${esc(loc.path)}">
+      <a class="act" href="/file?path=${encodeURIComponent(loc.path)}" target="_blank">open</a>
+      <button class="act" data-open="${esc(loc.path)}">preview.app</button>
+      <button class="act" data-reveal="${esc(loc.path)}">finder</button>
+      <span class="path" title="${esc(loc.path)}">${esc(loc.path.split("/").pop())}</span>
+      <div class="picker" data-for="${esc(loc.path)}" style="flex-basis:100%"></div>
+    </div>`;
+  } else {
+    for (const loc of item.locations) {
+      const copy = copyAt[loc.path];
+      const place = copy?.where === "library" ? "library copy"
+        : copy?.shared ? `#${copy.shared} copy · shared with coauthors`
+        : [loc.context, loc.topic ?? loc.section].filter(Boolean).join(" · ");
+      html += `<div class="loc" data-path="${esc(loc.path)}"><div>${esc(place)}</div>
+        <div class="path">${esc(loc.path.split("/").pop())}</div>${marksLine(copy, item.locations.length > 1)}
+        <div class="acts">
+          <a class="act" href="/file?path=${encodeURIComponent(loc.path)}" target="_blank">open</a>
+          <button class="act" data-open="${esc(loc.path)}">preview.app</button>
+          <button class="act" data-reveal="${esc(loc.path)}">finder</button>
+        </div><div class="picker" data-for="${esc(loc.path)}"></div></div>`;
+    }
   }
-  for (const loc of item.locations) {
-    const copy = copyAt[loc.path];
-    const place = copy?.where === "library" ? "library copy"
-      : copy?.shared ? `#${copy.shared} copy · shared with coauthors`
-      : [loc.context, loc.topic ?? loc.section].filter(Boolean).join(" · ");
-    html += `<div class="loc" data-path="${esc(loc.path)}"><div>${esc(place)}</div>
-      <div class="path">${esc(loc.path.split("/").pop())}</div>${marksLine(copy, item.locations.length > 1)}
-      <div class="acts">
-        <a class="act" href="/file?path=${encodeURIComponent(loc.path)}" target="_blank">open</a>
-        <button class="act" data-open="${esc(loc.path)}">preview.app</button>
-        <button class="act" data-reveal="${esc(loc.path)}">finder</button>
-        <button class="act" data-fileto="${esc(loc.path)}">file to…</button>
-        <button class="act" data-copyto="${esc(loc.path)}">copy to…</button>
-      </div><div class="picker" data-for="${esc(loc.path)}"></div></div>`;
+
+  // 6. Record metadata + lifecycle actions (edit, confirm, copy link, merge, remove).
+  html += `<div class="label">Record</div><dl class="meta">`;
+  html += `<dt>status</dt><dd><span class="st ${status}">${GLYPH[status] ?? "·"}</span> ${esc(status)}${
+    meta.source ? ` <span class="badge">· ${esc(meta.source === "pdf" ? "read from the pdf" : "from " + meta.source)}</span>` : ""}</dd>`;
+  if (item.citekey) html += `<dt>citekey</dt><dd>${esc(item.citekey)}</dd>`;
+  for (const [key, file] of Object.entries(work?.bib_keys ?? {})) {
+    html += `<dt>also</dt><dd>${esc(key)} <span class="badge">· ${esc(file.replace(/^(~|Dropbox)\//, ""))}</span></dd>`;
+  }
+  if (meta.doi) html += `<dt>doi</dt><dd><a href="https://doi.org/${esc(meta.doi)}" target="_blank" rel="noreferrer">${esc(meta.doi)}</a></dd>`;
+  html += `<dt>kind</dt><dd>${esc(item.kind)}</dd>`;
+  const when = (day, at) => esc(day) + (at != null ? ` <span class="badge">${clock(at)}</span>` : "");
+  if (item.added) html += `<dt>added</dt><dd>${when(item.added, item.added_at)}</dd>`;
+  if (item.in_refs) html += `<dt>in refs</dt><dd>${when(item.in_refs, item.in_refs_at)}</dd>`;
+  if (item.modified) html += `<dt>modified</dt><dd>${when(item.modified, item.modified_at)}</dd>`;
+  html += `</dl>`;
+  if (work) {
+    html += `<div class="acts" style="margin-top:6px">
+      <button class="act" data-act="edit">edit</button>
+      ${item.locations.length
+        ? `<button class="act" data-act="reread" title="Re-scan the PDF with Claude and refresh registry metadata">re-read pdf</button>` : ""}
+      ${["needs-review", "extracted", "imported"].includes(status)
+        ? `<button class="act" data-act="confirm">accept as is</button>` : ""}
+      ${work.user?.overrides && Object.keys(work.user.overrides).length
+        ? `<button class="act" data-act="revert">undo my edits</button>` : ""}
+      <button class="act" data-act="copy-link">copy link</button>
+      <button class="act" data-act="merge">merge into…</button>
+      <button class="act danger-act" data-act="remove">remove…</button>
+    </div><div id="editor"></div><div id="mergepicker"></div>`;
+  } else if (item.status && item.locations.length) {
+    html += `<div class="acts" style="margin-top:6px">
+      <button class="act" data-act="reread" title="Re-scan the PDF with Claude and refresh registry metadata">re-read pdf</button>
+    </div>`;
   }
 
   if (work?.user?.former_names?.length) {
@@ -1036,12 +1106,13 @@ async function drawDetail() {
       work.user.former_names.map((n) => `<div class="path">${esc(n)}</div>`).join("");
   }
   if (bibtex) {
+    const bibTarget = appendBibTarget(item);
+    const pref = preferredCitekey(item);
     html += `<div class="label">BibTeX</div><pre class="bib">${esc(bibtex)}</pre>`;
     html += `<div class="acts" style="margin-top:6px">
-      <button class="act" data-act="citekey">copy citekey</button>
+      <button class="act" data-act="citekey">copy ${esc(pref.key)}</button>
       <button class="act" data-act="bibtex">copy bibtex</button>
-      <button class="act" data-act="read">${item.read_status === "read" ? "mark unread" : "mark read"}</button>
-      <button class="act" data-act="queue">${item.queued ? "off the queue" : "queue"}</button>
+      ${bibTarget ? `<button class="act" data-append-bib="${esc(bibTarget.name)}">append to #${esc(bibTarget.name)} .bib</button>` : ""}
     </div>`;
   }
   $("detail").innerHTML = html;
@@ -1054,9 +1125,6 @@ async function drawDetail() {
 }
 
 // One copy's marks: yours, then others' by name, and the newest mark's date.
-// ⚑ when it has marks the library copy lacks or newer ones (annotations.py);
-// a flagged copy can bring them into the library copy.
-const shortDay = (iso) => new Date(iso).toLocaleDateString([], { day: "numeric", month: "short" });
 function marksLine(copy, several) {
   if (!copy || !several) return "";
   const parts = [];
@@ -1097,7 +1165,7 @@ const noteConflict = new Set();     // work ids whose last save was refused (cha
 let noteQueue = Promise.resolve();  // one save at a time, so versions follow in order
 let noteTimer = null;
 
-function noteHtml(work, data) {
+function noteHtml(work, data, backlinks = []) {
   if (!data.available) {
     return `<div class="label">Notes</div><p class="where">Notes are off: no Obsidian vault is set
       (or it was not found). Set <code>obsidian_vault</code> in ~/.config/refs/config.toml.</p>`;
@@ -1107,8 +1175,9 @@ function noteHtml(work, data) {
       placeholder="Notes on this paper (Markdown). Saved to Obsidian as ${esc(data.file)}">${esc(data.body)}</textarea>
     <div class="acts note-bar">
       <a class="act" href="${esc(data.uri)}">open in obsidian</a>
+      <button class="act" data-note-sync="1" title="refresh refs-managed YAML properties without touching your own">sync properties</button>
       <span id="notestate" class="badge">${data.exists ? esc(data.file) : ""}</span>
-    </div>`;
+    </div>${backlinksHtml(backlinks)}`;
 }
 
 function noteState(text) { const el = $("notestate"); if (el) el.innerHTML = text; }
@@ -1220,9 +1289,24 @@ async function changeWork(path, body, message) {
   await search(id);
 }
 
-$("detail").addEventListener("submit", (event) => {
+$("detail").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (event.target.id === "newcoll") { createCollection(event.target); return; }
+  if (event.target.id === "rereadform" && currentWork) {
+    const f = new FormData(event.target);
+    const done = await post(`/api/work/${currentWork.id}/reads`, {
+      at: String(f.get("at") || "").trim() || null,
+      status: String(f.get("status") || "read"),
+      context: String(f.get("context") || "").trim() || null,
+      note: String(f.get("note") || "").trim() || null,
+    });
+    if (done.detail) { say(done.detail, 8000); return; }
+    const item = state.items[state.selected];
+    if (item) Object.assign(item, done);
+    say("logged reading");
+    loadSidebar(); renderList(); renderDetail();
+    return;
+  }
   if (event.target.id !== "editform") return;
   const form = new FormData(event.target), fields = {};
   for (const [name, value] of form) fields[name] = String(value).trim();
@@ -1232,7 +1316,34 @@ $("detail").addEventListener("submit", (event) => {
   changeWork("edit", { fields }, "saved your corrections");
 });
 
-$("detail").addEventListener("click", (event) => {
+$("detail").addEventListener("keydown", async (event) => {
+  if (event.target.id === "utag-in" && event.key === "Enter" && currentWork) {
+    event.preventDefault();
+    const val = event.target.value.trim();
+    if (!val) return;
+    const res = await post(`/api/work/${currentWork.id}/tags`, { add_user: [val] });
+    if (res.detail) { say(res.detail, 8000); return; }
+    const item = state.items[state.selected];
+    if (item) { item.tags = res.tags; item.user_tags = res.user_tags; }
+    say(`tagged "${val}"`);
+    renderDetail();
+  } else if (event.target.id === "qnote" && event.key === "Enter" && currentWork) {
+    event.preventDefault();
+    event.target.blur();
+  }
+});
+
+$("detail").addEventListener("focusout", async (event) => {
+  if (event.target.id === "qnote" && currentWork) {
+    const item = state.items[state.selected];
+    const val = event.target.value;
+    if (val === (item?.queue_note ?? "")) return;
+    const done = await saveQueueNote(currentWork.id, val);
+    if (done && item) { Object.assign(item, done); renderList(); }
+  }
+});
+
+$("detail").addEventListener("click", async (event) => {
   const el = event.target;
   if (el.dataset.identify) identify(el.dataset.identify);
   else if (el.dataset.open) post("/api/open", { path: el.dataset.open });
@@ -1240,6 +1351,68 @@ $("detail").addEventListener("click", (event) => {
   else if (el.dataset.fileto) openPicker([el.dataset.fileto], "move");
   else if (el.dataset.copyto) openPicker([el.dataset.copyto], "copy");
   else if (el.dataset.batch) batchAct(el.dataset.batch);
+  else if (el.dataset.setread && state.items[state.selected]) {
+    setRead(state.items[state.selected], el.dataset.setread);
+  }
+  else if (el.dataset.qpin && currentWork) {
+    const item = state.items[state.selected];
+    const next = item?.queue_priority === "next" ? "" : "next";
+    const done = await post(`/api/work/${currentWork.id}/queue`, { on: null, priority: next });
+    if (!done.detail && item) {
+      Object.assign(item, done);
+      say(next ? "pinned to Up next" : "unpinned from Up next");
+      sortItems(); renderList(); renderDetail();
+    }
+  }
+  else if (el.dataset.rereadOpen) showRereadForm(state.collection ?? "");
+  else if (el.dataset.rereadCancel) { const b = $("reread-form"); if (b) b.innerHTML = ""; }
+  else if (el.dataset.utagDel && currentWork) {
+    const res = await post(`/api/work/${currentWork.id}/tags`, { remove_user: [el.dataset.utagDel] });
+    const item = state.items[state.selected];
+    if (!res.detail && item) { item.tags = res.tags; item.user_tags = res.user_tags; renderDetail(); }
+  }
+  else if (el.dataset.atagHide && currentWork) {
+    const res = await post(`/api/work/${currentWork.id}/tags`, { hide_auto: [el.dataset.atagHide] });
+    const item = state.items[state.selected];
+    if (!res.detail && item) { item.tags = res.tags; renderDetail(); }
+  }
+  else if (el.dataset.atagRestore && currentWork) {
+    const res = await post(`/api/work/${currentWork.id}/tags`, { restore_auto: true });
+    const item = state.items[state.selected];
+    if (!res.detail && item) { item.tags = res.tags; say("restored hidden auto tags"); renderDetail(); }
+  }
+  else if (el.dataset.hlPull && currentWork) {
+    await saveNote();
+    const version = noteSaved[currentWork.id]?.version ?? "";
+    const res = await post(`/api/work/${currentWork.id}/highlights/pull`, { version });
+    if (res.detail) { say(res.detail, 9000); return; }
+    say(`pulled ${res.count} highlights into ${res.note.file}`, 7000);
+    const item = state.items[state.selected];
+    if (item) item.has_note = true;
+    renderList(); renderDetail();
+  }
+  else if (el.dataset.noteSync && currentWork) {
+    await saveNote();
+    const res = await post(`/api/work/${currentWork.id}/note/sync`, {});
+    if (res.detail) { say(res.detail, 9000); return; }
+    say(`synced properties on ${res.note.file}`);
+    renderDetail();
+  }
+  else if (el.dataset.appendBib && currentWork) {
+    const res = await post("/api/collections/append-bib", { name: el.dataset.appendBib, work_ids: [currentWork.id] });
+    if (res.detail) { say(res.detail, 9000); return; }
+    say(res.added?.length ? `appended @${res.added[0]} to ${res.bib_file}`
+      : `already in ${res.bib_file} as @${res.present?.[0]?.key ?? currentWork.citekey}`, 8000);
+    renderDetail();
+  }
+  else if (el.closest("[data-merge-drop]") && currentWork) {
+    const otherId = el.closest("[data-merge-drop]").dataset.mergeDrop;
+    if (!confirm(`Merge the selected duplicate work INTO @${currentWork.citekey}?\n\nIts files, collections, tags and reading history move here; its old citekey becomes an alias.`)) return;
+    const res = await post(`/api/work/${currentWork.id}/merge`, { other_id: otherId });
+    if (res.detail) { say(res.detail, 9000); return; }
+    say(`merged @${res.dropped_citekey} into @${currentWork.citekey}`, 9000);
+    loadSidebar(); search(currentWork.id);
+  }
   else if (el.closest(".choice")) {
     const choice = el.closest(".choice");
     if (el.dataset.inside) pickerInside(choice.dataset.folder);
@@ -1251,16 +1424,46 @@ $("detail").addEventListener("click", (event) => {
   else if (el.dataset.collAdd) openCollectionPicker([state.items[state.selected]?.work_id].filter(Boolean), $("collpicker"));
   else if (el.dataset.collOut) collect([state.items[state.selected]?.work_id].filter(Boolean), el.dataset.collOut, false);
   else if (el.dataset.collShow) {
-    state.collection = el.dataset.collShow; state.context = null; state.tag = null; state.view = "all";
+    state.collection = el.dataset.collShow; state.collectionFilter = "all"; state.context = null; state.tag = null; state.view = "all";
     markSidebar(); search();
   }
   else if (el.closest(".opt")) collect(cpick.ids, el.closest(".opt").dataset.coll);
   else if (el.dataset.act === "cancel-new") renderDetail();
   else if (el.dataset.act === "edit") showEditor();
+  else if (el.dataset.act === "reread") {
+    const item = state.items[state.selected];
+    if (currentWork) {
+      const hasOverrides = Boolean(currentWork.user?.overrides && Object.keys(currentWork.user.overrides).length);
+      rereadPdfs({
+        workIds: [currentWork.id],
+        hasOverrides,
+        label: item?.citekey ?? currentWork.citekey,
+        keepId: item?.id ?? null,
+      });
+    } else if (item?.locations?.length) {
+      const p = primaryPath(item) ?? item.locations[0].path;
+      rereadPdfs({ paths: [p], label: p.split("/").pop(), keepId: item.id });
+    }
+  }
   else if (el.dataset.act === "cancel-edit") $("editor").innerHTML = "";
   else if (el.dataset.act === "note-reload") renderDetail();
   else if (el.dataset.act === "confirm") changeWork("confirm", {}, "accepted as is");
   else if (el.dataset.act === "revert") changeWork("edit", { fields: {} }, "back to the automatic record");
+  else if (el.dataset.act === "copy-link" && currentWork) {
+    copyText(workLink(currentWork.id, state.collection), "copied direct link to this paper");
+  }
+  else if (el.dataset.act === "merge" && currentWork) openMergePicker(currentWork.id);
+  else if (el.dataset.act === "remove" && currentWork) {
+    const hasFiles = (state.items[state.selected]?.locations?.length ?? 0) > 0;
+    const msg = hasFiles
+      ? `Remove @${currentWork.citekey} from refs and move its PDF to the macOS Trash?\n\nIts record is archived under .refs/trash/ and the PDF can be dragged back from the Trash.`
+      : `Delete this stub (@${currentWork.citekey}) from refs?`;
+    if (!confirm(msg)) return;
+    const res = await post(`/api/work/${currentWork.id}/remove`, { trash_files: hasFiles });
+    if (res.detail) { say(res.detail, 9000); return; }
+    say(`removed @${res.citekey}`, 7000);
+    loadSidebar(); search();
+  }
   else if (el.dataset.act === "fetch-doi") {
     const doi = $("editform").doi.value.trim();
     if (doi) changeWork("doi", { doi }, "record replaced from the registry");
@@ -1275,14 +1478,33 @@ $("detail").addEventListener("click", (event) => {
 
 // --- actions (shared by keys and buttons) -------------------------------------------
 
-// Read a PDF that is on disk but was never read (about $0.001).
 function identify(path) {
   const name = path.split("/").pop();
   say(`adding ${name} …`, 0);
   follow(post("/api/identify", { path }), name);
 }
 
-// One copy of a paper to the macOS Trash (the server refuses the last copy).
+async function rereadPdfs({ workIds = [], paths = [], hasOverrides = false, label, keepId = null, skipped = 0 }) {
+  const total = workIds.length + paths.length;
+  if (!total) { say("none of the selected papers has a PDF on disk"); return; }
+  let clearOverrides = false;
+  if (total === 1 && hasOverrides) {
+    if (!confirm("This paper has manual edits, which normally override automatic metadata.\n\nRe-read the PDF and replace your manual edits with freshly scanned metadata?")) return;
+    clearOverrides = true;
+  } else if (total > 1) {
+    const est = Math.max(0.01, total * 0.002).toFixed(2);
+    const skipNote = skipped ? `\n(${skipped} selected ${skipped === 1 ? "paper has" : "papers have"} no PDF and will be skipped.)` : "";
+    if (!confirm(`Re-read ${total} PDFs with Claude & registries (about $${est}) to repopulate their metadata?${skipNote}\n\nCitekeys, collections, reading log, notes and any manual edits are kept.`)) return;
+  }
+  const what = label || (total === 1 ? "PDF" : `${total} PDFs`);
+  say(`re-reading ${what} …`, 0);
+  await follow(
+    post("/api/reread", { work_ids: workIds, paths, clear_overrides: clearOverrides }),
+    what,
+    { verb: "re-reading", keepId },
+  );
+}
+
 async function trashCopy(path) {
   if (!confirm(`Move this copy to the Trash?\n\n${path}`)) return;
   const response = await fetch("/api/trash", { method: "POST",
@@ -1290,30 +1512,6 @@ async function trashCopy(path) {
     body: JSON.stringify({ path }) });
   say(response.ok ? "moved to the Trash" : (await response.json()).detail);
   loadSidebar(); search(state.items[state.selected]?.id ?? null);
-}
-
-// Copy text. `text` may be a promise (BibTeX still being fetched): Safari
-// allows the clipboard only during the click itself, so the write starts
-// now and its contents follow.
-async function copyText(text, message) {
-  try {
-    if (typeof text !== "string" && window.ClipboardItem) {
-      const blob = Promise.resolve(text).then((t) => new Blob([t], { type: "text/plain" }));
-      await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
-    } else {
-      await navigator.clipboard.writeText(await text);
-    }
-    say(typeof message === "function" ? message(await text) : message ?? "copied");
-  } catch {
-    say("could not copy: the browser refused the clipboard", 8000);
-  }
-}
-
-// The BibTeX of these works, one entry after another.
-function copyBibtex(ids) {
-  const text = Promise.all(ids.map((id) => get(`/api/work/${id}`).then((d) => d.bibtex ?? "", () => "")))
-    .then((entries) => entries.filter(Boolean).join("\n"));
-  copyText(text, `copied BibTeX for ${ids.length === 1 ? "1 paper" : `${ids.length} papers`}`);
 }
 
 async function act(name) {
@@ -1324,30 +1522,35 @@ async function act(name) {
   if (name === "preview" && path) post("/api/open", { path });
   if (name === "reveal" && path) post("/api/open", { path, reveal: true });
   if (name === "citekey" && item.citekey) {
-    await navigator.clipboard.writeText(item.citekey);
-    say(`copied ${item.citekey}`);
+    const pref = preferredCitekey(item);
+    await navigator.clipboard.writeText(pref.key);
+    say(pref.alias ? `copied ${pref.key} (from ${pref.file})` : `copied ${pref.key}`);
   }
   if (name === "bibtex" && $("detail").dataset.bibtex) {
     await navigator.clipboard.writeText($("detail").dataset.bibtex);
     say(`copied bibtex for ${item.citekey}`);
   }
   if ((name === "read" || name === "queue") && item.work_id) {
+    const nextRead = READ_ORDER[(READ_ORDER.indexOf(item.read_status ?? "unread") + 1) % READ_ORDER.length];
     const done = name === "read"
-      ? await post(`/api/work/${item.work_id}/read`, { status: item.read_status === "read" ? "unread" : "read" })
-      : await post(`/api/work/${item.work_id}/queue`, { on: !item.queued });
+      ? await post(`/api/work/${item.work_id}/read`, { status: nextRead, context: state.collection })
+      : await post(`/api/work/${item.work_id}/queue`, { on: !item.queued, for_collection: !item.queued ? state.collection : null });
     if (done.detail) { say(done.detail); return; }
     const leftQueue = item.queued && !done.queued;
-    Object.assign(item, done);                 // read_status, read_source, queued
+    Object.assign(item, done);
     if (name === "queue") say(done.queued ? `queued ${item.citekey}` : `${item.citekey} off the queue`);
-    else if (leftQueue) say(`read ${item.citekey}: off the queue`);
+    else say(`${item.citekey}: ${done.read_status}${leftQueue ? " (off queue)" : ""}`);
     loadSidebar();
-    // In the queue view a paper that left the queue leaves the list.
     if ((state.view === "queue" && leftQueue)
-        || (["unread", "reading", "read"].includes(state.view) && item.read_status !== state.view)) {
+        || (["unread", "reading", "skimmed", "read"].includes(state.view) && item.read_status !== state.view)) {
       search(); return;
     }
+    if (state.collection && state.collectionAll) {
+      state.raw = filterCollectionItems(state.collectionAll, state.collectionFilter);
+      sortItems();
+    }
     const keep = state.selected;
-    renderList(); select(keep, false);
+    renderList(); select(Math.min(keep, Math.max(0, state.items.length - 1)), false);
   }
 }
 
@@ -1410,9 +1613,9 @@ $("q").addEventListener("keydown", async (event) => {
 
 // --- following an "add" job -----------------------------------------------------------
 
-// Adding runs in the background on the server. Show elapsed time while it
+// Adding / re-reading runs in the background on the server. Show elapsed time while it
 // runs, the outcome when it ends, and say so plainly if contact is lost.
-async function follow(start, label) {
+async function follow(start, label, { verb = "adding", keepId = null } = {}) {
   try {
     const begun = await start;
     if (begun.message) { say(begun.message.split("\n")[0], 9000); return; }   // e.g. already in the library
@@ -1421,16 +1624,18 @@ async function follow(start, label) {
       await new Promise((resolve) => setTimeout(resolve, 1500));
       const job = await get(`/api/job/${begun.job}`);
       if (job.state === "running") {
-        say(`adding ${label} … ${job.message ? `${job.message} · ` : ""}${job.seconds}s`, 0);
+        say(`${verb} ${label} … ${job.message ? `${job.message} · ` : ""}${job.seconds}s`, 0);
         continue;
       }
       say((job.state === "failed" ? "failed: " : "") + (job.message.split("\n")[0] || job.state), 12000);
       break;
     }
   } catch {
-    say(`lost contact with refs while adding ${label}. The file, if saved, is in ${state.dump}.`, 0);
+    say(verb === "adding"
+      ? `lost contact with refs while adding ${label}. The file, if saved, is in ${state.dump}.`
+      : `lost contact with refs while ${verb} ${label}.`, 0);
   }
-  loadSidebar(); search();
+  loadSidebar(); search(keepId);
 }
 
 // --- adding by drop or paste ---------------------------------------------------------
@@ -1877,225 +2082,32 @@ async function showCopies(token) {
     to <b>kept on purpose</b> at the bottom, where <b>un-keep</b> brings it back.</p>`;
 }
 
-// --- settings ----------------------------------------------------------------------------
+// --- module context (shared with settings.js, updates.js, importer.js, onboarding.js) ---
 
-// The settings page edits ~/.config/refs/config.toml through the server
-// (settings.py), which checks every change and keeps the file's comments. The
-// form is built from the server's list of fields. Changes stay a draft (kept
-// while you visit other views) until "save changes"; the server then uses them
-// at once and rescans.
-const settings = { data: null, draft: {}, error: null, authors: null };
-const LIST_KINDS = new Set(["folders", "names", "globs", "rules", "authors"]);
+const modCtx = {
+  state,
+  listToken: () => listToken,
+  loadSidebar,
+  markSidebar,
+  search,
+  follow,
+  setAdding,
+  openImport: (col) => openImportView(col, modCtx),
+};
 
-const sValue = (f) => (f.key in settings.draft ? settings.draft[f.key] : f.value);
-const sDirty = () => Object.keys(settings.draft).length > 0;
-// `redraw` false: a text box or menu changed. Redrawing then would replace the
-// button a click is landing on (the change fires as the box loses focus, just
-// before the click), so only the save button and the field's mark change.
-function sSet(key, value, redraw = true) {
-  const field = settings.data.fields.find((f) => f.key === key);
-  if (JSON.stringify(value) === JSON.stringify(field.value)) delete settings.draft[key];
-  else settings.draft[key] = value;
-  if (settings.error?.key === key) settings.error = null;
-  if (redraw) return drawSettings();
-  const n = Object.keys(settings.draft).length;
-  const save = $("list").querySelector("[data-s-save]");
-  if (save) { save.disabled = !n; save.textContent = `save changes${n ? ` (${n})` : ""}`; }
-  const name = $("list").querySelector(`[data-field="${key}"] .name`);
-  if (name) name.innerHTML = esc(field.label) + (key in settings.draft ? `<span class="badge"> · changed</span>` : "");
-}
+wireSettingsEvents(modCtx);
+wireImportEvents(modCtx);
 
-async function showSettings(token) {
-  const data = await get("/api/settings");
-  if (token !== listToken) return;
-  state.items = [];
-  $("count").textContent = "settings";
-  settings.data = data;
-  drawSettings();
-}
-
-function sField(f) {
-  const value = sValue(f);
-  const changed = f.key in settings.draft ? `<span class="badge"> · changed</span>` : "";
-  const bad = settings.error?.key === f.key ? `<p class="bad">${esc(settings.error.message)}</p>` : "";
-  const choose = (kind) => `<button class="act" data-s-choose="${esc(f.key)}" data-kind="${kind}">choose…</button>`;
-  let edit = "";
-
-  if (f.kind === "choice") {
-    edit = `<select data-s-key="${esc(f.key)}">${f.choices.map((c) =>
-      `<option${c === value ? " selected" : ""}>${esc(c)}</option>`).join("")}</select>`;
-  } else if (f.kind === "vault") {
-    // Vaults Obsidian knows on this Mac, plus whatever is set now.
-    const options = [...new Set(["", ...settings.data.vaults, value])];
-    edit = `<select data-s-key="${esc(f.key)}">${options.map((v) =>
-      `<option value="${esc(v)}"${v === value ? " selected" : ""}>${v ? esc(v) : "none: notes are off"}</option>`).join("")}</select>
-      ${choose("vault")}`;
-  } else if (LIST_KINDS.has(f.kind)) {
-    const chips = f.builtin.map((v) => `<span class="chip fixed" title="built in: always on">${esc(v)}</span>`);
-    value.forEach((v, i) => chips.push(`<span class="chip">${v === "" ? "<i>(no name)</i>" : esc(v)}<button
-      class="act" data-s-remove="${esc(f.key)}" data-index="${i}" title="remove">×</button></span>`));
-    edit = `<div class="chips">${chips.join("") || `<span class="where">none</span>`}</div>
-      <div class="adder"><input data-s-add="${esc(f.key)}" placeholder="${esc(f.placeholder || "add…")}"
-        spellcheck="false" autocomplete="off">
-      ${f.kind === "folders" ? choose("folders") : ""}
-      ${f.kind === "authors" ? `<button class="act" data-s-authors="1">find names in my PDFs</button>` : ""}</div>`;
-    if (f.kind === "authors" && settings.authors) edit += sAuthors(value);
-  } else {
-    const type = f.kind === "number" ? "number" : "text";
-    edit = `<input data-s-key="${esc(f.key)}" type="${type}" value="${esc(value)}"
-      placeholder="${esc(f.placeholder)}" spellcheck="false" autocomplete="off"${type === "number" ? ` min="0" step="0.5"` : ""}>
-      ${f.kind === "library" ? choose("library") : f.kind === "folder" ? choose("folder") : ""}`;
-  }
-  return `<div class="setting${bad ? " has-bad" : ""}" data-field="${esc(f.key)}">
-    <div class="name">${esc(f.label)}${changed}</div>
-    <div class="edit-it">${edit}</div>
-    <p class="help">${esc(f.help)}</p>${bad}</div>`;
-}
-
-// Names found on highlights in your PDFs: tick the ones that are you.
-function sAuthors(value) {
-  if (!settings.authors.length) return `<p class="where">no highlights or notes found in your PDFs.</p>`;
-  return `<div class="found">${settings.authors.slice(0, 12).map((a) =>
-    `<label><input type="checkbox" data-s-author="${esc(a.name)}"${value.includes(a.name) ? " checked" : ""}>
-      ${a.name ? esc(a.name) : "<i>(no name)</i>"} <span class="badge">· ${a.files} files, ${a.marks} marks</span></label>`).join("")}</div>`;
-}
-
-function drawSettings() {
-  const data = settings.data;
-  if (!data) return;
-  if (data.error) {
-    $("list").innerHTML = `<div class="empty">The settings file has a mistake: ${esc(data.error)}
-      Fix it in a text editor, then reload this page.</div>`;
-    return;
-  }
-  const n = Object.keys(settings.draft).length;
-  let html = `<div class="bar">
-    <button class="act" data-s-save="1"${n ? "" : " disabled"}>save changes${n ? ` (${n})` : ""}</button>
-    ${n ? `<button class="act" data-s-discard="1">discard</button>` : ""}
-    ${settings.error && !settings.error.key ? `<span class="bad">${esc(settings.error.message)}</span>` : ""}
-  </div>`;
-  if (data.not_set_up) html += `<p class="setup">${esc(data.not_set_up)}</p>`;
-  let group = null;
-  for (const f of data.fields) {
-    if (f.group !== group) html += `<div class="topic"><span>${esc(group = f.group)}</span></div>`;
-    html += sField(f);
-  }
-  // Keep the place and the focused box when the form is drawn again.
-  const scroll = $("list").scrollTop;
-  const focused = document.activeElement?.dataset?.sAdd;
-  $("list").innerHTML = `<div class="settings">${html}</div>`;
-  $("list").scrollTop = scroll;
-  if (focused) $("list").querySelector(`[data-s-add="${focused}"]`)?.focus();
-
-  const key = { set: "stored in the macOS Keychain", environment: "from ANTHROPIC_API_KEY",
-                missing: "not set: refs cannot read new PDFs" }[data.api_key];
-  $("detail").innerHTML = `<div class="label">Settings</div>
-    <p>Saved in <code>${esc(data.file)}</code>. Comments you write there are kept; the previous
-    version is kept as <code>config.toml.bak</code>.</p>
-    <p class="where" style="margin-top:8px">Saving applies the changes at once and rescans the
-    watched folders. Folders are inside the library folder; "choose…" opens the Finder dialog.</p>
-    <div class="label">Anthropic API key</div>
-    <p class="${data.api_key === "missing" ? "bad" : "where"}">${esc(key)}</p>
-    <div class="adder"><input id="s-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">
-      <button class="act" data-s-key-save="1">${data.api_key === "missing" ? "save key" : "replace key"}</button></div>
-    <p class="where" style="margin-top:6px">refs uses it to read new PDFs (about $0.001 each) and,
-    when a search is unsure, to ask (about $0.0005). The key is never shown again or written to a file.</p>`;
-}
-
-async function saveSettings() {
-  // Something typed into an "add…" box but not yet added (Enter) counts too.
-  for (const input of $("list").querySelectorAll("input[data-s-add]")) if (input.value.trim()) sAddTyped(input);
-  if (!sDirty()) return;
-  say("saving …", 0);
-  const response = await fetch("/api/settings", { method: "POST",
-    headers: { "Content-Type": "application/json", "X-Refs": "1" },
-    body: JSON.stringify({ changes: settings.draft }) });
-  const answer = await response.json();
-  if (!response.ok) {
-    settings.error = { key: answer.key ?? null, message: answer.error ?? "could not save" };
-    say(answer.error ?? "could not save", 8000);
-    drawSettings();
-    $("list").querySelector(".has-bad")?.scrollIntoView({ block: "center" });
-    return;
-  }
-  settings.data = answer;
-  settings.draft = {};
-  settings.error = null;
-  drawSettings();
-  say("saved. Rescanning with the new settings …");
-  setTimeout(loadSidebar, 1500);
-}
-
-function sAddTyped(input) {
-  const key = input.dataset.sAdd;
-  const text = input.value.trim();
-  if (!text) return;
-  const field = settings.data.fields.find((f) => f.key === key);
-  input.value = "";
-  sSet(key, [...sValue(field).filter((v) => v !== text), text]);
-}
-
-$("list").addEventListener("click", async (event) => {
-  const el = event.target.closest("button");
-  if (!el || state.view !== "settings") return;
-  const d = el.dataset;
-  if (d.sSave) await saveSettings();
-  else if (d.sDiscard) { settings.draft = {}; settings.error = null; drawSettings(); }
-  else if (d.sRemove) {
-    const field = settings.data.fields.find((f) => f.key === d.sRemove);
-    sSet(d.sRemove, sValue(field).filter((_, i) => i !== Number(d.index)));
-  }
-  else if (d.sChoose) {
-    const field = settings.data.fields.find((f) => f.key === d.sChoose);
-    say("choose a folder in the Finder dialog …", 0);
-    const answer = await post("/api/settings/folder", { prompt: `refs: ${field.label}`, kind: d.kind });
-    say(answer.error ?? (answer.path ? "" : "nothing chosen"));
-    if (!answer.path) return;
-    if (d.kind === "folders") sSet(field.key, [...sValue(field).filter((v) => v !== answer.path), answer.path]);
-    else sSet(field.key, answer.path);
-  }
-  else if (d.sAuthors) {
-    say("reading the highlights in your PDFs …", 0);
-    settings.authors = (await get("/api/settings/authors")).authors;
-    say(`${settings.authors.length} names found`);
-    drawSettings();
-  }
-});
-
-$("list").addEventListener("change", (event) => {
-  const el = event.target;
-  if (state.view !== "settings") return;
-  if (el.dataset.sKey) {
-    const field = settings.data.fields.find((f) => f.key === el.dataset.sKey);
-    sSet(field.key, field.kind === "number" ? Number(el.value) : el.value, false);
-  } else if (el.dataset.sAuthor !== undefined) {
-    const field = settings.data.fields.find((f) => f.kind === "authors");
-    const name = el.dataset.sAuthor;
-    const now = sValue(field).filter((v) => v !== name);
-    sSet(field.key, el.checked ? [...now, name] : now);
-  }
-});
-
-$("list").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && event.target.dataset?.sAdd) { event.preventDefault(); sAddTyped(event.target); }
-});
-
-$("detail").addEventListener("click", async (event) => {
-  if (!event.target.closest("[data-s-key-save]")) return;
-  const input = $("s-key");
-  const response = await fetch("/api/settings/key", { method: "POST",
-    headers: { "Content-Type": "application/json", "X-Refs": "1" },
-    body: JSON.stringify({ key: input.value }) });
-  const answer = await response.json();
-  input.value = "";
-  if (!response.ok) { say(answer.error, 8000); return; }
-  settings.data.api_key = answer.api_key;
-  say("API key saved in the Keychain");
-  drawSettings();
-});
-
-const REVIEW_VIEWS = { renames: showRenames, copies: showCopies, downloads: showDownloads, inbox: showInbox,
-                       settings: showSettings, sidebar: showSidebarPage };
+const REVIEW_VIEWS = {
+  renames: showRenames,
+  copies: showCopies,
+  downloads: showDownloads,
+  inbox: showInbox,
+  updates: (token) => showUpdates(token, modCtx),
+  import: (token) => showImport(token, modCtx),
+  settings: (token) => showSettings(token, modCtx),
+  sidebar: showSidebarPage,
+};
 
 $("list").addEventListener("change", (event) => {
   const path = event.target.dataset?.path;
@@ -2108,6 +2120,20 @@ $("list").addEventListener("change", (event) => {
 $("list").addEventListener("click", async (event) => {
   const el = event.target.closest("button");
   if (!el) return;
+  if (el.dataset.cfilter) {
+    state.collectionFilter = el.dataset.cfilter;
+    state.raw = filterCollectionItems(state.collectionAll ?? [], state.collectionFilter);
+    sortItems();
+    state.selected = 0;
+    pushHash(state, state.items[0]?.work_id ?? null);
+    renderList(); renderDetail();
+    return;
+  }
+  if (el.dataset.ws) {
+    await handleWorkspaceAction(el.dataset.ws, state, modCtx);
+    return;
+  }
+  if (state.view === "updates" && await handleUpdatesClick(el, modCtx)) return;
   const boxes = [...$("list").querySelectorAll("input[data-path]:not(:disabled)")];
   const tick = (filter, on) => boxes.filter(filter).forEach((box) => {
     box.checked = on; on ? state.picked.add(box.dataset.path) : state.picked.delete(box.dataset.path);
@@ -2671,11 +2697,16 @@ function rowMenu(row) {
     has && !item.status && { label: "identify it now", run: () => identify(path) },
     SEP,
     w && { label: item.queued ? "take off the queue" : "put on the queue", key: "q", run: () => act("queue") },
-    w && { label: item.read_status === "read" ? "mark unread" : "mark read", key: "r", run: () => act("read") },
-    w && item.read_status === "unread" && { label: "mark started", run: () => setRead(item, "reading") },
+    w && { label: "cycle read status", key: "r", run: () => act("read") },
+    w && item.read_status !== "reading" && { label: "mark reading", run: () => setRead(item, "reading") },
+    w && item.read_status !== "skimmed" && { label: "mark skimmed", run: () => setRead(item, "skimmed") },
+    w && item.read_status !== "read" && { label: "mark read", run: () => setRead(item, "read") },
     SEP,
-    item.citekey && { label: "copy citekey", key: "y", run: () => copyText(item.citekey, `copied ${item.citekey}`) },
-    item.citekey && { label: "copy \\cite{…}", run: () => copyText(`\\cite{${item.citekey}}`, `copied \\cite{${item.citekey}}`) },
+    item.citekey && { label: `copy ${preferredCitekey(item).key}`, key: "y", run: () => act("citekey") },
+    item.citekey && { label: "copy \\cite{…}", run: () => {
+      const pref = preferredCitekey(item);
+      copyText(`\\cite{${pref.key}}`, `copied \\cite{${pref.key}}`);
+    } },
     w && { label: "copy BibTeX", key: "b", run: () => copyBibtex([w]) },
     SEP,
     w && { label: "add to collection…", key: "#",
@@ -2686,6 +2717,12 @@ function rowMenu(row) {
     SEP,
     w && !marks && { label: "write a note", key: "n", run: after(() => $("note")?.focus()) },
     w && !marks && { label: "edit the record", run: after(showEditor) },
+    has && (w || item.status) && { label: "re-read PDF", run: after(() => {
+      const hasOverrides = Boolean(currentWork?.id === w && currentWork?.user?.overrides && Object.keys(currentWork.user.overrides).length);
+      rereadPdfs(w
+        ? { workIds: [w], hasOverrides, label: item.citekey ?? path.split("/").pop(), keepId: item.id }
+        : { paths: [path], label: path.split("/").pop(), keepId: item.id });
+    }) },
     w && !marks && ["needs-review", "extracted", "imported"].includes(item.status)
       && { label: "accept the record as is", run: after(() => changeWork("confirm", {}, "accepted as is")) },
     SEP,
@@ -2694,14 +2731,18 @@ function rowMenu(row) {
 }
 
 async function setRead(item, status) {
-  const done = await post(`/api/work/${item.work_id}/read`, { status });
+  const done = await post(`/api/work/${item.work_id}/read`, { status, context: state.collection });
   if (done.detail) { say(done.detail); return; }
   Object.assign(item, done);
-  say(`${item.citekey}: ${status === "reading" ? "started" : status}`);
+  say(`${item.citekey}: ${status}`);
   loadSidebar();
-  if (["unread", "reading", "read"].includes(state.view)) { search(item.id); return; }
+  if (["unread", "reading", "skimmed", "read"].includes(state.view)) { search(item.id); return; }
+  if (state.collection && state.collectionAll) {
+    state.raw = filterCollectionItems(state.collectionAll, state.collectionFilter);
+    sortItems();
+  }
   const keep = state.selected;
-  renderList(); select(keep, false);
+  renderList(); select(Math.min(keep, Math.max(0, state.items.length - 1)), false);
 }
 
 // The selection's menu: the batch buttons, plus copying.
@@ -2718,6 +2759,7 @@ function batchMenu() {
     SEP,
     { label: "queue all", run: () => batchAct("queue") },
     { label: "mark all read", run: () => batchAct("read") },
+    { label: "re-read PDFs…", off: none, run: () => batchAct("reread") },
     SEP,
     keys.length && { label: "copy citekeys", run: () => copyText(keys.join(", "), `copied ${keys.length} citekeys`) },
     keys.length && { label: "copy \\cite{…}", run: () => copyText(`\\cite{${keys.join(", ")}}`, `copied \\cite with ${keys.length} keys`) },
@@ -3013,10 +3055,10 @@ selecting many
   ⌘A                   select every row in the list
   esc                  clear the selection
   F  C  #              file / copy / collect the whole selection (buttons: queue all, mark read)
-  y                    copy citekey
+  y                    copy citekey (prefers the active project's .bib key)
   b                    copy BibTeX
-  r                    toggle read / unread
-  q                    put on the queue / take off (▸ in the list)
+  r                    cycle reading status (unread → reading → skimmed → read)
+  q / Q                toggle queue / queue with a 1-line reason
   n                    write a note (saved to Obsidian; esc leaves the box)
   a                    add a paper (URL, DOI, arXiv id, NBER number); shift+Enter also queues it
   m                    show course material too
@@ -3047,13 +3089,14 @@ search filters
   #220a   #219a/public-economics   (a collection; a parent includes its parts)
   author:smith   year:2019   course:101   project:thesis
   tag:theory    kind:book   status:needs-review   topic:demand
-  read:read     read:reading   read:unread   queued:yes
+  read:read     read:skimmed   read:reading   read:unread   queued:yes
 
 reading
 
   your highlights and notes in a PDF count: marks on 30% of its pages (at
-  least 5) make it read (●), marks on 2 or more pages make it started (◐).
-  What you set with r always wins. ▸ = on the queue.`;
+  least 5) make it read (●), marks on 2 or more pages make it reading (◐).
+  What you set with r (unread → reading → skimmed ◔ → read) always wins.
+  ▸ = on the queue (★ = pinned to Up next).`;
 
 document.addEventListener("keydown", async (event) => {
   if ($("help").open) { $("help").close(); return; }
@@ -3113,6 +3156,15 @@ document.addEventListener("keydown", async (event) => {
   else if (key === "b") act("bibtex");
   else if (key === "r") act("read");
   else if (key === "q") act("queue");
+  else if (key === "Q") {
+    event.preventDefault();
+    const item = state.items[state.selected];
+    if (!item?.work_id) return;
+    if (!item.queued) await act("queue");
+    await detailDone;
+    const box = $("qnote");
+    if (box) { box.focus(); box.select(); }
+  }
   else if (key === "n" && $("note")) { event.preventDefault(); $("note").focus(); }
   else if (key === "m") {
     state.scope = state.scope === "all" ? "library" : "all";
@@ -3139,366 +3191,25 @@ document.addEventListener("keydown", async (event) => {
   }
 });
 
-// --- first run: onboarding -------------------------------------------------------------------
+// --- start & URL hash routing ------------------------------------------------------------
 
-// Shown while refs is not set up (no watched folders). One screen per question,
-// over the main panes; the answers are saved together at the end through
-// /api/settings, with the same checks as the settings page (settings.py), and
-// the watcher then scans (and reads, if you chose so) with progress shown here.
-const ob = {
-  step: 0, info: null, library: null, survey: null, open: new Set(),
-  roots: new Set(), dump: "papers-dump", exclude: new Set(), noLlm: new Set(),
-  vault: "", vaultFolder: "refs", read: "dump", saving: false, startedPass: null,
-};
-const OB_STEPS = ["welcome", "library", "papers", "dump", "private", "notes", "reading", "progress"];
-
-async function maybeOnboard() {
-  const info = await get("/api/onboarding");
-  if (!info.needed) return;
-  ob.info = info;
-  ob.library = info.libraries[0]?.path ?? info.library;
-  ob.dump = info.dump;
-  ob.vault = info.vaults[0] ?? "";
-  let box = $("onboard");
-  if (!box) {
-    box = document.createElement("section");
-    box.id = "onboard";
-    box.setAttribute("aria-label", "Set up refs");
-    document.querySelector("main").append(box);
-  }
-  drawOnboarding();
+function applyHashRoute(hash = location.hash) {
+  const route = decodeHash(hash);
+  if (!route) return null;
+  state.collection = route.collection;
+  state.collectionFilter = route.collectionFilter || "all";
+  state.tag = route.tag;
+  state.context = route.context;
+  state.view = route.view || "all";
+  state.query = route.query || "";
+  $("q").value = state.query;
+  return route.workId;
 }
 
-const obUnder = (path, folders) => [...folders].some((f) => path === f || path.startsWith(f + "/"));
-// PDFs in the chosen folders (a folder inside another chosen one counts once).
-function obPdfs() {
-  let n = 0;
-  const walk = (node) => {
-    if (ob.roots.has(node.path) && !obUnder(node.path, ob.exclude)) { n += node.pdfs; return; }
-    node.children.forEach(walk);
-  };
-  if (ob.survey) walk(ob.survey.tree);
-  return n;
-}
-// Folders of term folders inside the chosen ones: courses grouped by term.
-const obRules = () => (ob.survey?.term_rules ?? []).filter((r) => obUnder(r.split("/{term}")[0], ob.roots));
-const dollars = (x) => (x < 0.01 ? "under $0.01" : `about $${x < 10 ? x.toFixed(2) : Math.round(x)}`);
-
-function obTree(node, depth) {
-  // Folders without PDFs are left out, except at the top (dimmed).
-  const kids = node.children.filter((c) => c.pdfs > 0 || depth === 0);
-  return kids.map((c) => {
-    const inside = obUnder(c.path, [...ob.roots].filter((r) => r !== c.path));
-    const checked = ob.roots.has(c.path) || inside;
-    const more = c.children.some((g) => g.pdfs > 0);
-    const opened = ob.open.has(c.path);
-    return `<div class="ob-row${c.pdfs ? "" : " dim"}" style="padding-left:${depth * 2.5}ch">
-      <button class="act ob-fold" data-ob-fold="${esc(c.path)}"${more ? "" : " disabled"}>${more ? (opened ? "▾" : "▸") : " "}</button>
-      <label><input type="checkbox" data-ob-root="${esc(c.path)}"${checked ? " checked" : ""}${inside ? " disabled" : ""}>
-      ${esc(c.name)}</label><span class="n">${c.pdfs.toLocaleString()}</span></div>`
-      + (opened ? obTree(c, depth + 1) : "");
-  }).join("");
-}
-
-function drawOnboarding() {
-  const box = $("onboard");
-  const info = ob.info;
-  const name = OB_STEPS[ob.step];
-  const back = ob.step > 1 && name !== "progress" ? `<button class="act" data-ob-back="1">back</button>` : "";
-  const next = (label = "next", disabled = false) =>
-    `<button class="act primary" data-ob-next="1"${disabled ? " disabled" : ""}>${label}</button>`;
-  const dots = OB_STEPS.slice(1, -1).map((_, i) => `<span class="${i + 1 <= ob.step ? "on" : ""}">·</span>`).join("");
-  let body = "";
-
-  if (name === "welcome") {
-    body = `<h1>Set up refs</h1>
-      <p>refs indexes the PDFs you already keep in folders (Dropbox, iCloud Drive, any folder),
-      works out what each paper is, and follows the folders as you add, move and rename files.
-      Your files stay where they are.</p>
-      <p class="where">A few questions: where your papers are, what to keep private, and how
-      much to read with Claude. Everything can be changed later under settings.</p>
-      <div class="ob-nav">${next("start")}</div>`;
-  }
-  else if (name === "library") {
-    const options = [...info.libraries];
-    if (!options.some((o) => o.path === ob.library)) options.push({ label: "chosen", path: ob.library });
-    body = `<h1>Where do you keep your papers?</h1>
-      <p class="where">The library folder: refs looks for papers inside it, and nowhere else.
-      Usually your Dropbox or iCloud Drive.</p>
-      <div class="ob-choices">${options.map((o) => `<label><input type="radio" name="ob-lib" value="${esc(o.path)}"
-        ${o.path === ob.library ? " checked" : ""}> ${esc(o.label)} <span class="badge">${esc(o.path)}</span></label>`).join("")}</div>
-      <button class="act" data-ob-choose="library">choose another folder…</button>
-      <div class="ob-nav">${back}${next()}</div>`;
-  }
-  else if (name === "papers") {
-    if (!ob.survey) body = `<h1>Counting PDFs …</h1><p class="where">in ${esc(ob.library)}</p>`;
-    else if (ob.survey.error) body = `<h1>That folder cannot be read</h1><p class="bad">${esc(ob.survey.error)}</p>
-      <div class="ob-nav">${back}</div>`;
-    else {
-      const n = obPdfs();
-      body = `<h1>Which folders hold papers?</h1>
-        <p class="where">Tick the folders refs should watch; everything inside them is included.
-        Numbers are PDFs. ▸ opens a folder, so you can pick only part of it.</p>
-        ${ob.survey.complete ? "" : `<p class="bad">This library is large: counting stopped after
-          ${ob.survey.seconds} s, so the numbers are low.</p>`}
-        <div class="ob-tree">${obTree(ob.survey.tree, 0)}</div>
-        <p class="ob-sum">${ob.roots.size ? `${n.toLocaleString()} PDFs in ${ob.roots.size} folder${ob.roots.size > 1 ? "s" : ""}` : "nothing chosen yet"}</p>
-        ${obRules().map((r) => `<p class="where">Term folders in <b>${esc(r.split("/{term}")[0])}</b>:
-          the folders inside each term are courses, grouped by term.</p>`).join("")}
-        <div class="ob-nav">${back}${next("next", !ob.roots.size)}</div>`;
-    }
-  }
-  else if (name === "dump") {
-    body = `<h1>Where should new papers go?</h1>
-      <p class="where">The quick-add folder. Papers you add in refs (a link, a DOI, the
-      bookmarklet) are saved here, and you can save PDFs here yourself from the browser or the
-      phone. refs gives them tidy names; it renames nothing anywhere else. Created if it does
-      not exist, inside the library folder.</p>
-      <div class="adder"><input id="ob-dump" value="${esc(ob.dump)}" spellcheck="false" autocomplete="off"></div>
-      <div class="ob-nav">${back}${next()}</div>`;
-  }
-  else if (name === "private") {
-    const shown = (ob.survey?.suggestions ?? []).filter((s) => obUnder(s.path, ob.roots));
-    const row = (path, kind) => {
-      const set = kind === "no_llm" ? ob.noLlm : ob.exclude;
-      return `<label><input type="checkbox" data-ob-private="${esc(path)}" data-kind="${kind}"${set.has(path) ? " checked" : ""}>
-        ${esc(path)} <span class="badge">· ${kind === "no_llm" ? "index, but never send to Claude" : "leave out entirely"}</span></label>`;
-    };
-    const chosen = [...ob.exclude].map((p) => [p, "exclude"]).concat([...ob.noLlm].map((p) => [p, "no_llm"]));
-    const listed = new Set(shown.map((s) => s.path));
-    body = `<h1>Anything private in there?</h1>
-      <p class="where">Paperwork (visa, taxes, insurance) can be <b>left out entirely</b>: never
-      read, never indexed. Confidential work (a manuscript you referee) can be indexed but
-      <b>never sent to Claude</b>.</p>
-      ${shown.length ? `<p>Suggested from folder names:</p>` : `<p class="where">No folder names suggest paperwork.</p>`}
-      <div class="ob-choices">${shown.map((s) => row(s.path, s.kind)).join("")}
-        ${chosen.filter(([p]) => !listed.has(p)).map(([p, k]) => row(p, k)).join("")}</div>
-      <div class="acts"><button class="act" data-ob-choose="exclude">leave out a folder…</button>
-        <button class="act" data-ob-choose="no_llm">keep a folder from Claude…</button></div>
-      <div class="ob-nav">${back}${next()}</div>`;
-  }
-  else if (name === "notes") {
-    const vaults = [...new Set([...info.vaults, ob.vault].filter(Boolean))];
-    body = `<h1>Reading notes in Obsidian?</h1>
-      <p class="where">refs can keep a note for each paper as a Markdown file in an Obsidian
-      vault, so your notes are in Obsidian too and <code>[[citekey]]</code> links to them.</p>
-      <div class="ob-choices">${vaults.map((v) => `<label><input type="radio" name="ob-vault" value="${esc(v)}"
-        ${v === ob.vault ? " checked" : ""}> ${esc(v)}</label>`).join("")}
-        <label><input type="radio" name="ob-vault" value=""${ob.vault ? "" : " checked"}> no notes for now</label></div>
-      <button class="act" data-ob-choose="vault">choose a vault…</button>
-      ${ob.vault ? `<p style="margin-top:10px">Folder in the vault:</p>
-        <div class="adder"><input id="ob-vault-folder" value="${esc(ob.vaultFolder)}" spellcheck="false"></div>` : ""}
-      <div class="ob-nav">${back}${next()}</div>`;
-  }
-  else if (name === "reading") {
-    const n = obPdfs();
-    const cost = n * info.cost_per_pdf;
-    const minutes = Math.max(1, Math.round(n * 4 / 60));
-    const key = { set: "found in the macOS Keychain", environment: "from ANTHROPIC_API_KEY" }[info.api_key];
-    const option = (value, label, note) => `<label><input type="radio" name="ob-read" value="${value}"
-      ${ob.read === value ? " checked" : ""}> ${label} <span class="badge">· ${note}</span></label>`;
-    body = `<h1>Reading your papers</h1>
-      <p>To tell what each PDF is, refs sends the <b>text of its first three pages</b> (an image
-      of page one for scans) to Claude Haiku, then checks the result against Crossref and
-      OpenAlex. It never sends file names, your notes, or anything in a private folder.
-      It costs about $0.001 a PDF, billed to your own Anthropic API key.</p>
-      <div class="label">API key</div>
-      ${key ? `<p class="where">${esc(key)} ✓</p>` : `<p class="where">Create one at
-        <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer">console.anthropic.com</a>,
-        then paste it here. It is kept in the macOS Keychain, never in a file.</p>
-        <div class="adder"><input id="ob-key" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">
-        <button class="act" data-ob-key="1">check and save</button></div>`}
-      <div class="label">What to read</div>
-      <div class="ob-choices">
-        ${option("all", `everything: ${n.toLocaleString()} PDFs now`, `${dollars(cost)}, ${minutes} min or so, then each new PDF`)}
-        ${option("dump", "only papers I add from now on", "the others wait under “not identified”, free")}
-        ${option("none", "nothing for now", "read later with `refs process`")}
-      </div>
-      ${ob.read === "all" && cost > info.read_cap ? `<p class="where">That is above the monthly limit
-        for reading ($${info.read_cap}): reading stops there and goes on next month, or raise
-        the limit under settings.</p>` : ""}
-      ${info.api_key === "missing" && ob.read !== "none" ? `<p class="bad">Without a key nothing can be read;
-        PDFs are still indexed and found by file name.</p>` : ""}
-      <div class="ob-nav">${back}${next(ob.saving ? "saving …" : "finish setup", ob.saving)}</div>
-      ${ob.error ? `<p class="bad">${esc(ob.error)}</p>` : ""}`;
-  }
-  else if (name === "progress") body = obProgressHtml();
-
-  box.innerHTML = `<div class="ob-page"><div class="ob-dots">${dots}</div>${body}</div>`;
-}
-
-let obStatus = null;
-function obProgressHtml() {
-  const s = obStatus;
-  const p = s?.progress;
-  const finished = s && !p && !s.pending && s.last_pass && s.last_pass !== ob.startedPass;
-  if (!ob.info.watching) {
-    return `<h1>Saved</h1><p class="where">This refs runs without the folder watcher (--no-watch),
-      so it indexed your folders but reads nothing new. Run <code>refs process --all</code> to read.</p>
-      <div class="ob-nav"><button class="act primary" data-ob-done="1">open my library</button></div>`;
-  }
-  if (!finished) {
-    const what = !p ? "starting …"
-      : p.stage === "scanning" ? `scanning: ${p.done.toLocaleString()} of ${p.total.toLocaleString()} PDFs`
-      : p.stage === "indexing" ? "building the search index (the first time, this downloads a 70 MB search model)"
-      : p.stage === "filing" ? "filing what was read and updating the index"
-      : `reading with Claude: ${p.done.toLocaleString()} of ${p.total.toLocaleString()} PDFs`;
-    const share = p && p.total ? Math.round((100 * p.done) / p.total) : 0;
-    return `<h1>Setting up your library</h1><p>${esc(what)}</p>
-      <div class="ob-bar"><span style="width:${share}%"></span></div>
-      <p class="where">You can use refs while this runs; reading continues in the background.</p>
-      <div class="ob-nav"><button class="act" data-ob-done="1">use refs now</button></div>`;
-  }
-  const login = { running: "refs runs in the background and starts at login ✓",
-                  installed: "refs is set to start at login",
-                  none: "To keep refs running in the background and start it at login, run <code>refs service install</code> in Terminal." }[ob.info.service];
-  return `<h1>Your library is ready</h1>
-    <p>${esc(s.message || "Indexed.")}</p>
-    <div class="label">Next</div>
-    <ul class="ob-list">
-      <li>Search with <kbd>/</kbd>, open with <kbd>⏎</kbd>, all keys with <kbd>?</kbd>.</li>
-      <li>Add papers from any page with the <a href="/bookmarklet" target="_blank">bookmarklet</a>, or with <kbd>a</kbd> here.</li>
-      ${ob.read !== "all" ? `<li>Your PDFs are indexed but not identified yet: they are under
-        <b>not identified</b> in the sidebar, found by file name. To identify them, set
-        <b>Read new PDFs</b> to “all” under settings (about $0.001 each).</li>` : ""}
-      <li>${login}</li>
-      <li>Change any of this under <b>settings</b> (bottom of the sidebar, or <kbd>,</kbd>), including
-      how folders become courses and projects.</li>
-    </ul>
-    <div class="ob-nav"><button class="act primary" data-ob-done="1">open my library</button></div>`;
-}
-
-async function obFollow() {
-  // Poll the watcher until the pass that the new settings started is over.
-  while (OB_STEPS[ob.step] === "progress" && $("onboard")) {
-    try { obStatus = await get("/api/changes"); } catch {}
-    drawOnboarding();
-    const finished = obStatus && !obStatus.progress && !obStatus.pending
-      && obStatus.last_pass && obStatus.last_pass !== ob.startedPass;
-    if (finished || !ob.info.watching) return;
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-}
-
-async function obNext() {
-  const name = OB_STEPS[ob.step];
-  const box = $("onboard");
-  if (name === "library") {
-    ob.library = box.querySelector("input[name=ob-lib]:checked")?.value ?? ob.library;
-    ob.survey = null; ob.roots.clear(); ob.open.clear();
-    ob.exclude.clear(); ob.noLlm.clear(); ob.suggested = false;
-    ob.step++; drawOnboarding();
-    const answer = await fetch(`/api/onboarding/survey?root=${encodeURIComponent(ob.library)}`);
-    ob.survey = await answer.json();
-    return drawOnboarding();
-  }
-  if (name === "dump") {
-    ob.dump = $("ob-dump").value.trim().replace(/^\/+|\/+$/g, "") || ob.info.dump;
-    // Suggestions marked likely (visa, referee, …) start ticked, once.
-    if (!ob.suggested) {
-      ob.suggested = true;
-      for (const s of ob.survey?.suggestions ?? []) {
-        if (s.ticked && obUnder(s.path, ob.roots)) (s.kind === "no_llm" ? ob.noLlm : ob.exclude).add(s.path);
-      }
-    }
-  }
-  if (name === "notes") {
-    ob.vault = box.querySelector("input[name=ob-vault]:checked")?.value ?? "";
-    ob.vaultFolder = $("ob-vault-folder")?.value.trim() || "refs";
-  }
-  if (name === "reading") return obFinish();
-  ob.step++;
-  // First time on the reading screen: read everything when that is cheap (up
-  // to $5) and a key is there; otherwise only papers added from now on.
-  if (OB_STEPS[ob.step] === "reading" && !ob.readChosen) {
-    ob.read = obPdfs() * ob.info.cost_per_pdf <= 5 && ob.info.api_key !== "missing" ? "all" : "dump";
-  }
-  drawOnboarding();
-}
-
-async function obFinish() {
-  ob.read = $("onboard").querySelector("input[name=ob-read]:checked")?.value ?? ob.read;
-  ob.saving = true; ob.error = null; drawOnboarding();
-  ob.startedPass = (await get("/api/changes")).last_pass;
-  const changes = {
-    dropbox_root: ob.library, roots: [...ob.roots], dump: ob.dump,
-    exclude_paths: [...ob.exclude], no_llm: [...ob.noLlm],
-    obsidian_vault: ob.vault, obsidian_folder: ob.vaultFolder, auto_process: ob.read,
-    contexts: obRules(),
-  };
-  // "Read everything" showed its cost: it is your OK for that batch (budget.py).
-  const response = await fetch("/api/settings", { method: "POST",
-    headers: { "Content-Type": "application/json", "X-Refs": "1" },
-    body: JSON.stringify({ changes, approve_reads: ob.read === "all" }) });
-  const answer = await response.json();
-  ob.saving = false;
-  if (!response.ok) { ob.error = answer.error; return drawOnboarding(); }
-  ob.step++;
-  obFollow();
-}
-
-document.addEventListener("click", async (event) => {
-  const box = $("onboard");
-  const el = event.target.closest("button");
-  if (!box || !el || !box.contains(el)) return;
-  const d = el.dataset;
-  if (d.obNext) await obNext();
-  else if (d.obBack) { ob.step--; drawOnboarding(); }
-  else if (d.obFold) { ob.open.has(d.obFold) ? ob.open.delete(d.obFold) : ob.open.add(d.obFold); drawOnboarding(); }
-  else if (d.obChoose) {
-    const kind = d.obChoose;
-    const answer = await post("/api/settings/folder", {
-      prompt: { library: "refs: the library folder", vault: "refs: your Obsidian vault",
-                exclude: "refs: a folder to leave out", no_llm: "refs: a folder to keep from Claude" }[kind],
-      kind: kind === "library" || kind === "vault" ? kind : "folders" });
-    if (answer.error) say(answer.error, 8000);
-    if (!answer.path) return;
-    if (kind === "library") ob.library = answer.path;
-    else if (kind === "vault") ob.vault = answer.path;
-    else (kind === "no_llm" ? ob.noLlm : ob.exclude).add(answer.path);
-    drawOnboarding();
-  }
-  else if (d.obKey) {
-    const input = $("ob-key");
-    say("checking the key with Anthropic …", 0);
-    const response = await fetch("/api/settings/key", { method: "POST",
-      headers: { "Content-Type": "application/json", "X-Refs": "1" }, body: JSON.stringify({ key: input.value }) });
-    const answer = await response.json();
-    if (!response.ok) { say(answer.error, 8000); return; }
-    say("key saved in the Keychain");
-    ob.info.api_key = answer.api_key;
-    // With a key now, the default may become "read everything" (if cheap).
-    if (!ob.readChosen) ob.read = obPdfs() * ob.info.cost_per_pdf <= 5 ? "all" : "dump";
-    drawOnboarding();
-  }
-  else if (d.obDone) {
-    box.remove();
-    loadSidebar(); search();
-  }
-});
-
-document.addEventListener("change", (event) => {
-  const box = $("onboard");
-  const el = event.target;
-  if (!box || !box.contains(el)) return;
-  if (el.dataset.obRoot !== undefined) {
-    const path = el.dataset.obRoot;
-    if (el.checked) {
-      // A folder replaces any chosen folders inside it.
-      for (const r of [...ob.roots]) if (r.startsWith(path + "/")) ob.roots.delete(r);
-      ob.roots.add(path);
-    } else ob.roots.delete(path);
-    drawOnboarding();
-  } else if (el.dataset.obPrivate !== undefined) {
-    const set = el.dataset.kind === "no_llm" ? ob.noLlm : ob.exclude;
-    el.checked ? set.add(el.dataset.obPrivate) : set.delete(el.dataset.obPrivate);
-  } else if (el.name === "ob-read") {
-    ob.read = el.value; ob.readChosen = true; drawOnboarding();
-  } else if (el.name === "ob-vault") {
-    ob.vault = el.value; drawOnboarding();
-  } else if (el.name === "ob-lib") {
-    ob.library = el.value;
-  }
+window.addEventListener("hashchange", () => {
+  const wid = applyHashRoute();
+  markSidebar();
+  search(wid);
 });
 
 // --- start --------------------------------------------------------------------------------
@@ -3514,10 +3225,11 @@ if (params.get("q")) {
   state.query = params.get("q").trim();
   $("q").value = state.query;
 }
+const initialWork = applyHashRoute();
 applyLayout();
 loadSidebar();
-search();
-maybeOnboard();
+search(initialWork);
+maybeOnboard(modCtx);
 
 // --- following the folder watcher -----------------------------------------------------
 
@@ -3558,7 +3270,6 @@ const OUTCOME = {   // glyph and word for each entry of the activity list
   skipped: ["·", "skipped"], scan: ["~", "folders"],
 };
 const fileName = (path) => path?.split("/").pop() ?? "";
-const clock = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 function span(seconds) {
   if (seconds < 1) return "under 1 s";
   seconds = Math.round(seconds);

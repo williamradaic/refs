@@ -34,7 +34,8 @@ def _mupdf():
     return _pymupdf
 
 
-RANK = {"unread": 0, "reading": 1, "read": 2}
+RANK = {"unread": 0, "reading": 1, "skimmed": 2, "read": 3}
+ORDER = ("unread", "reading", "skimmed", "read")
 
 # Annotation types a reader adds. Links, form fields and popups come with the
 # file from the publisher, so they are not counted.
@@ -187,21 +188,98 @@ def apply_detection(work: dict, evidence: tuple[int, int, int] | None) -> bool:
     return bool(finished)
 
 
-def set_status(work: dict, status: str) -> None:
-    """Your own choice of read status. Reading a paper takes it off the queue."""
+def set_status(work: dict, status: str, *, context: str | None = None, note: str | None = None) -> None:
+    """Your own choice of read status. Reading a paper takes it off the queue
+    and logs a reading entry for `skimmed` and `read`."""
     if status not in RANK:
         raise ValueError(f"read status must be one of {', '.join(RANK)}, not {status!r}")
-    work["user"]["read_status"] = status
-    work["user"]["read_set"] = now()
+    user = work["user"]
+    user["read_status"] = status
+    stamp = now()
+    user["read_set"] = stamp
     if status == "read":
-        work["user"].pop("queued", None)
+        for k in ("queued", "queue_note", "queue_for", "queue_priority"):
+            user.pop(k, None)
+    if status in {"skimmed", "read"}:
+        log_read(work, status, context=context, note=note, at=stamp[:10])
+
+
+def log_read(work: dict, status: str = "read", *, context: str | None = None,
+             note: str | None = None, at: str | None = None) -> dict:
+    """Append a reading event (`at`, `status`, optional `context` and `note`)
+    to `work["user"]["reads"]`. Avoids duplicate same-day identical entries."""
+    if status not in {"reading", "skimmed", "read"}:
+        raise ValueError(f"log status must be reading, skimmed or read, not {status!r}")
+    day = (at or now())[:10]
+    entry: dict = {"at": day, "status": status}
+    if context:
+        entry["context"] = context.strip().lstrip("#")
+    if note and note.strip():
+        entry["note"] = note.strip()
+    reads = list(work["user"].get("reads") or [])
+    if reads and reads[-1].get("at") == day and reads[-1].get("status") == status \
+            and reads[-1].get("context") == entry.get("context"):
+        if entry.get("note"):
+            reads[-1]["note"] = entry["note"]
+    else:
+        reads.append(entry)
+    work["user"]["reads"] = reads
+    return entry
+
+
+def last_read_at(work: dict | None) -> str | None:
+    """The latest date/time the paper was read or skimmed, if any."""
+    if not work:
+        return None
+    user = work.get("user") or {}
+    reads = user.get("reads") or []
+    if reads:
+        return max((r.get("at") or "" for r in reads), default="") or None
+    status, source = effective(work)
+    if status in {"skimmed", "read"}:
+        if source == "you" and user.get("read_set"):
+            return user["read_set"][:10]
+        if source == "detected" and (work.get("read_auto") or {}).get("since"):
+            return work["read_auto"]["since"][:10]
+    return None
 
 
 # --- 3. The queue ---------------------------------------------------------------------------
 
-def set_queued(work: dict, on: bool) -> None:
+def set_queued(work: dict, on: bool, *, note: str | None = None,
+               for_collection: str | None = None, priority: str | None = None) -> None:
     """Put a work on the queue (stamped with the time, which orders the queue) or take it off."""
+    user = work["user"]
     if on:
-        work["user"].setdefault("queued", now())
+        user.setdefault("queued", now())
+        update_queue(work, note=note, for_collection=for_collection, priority=priority)
     else:
-        work["user"].pop("queued", None)
+        for k in ("queued", "queue_note", "queue_for", "queue_priority"):
+            user.pop(k, None)
+
+
+def update_queue(work: dict, *, note: str | None = None,
+                 for_collection: str | None = None, priority: str | None = None) -> None:
+    """Update optional metadata on a queued work (a `None` argument leaves that field alone;
+    an empty string clears it)."""
+    user = work["user"]
+    if not user.get("queued"):
+        return
+    if note is not None:
+        clean = note.strip()
+        if clean:
+            user["queue_note"] = clean
+        else:
+            user.pop("queue_note", None)
+    if for_collection is not None:
+        clean = for_collection.strip().lstrip("#")
+        if clean:
+            user["queue_for"] = clean
+        else:
+            user.pop("queue_for", None)
+    if priority is not None:
+        clean = priority.strip().lower()
+        if clean in {"next", "high"}:
+            user["queue_priority"] = "next"
+        else:
+            user.pop("queue_priority", None)

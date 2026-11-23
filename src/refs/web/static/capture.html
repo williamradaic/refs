@@ -26,7 +26,7 @@
   <div class="page">
     <h1 id="title">adding to refs</h1>
     <div class="dim" id="from"></div>
-    <div class="state" id="state">waiting for the page …</div>
+    <div class="state" id="state">grabbing PDF from the browser …</div>
     <div class="row2">
       <button class="act" id="go" hidden>add it (Enter)</button>
       <button class="act" id="lib" hidden>open it through the library</button>
@@ -40,23 +40,21 @@
   </div>
   <script>
     // The window the "+ refs" bookmarklet opens (bookmarklet.html builds it).
-    // The bookmarklet, running in the paper's page, reads its citation tags and
-    // fetches the PDF there, signed in as you; it hands both over with
-    // postMessage. With the bookmarklet's key the add starts at once. Without
-    // a message (an old bookmarklet, or a site that cuts the link between
-    // windows) this falls back to adding the address, after Enter.
+    // Supports three delivery channels cleanly with `cid` deduplication:
+    //   1. Direct raw upload from the bookmarklet (/api/capture-upload) — works under COOP
+    //   2. postMessage ArrayBuffer -> raw upload (/api/capture-raw) — works under strict connect-src CSP
+    //   3. Multipart <form> redirect (/capture-form -> /capture?cid=...) — works under both
     const $ = (id) => document.getElementById(id);
     const params = new URLSearchParams(location.search);
     const pageUrl = params.get("add") ?? "";
+    const cid = params.get("cid") ?? "";
     let started = false, closing = null, pending = false;
-    let heard = false;              // the page has answered: stop saying "ready"
-    let stage = "adding";           // what the job is doing, for the progress line
-    let proxy = "";                 // the library proxy (settings), "" = none
+    let heard = false;
+    let stage = "adding";
+    let proxy = "";
     const ready = fetch("/api/bookmarklet").then((r) => r.json())
       .then((data) => { proxy = data.proxy ?? ""; }).catch(() => {});
 
-    // A page's address through the proxy (EZproxy wants it encoded after
-    // "qurl=", as is after "url="), and whether a page already came through it.
     const viaProxy = (url) => proxy + (/qurl=$/i.test(proxy) ? encodeURIComponent(url) : url);
     const proxied = (url) => {
       try {
@@ -65,8 +63,6 @@
       } catch { return false; }
     };
 
-    // Send the paper's tab through the library proxy; the bookmarklet's next
-    // click there finds the PDF. The tab is the one that opened this window.
     function throughLibrary(url) {
       try { window.opener.location.href = viaProxy(url); }
       catch { window.open(viaProxy(url), "_blank"); }
@@ -74,19 +70,31 @@
 
     $("from").textContent = pageUrl;
     try { $("queue").checked = localStorage.getItem("refs-capture-queue") === "1"; } catch {}
-    // Collections to put each captured paper in: kept between papers, so a
-    // literature review for one project needs it set once.
     try { $("into").value = localStorage.getItem("refs-capture-into") ?? ""; } catch {}
+    const into = () => $("into").value.split(/[\s,]+/).map((w) => w.replace(/^#/, "")).filter(Boolean);
+
+    // Sync remembered capture defaults to the server so direct uploads (Channel 1 / 3)
+    // automatically use the same `into` collections and `queue` toggle.
+    function syncPrefs() {
+      fetch("/api/capture-prefs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Refs": "1" },
+        body: JSON.stringify({ queue: $("queue").checked, collections: into() }),
+      }).catch(() => {});
+    }
+    syncPrefs();
+
     $("into").addEventListener("change", () => {
       try { localStorage.setItem("refs-capture-into", $("into").value); } catch {}
+      syncPrefs();
     });
-    const into = () => $("into").value.split(/[\s,]+/).map((w) => w.replace(/^#/, "")).filter(Boolean);
+    $("queue").addEventListener("change", () => {
+      try { localStorage.setItem("refs-capture-queue", $("queue").checked ? "1" : "0"); } catch {}
+      syncPrefs();
+    });
     fetch("/api/collections").then((r) => r.json()).then((data) => {
       $("colls").innerHTML = (data.collections ?? []).map((c) => `<option value="#${c.name}">`).join("");
     }).catch(() => {});
-    $("queue").addEventListener("change", () => {
-      try { localStorage.setItem("refs-capture-queue", $("queue").checked ? "1" : "0"); } catch {}
-    });
 
     function show(text, kind = "") {
       $("state").textContent = text;
@@ -100,80 +108,111 @@
       return { ok: response.ok, status: response.status, data: await response.json().catch(() => ({})) };
     }
 
-    // An ArrayBuffer as base64, without building a huge string by hand.
-    function base64(buffer) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
-        reader.onerror = reject;
-        reader.readAsDataURL(new Blob([buffer], { type: "application/pdf" }));
-      });
-    }
-
-    // Follow the background job (the server runs `refs add`) until it ends.
     async function follow(begun) {
-      if (begun.data.message) { show(begun.data.message, "ok"); closeSoon(); return; }
+      if (begun.data.message) { show("✓ " + begun.data.message, "ok"); closeSoon(3500); return; }
       if (!begun.data.job) { show(begun.data.detail ?? "could not start", "bad"); return; }
       for (;;) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 900));
         let job;
         try { job = await (await fetch(`/api/job/${begun.data.job}`)).json(); }
-        catch { show("lost contact with refs. If the PDF was saved, it is in the quick-add folder.", "bad"); return; }
-        if (job.state === "running") { show(`${stage} … ${job.seconds}s\n(reading the PDF and looking it up takes 10 to 30 seconds; you can close this window, the add carries on)`); continue; }
+        catch { show("lost contact with refs. If the PDF was saved, it is in the library folder.", "bad"); return; }
+        if (job.state === "running") {
+          show(`${stage} … ${job.seconds}s\n(PDF is safely saved; reading and renaming in the background — safe to close this window)`);
+          continue;
+        }
         const failed = job.state === "failed";
-        // Saved without a PDF: the publisher's PDF sits on another site (OUP
-        // and other Silverchair journals) or behind a sign-in. Opening the PDF
-        // itself and clicking + refs there hands it over.
         const noPdf = /without a PDF/i.test(job.message ?? "");
-        show((job.message || job.state) + (noPdf
-          ? "\n\nIf your browser can open the PDF, open it and click + refs on the PDF itself: it attaches to this record."
+        show((failed ? "" : "✓ ") + (job.message || job.state) + (noPdf
+          ? "\n\nOpen the PDF in your browser and click + refs directly on the PDF to attach it."
           : ""), failed ? "bad" : "ok");
         if (noPdf && proxy && !proxied(pageUrl)) {
           $("lib").hidden = false;
           $("lib").onclick = () => throughLibrary(pageUrl);
         }
-        if (noPdf) return;                   // leave the hint up
-        if (!failed) closeSoon();
+        if (noPdf) return;
+        if (!failed) closeSoon(3500);
         return;
       }
     }
 
-    // Close by itself a few seconds after success, unless asked not to.
-    function closeSoon() {
+    function closeSoon(ms = 3500) {
       $("stay").hidden = false;
-      closing = setTimeout(() => window.close(), 6000);
+      closing = setTimeout(() => window.close(), ms);
     }
     $("stay").addEventListener("click", () => { clearTimeout(closing); $("stay").hidden = true; });
+
+    // Called when Channel 1 (direct upload) or Channel 3 (form POST) already delivered the PDF to refs.
+    async function fromUploaded(result, meta = {}) {
+      if (started) return;
+      started = heard = true;
+      $("go").hidden = true;
+      $("title").textContent = result.title || meta.title || "adding to refs";
+      stage = result.bytes
+        ? `✓ PDF saved (${mb(result.bytes)}); identifying & renaming`
+        : "✓ PDF saved; identifying & renaming";
+      show(stage + " …");
+      await follow({ ok: true, status: 200, data: result });
+    }
 
     async function fromBookmarklet(message) {
       if (started) return;
       started = heard = true;
+      $("go").hidden = true;
       const meta = message.meta ?? {};
       $("title").textContent = meta.title || "adding to refs";
       const pdf = message.pdf instanceof ArrayBuffer && message.pdf.byteLength ? message.pdf : null;
       await ready;
       const url = message.url ?? pageUrl;
-      // Paywalled here, and not yet through the library: go through it first,
-      // instead of saving the paper without its PDF.
+
       if (!pdf && meta.pdf_problem === "paywall" && proxy && !proxied(url)) {
         show("Paywalled here. Opening the page through your library's proxy …\n\n" +
-             "Sign in there if asked, then click + refs again on that page.");
+             "Sign in there if asked, then open the PDF or click + refs again.");
         throughLibrary(url);
         offerEnter("Paywalled here; the page is opening through your library's proxy. Sign in there " +
-                   "if asked, then click + refs again on it.\n\nOr press Enter to save the paper without its PDF.", meta);
+                   "if asked, then click + refs again.\n\nOr press Enter to save the paper without its PDF.", meta);
         $("go").textContent = "save without the PDF (Enter)";
         started = false;
         return;
       }
-      stage = pdf ? `got the PDF from the page (${mb(pdf.byteLength)}); adding`
-        : meta.pdf_url ? "the page's PDF needs another site or a sign-in; refs tries the link, then an open copy"
+
+      if (pdf) {
+        stage = `✓ PDF received (${mb(pdf.byteLength)}); identifying & renaming`;
+        show(stage + " …");
+        const q = new URLSearchParams({
+          cid: message.cid || cid || "",
+          url,
+          doi: meta.doi || "",
+          title: (meta.title || "").slice(0, 160),
+          queue: $("queue").checked ? "true" : "false",
+          to: into().join(","),
+        });
+        const response = await fetch(`/api/capture-raw?${q}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/pdf",
+            "X-Refs": "1",
+            "X-Refs-Token": message.token ?? "",
+          },
+          body: pdf,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (response.status === 403) {
+          started = false;
+          offerEnter(`${data.detail}\n\nPress Enter to add it anyway.`, meta);
+          return;
+        }
+        await follow({ ok: response.ok, status: response.status, data });
+        return;
+      }
+
+      stage = meta.pdf_url ? "the page's PDF needs another site or a sign-in; refs tries the link, then an open copy"
         : "no PDF on the page; refs looks for an open copy";
       show(stage + " …");
-      const body = { token: message.token ?? "", url: message.url ?? pageUrl, meta, queue: $("queue").checked,
-                     collections: into(),
-                     pdf: pdf ? await base64(pdf) : null };
-      const begun = await postJson("/api/capture", body);
-      if (begun.status === 403) {          // an old bookmarklet: its key is not this Mac's
+      const begun = await postJson("/api/capture", {
+        token: message.token ?? "", url, meta, queue: $("queue").checked,
+        collections: into(), pdf: null, cid: message.cid || cid || null,
+      });
+      if (begun.status === 403) {
         started = false;
         offerEnter(`${begun.data.detail}\n\nPress Enter to add it anyway.`, meta);
         return;
@@ -181,7 +220,6 @@
       await follow(begun);
     }
 
-    // The fallback: add the address (and whatever the link said), after Enter.
     function offerEnter(text, meta = {}) {
       show(text);
       $("go").hidden = false;
@@ -200,33 +238,54 @@
       if (event.key === "Escape") window.close();
     });
 
-    // Only the window that opened this one may hand over a paper.
     window.addEventListener("message", (event) => {
-      if (event.source !== window.opener) return;
-      if (event.data?.type === "refs-pending" && !started) {   // still downloading the PDF there
+      if (window.opener && event.source !== window.opener) return;
+      if (event.data?.type === "refs-pending" && !started) {
         pending = true;
-        show(`the page is downloading the PDF … ${event.data.mb ? mb(event.data.mb * 1048576) : ""}`);
+        show("fetching PDF in the browser tab …");
       }
+      if (event.data?.type === "refs-uploaded") fromUploaded(event.data.result, event.data.meta);
       if (event.data?.type === "refs-capture") fromBookmarklet(event.data);
     });
 
-    if (!pageUrl) {
-      show("Nothing to add. Use the + refs bookmarklet on a paper's page.", "bad");
-    } else if (window.opener) {
-      // Say "ready" until the page answers: the bookmarklet may still be
-      // fetching the PDF. Its origin is not known here, hence "*" (the message
-      // carries nothing private).
-      let tries = 0;
-      const hello = setInterval(() => {
-        if (started || heard) { clearInterval(hello); return; }
-        try { window.opener.postMessage({ type: "refs-ready" }, "*"); } catch {}
-        if (++tries > (pending ? 240 : 40)) {   // 20 s without an answer (2 min while it downloads)
-          clearInterval(hello);
-          offerEnter("The page did not hand anything over. Press Enter to add its address.");
-        }
-      }, 500);
+    // Poll server rendezvous by `cid`: catches Channel 1 (direct upload under COOP)
+    // and Channel 3 (multipart form redirect) automatically!
+    async function pollRendezvous() {
+      if (!cid) return;
+      for (let tries = 0; tries < 80 && !started; tries++) {
+        try {
+          const s = await (await fetch(`/api/capture-status/${encodeURIComponent(cid)}`)).json();
+          if (s.found) { await fromUploaded(s); return; }
+        } catch {}
+        await new Promise((r) => setTimeout(r, 400));
+      }
+    }
+
+    if (!pageUrl && !cid) {
+      show("Nothing to add. Use the + refs bookmarklet on a PDF or paper's page.", "bad");
     } else {
-      offerEnter("Press Enter to add it.");
+      if (cid) pollRendezvous();
+      if (window.opener) {
+        let tries = 0;
+        const hello = setInterval(() => {
+          if (started || heard) { clearInterval(hello); return; }
+          try { window.opener.postMessage({ type: "refs-ready" }, "*"); } catch {}
+          if (++tries > (pending ? 240 : 40)) {
+            clearInterval(hello);
+            if (!started) offerEnter("The page did not hand anything over. Press Enter to add its address.");
+          }
+        }, 400);
+      } else if (!cid) {
+        offerEnter("Press Enter to add it.");
+      } else {
+        // COOP cut window.opener: pollRendezvous() is already watching for Channel 1 / 3;
+        // only show the Enter fallback if nothing arrives after 12 seconds.
+        setTimeout(() => {
+          if (!started && pageUrl) {
+            offerEnter("Could not receive the PDF automatically from that tab. Press Enter to add its address.");
+          }
+        }, 12000);
+      }
     }
   </script>
 </body>

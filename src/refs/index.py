@@ -20,7 +20,7 @@ import sqlite3
 import threading
 from pathlib import PurePosixPath
 
-from . import collection, contexts, embed, naming, notes, query, reading, records, works
+from . import collection, contexts, embed, highlights, naming, notes, query, reading, records, works
 from .config import Config
 
 # Bump when the tables change. An older index is simply dropped and rebuilt.
@@ -162,6 +162,7 @@ def connect(cfg: Config) -> sqlite3.Connection:
         if column not in have:
             conn.execute(f"ALTER TABLE files ADD COLUMN {column} {kind}")
     embed.ensure_schema(conn)
+    highlights.ensure_schema(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
     )
@@ -185,7 +186,7 @@ ADDED_COLUMNS = [("pages", "INTEGER"), ("marked_pages", "INTEGER"), ("marks", "I
                  ("marks_by", "TEXT"), ("marks_latest", "TEXT")]
 
 # What connect() creates, so it can tell, by reading only, that there is nothing to do.
-_TABLES = {"meta", "files", "paths", "events", "search", "vectors"}
+_TABLES = {"meta", "files", "paths", "events", "search", "vectors", "highlights", "highlights_done"}
 _INDEXES = {"paths_hash", "paths_context", "files_work_id", "files_status"}
 
 
@@ -226,6 +227,10 @@ def count_marks(cfg: Config, conn: sqlite3.Connection, local_paths: dict[str, st
                      "WHERE hash=?",
                      (found["pages"], found["marked_pages"], found["marks"],
                       json.dumps(found["by_author"], ensure_ascii=False), found["latest"], file_hash))
+        if found["marks"] > 0:
+            highlights.store(conn, file_hash, highlights.extract(cfg.absolute(rel), authors))
+        else:
+            highlights.store(conn, file_hash, [])
         counted += 1
     return counted
 
@@ -379,6 +384,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
     all_works = works.load_all(cfg)
     all_reads = records.load_all_reads(cfg)
     note_text = notes.bodies(cfg)           # your reading notes, by citekey
+    hl_text = highlights.all_text_by_hash(conn)
     material_dirs = frozenset(d.lower() for d in cfg.material_dirs)
 
     # Collections (collection.py). A work is in the collections its PDFs'
@@ -458,11 +464,13 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
             title, year = meta.get("title") or title, meta.get("year") or year
             authors = [a["family"] for a in meta.get("authors") or [] if a.get("family")] or authors
             venue, doi, status = meta.get("venue"), meta.get("doi"), meta.get("status")
-            # Your own tags join the model's (no repeats, order kept); collections
-            # are kept apart, in their own column (collection.py).
-            user_tags = work["user"].get("tags")
-            if user_tags:
-                tags = list(dict.fromkeys([*tags, *user_tags]))
+            # Model tags (minus any the user hid) plus your own personal tags;
+            # collections are kept apart, in their own column (collection.py).
+            hidden_tags = {t.lower() for t in (work["user"].get("hidden_tags") or [])}
+            auto_tags = [t for t in (work.get("tags") if "tags" in work else tags)
+                         if t.lower() not in hidden_tags]
+            user_tags = work["user"].get("tags") or []
+            tags = list(dict.fromkeys([*auto_tags, *user_tags]))
             ids.update({f"alias{n}": a for n, a in enumerate(
                 [*work.get("aliases", []), *work.get("bib_keys", {})])})
             former_names = work["user"].get("former_names", [])
@@ -490,7 +498,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
             venue or "",
             " ".join(tags),
             description or "",
-            note_text.get(citekey or "", ""),
+            "\n".join(filter(None, [note_text.get(citekey or "", ""), hl_text.get(file_hash, "")])),
         ))
 
     if file_updates:
@@ -554,6 +562,15 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
     return finished
 
 
+def update_tags(conn: sqlite3.Connection, work: dict) -> list[str]:
+    """Copy a work's effective tags (model + personal) into the index at once."""
+    tags = list(dict.fromkeys([*(work.get("tags") or []), *(work.get("user", {}).get("tags") or [])]))
+    conn.execute("UPDATE files SET tags=? WHERE work_id=?",
+                 (json.dumps(tags, ensure_ascii=False), work["id"]))
+    conn.commit()
+    return tags
+
+
 def update_collections(conn: sqlite3.Connection, work: dict) -> list[str]:
     """Copy a work's collections into the index after you changed them, so
     filters see the change at once (no scan). Returns the work's full list."""
@@ -599,6 +616,8 @@ def _file_dict(row: sqlite3.Row, locations: list[sqlite3.Row]) -> dict:
         "tags": json.loads(row["tags"] or "[]"),
         "read_status": row["read_status"],
         "queued": row["queued"],
+        "marks": row["marks"] or 0,
+        "marked_pages": row["marked_pages"] or 0,
         "first_seen": row["first_seen"],      # when refs first indexed this content
         "collections": json.loads(row["collections"] or "[]"),
         "locations": [
@@ -814,6 +833,8 @@ def search(
         if earlier is not None:
             earlier["locations"] += item["locations"]
             earlier["hashes"].append(item["hash"])
+            earlier["marks"] = max(earlier.get("marks", 0), item.get("marks", 0))
+            earlier["marked_pages"] = max(earlier.get("marked_pages", 0), item.get("marked_pages", 0))
             continue
         item["hashes"] = [item["hash"]]
         if item["work_id"]:

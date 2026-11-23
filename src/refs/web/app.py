@@ -10,6 +10,9 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+from email.parser import BytesParser
+from email.policy import default as email_policy
+import json
 import os
 import re
 import secrets
@@ -22,13 +25,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from .. import (annotations, bib, capture, collection, config, downloads, inbox, index, ingest, keys, library,
-                notes, onboarding, organize, reading, records, rename, resolve, settings, shared, venues,
-                works)
+from .. import (annotations, batch, bib, capture, collection, config, downloads, highlights, inbox, index,
+                ingest, keys, library, notes, onboarding, organize, reading, records, rename, resolve,
+                settings, shared, updates, venues, works)
 from .. import ask as asking
 from .. import keep as keeping              # an endpoint below is called `keep`
 from .. import contexts as contexts_mod     # sidebar() has a local named `contexts`
@@ -82,15 +85,29 @@ def create_app(watch: bool = False) -> FastAPI:
 
     # 3. Only from refs' own page. A browser names the site a request comes from
     #    (Origin) on every POST; anything that changes something must come from a
-    #    refs address. Requests without an Origin (the command line, scripts) are
-    #    still held to the X-Refs header that guard() checks.
+    #    refs address. The bookmarklet's token-authenticated capture endpoints
+    #    (/api/capture-upload, /capture-form) verify the per-Mac secret instead so
+    #    they still work when a publisher sets Cross-Origin-Opener-Policy.
+    _TOKEN_CAPTURE_PATHS = {"/api/capture-upload", "/capture-form"}
+
     @app.middleware("http")
     async def same_site_only(request, call_next):
-        if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        if request.method not in {"GET", "HEAD", "OPTIONS"} \
+                and request.url.path not in _TOKEN_CAPTURE_PATHS:
             origin = request.headers.get("origin")
             if origin is not None and not _refs_origin(origin):
                 return PlainTextResponse("refs only takes changes from its own page.", status_code=403)
         return await call_next(request)
+
+    def _cors_headers(request: Request) -> dict[str, str]:
+        origin = request.headers.get("origin") or "*"
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-Refs-Token",
+            "Access-Control-Allow-Private-Network": "true",
+            "Vary": "Origin",
+        }
 
     # The page's own files change with every update of refs: tell the browser
     # to check for a newer version each time (an unchanged file costs a 304).
@@ -269,22 +286,29 @@ def create_app(watch: bool = False) -> FastAPI:
         return {"added": local_day(added), "modified": local_day(modified), "in_refs": local_day(entered),
                 "added_at": added, "modified_at": modified, "in_refs_at": entered}
 
-    def shape(item: dict, all_works: dict) -> dict:
+    def shape(item: dict, all_works: dict, note_keys: set[str] = frozenset()) -> dict:
         """One search result as the page needs it."""
         work = all_works.get(item["work_id"] or "")
         meta = (work or {}).get("meta") or {}
         added, modified = dates(item["locations"], work)
+        user_tags = (work or {}).get("user", {}).get("tags") or []
+        citekey = item["citekey"]
         return {
             **date_fields(added, modified, in_refs(item, work)),
             # Venue column: the journal for articles, otherwise what the item is.
             "venue_label": venues.label(meta) if meta else item["kind"],
             "abbr": venues.abbreviation(meta.get("venue")) if meta else None,
             "id": item["work_id"] or item["hash"],
-            "work_id": item["work_id"], "citekey": item["citekey"],
+            "work_id": item["work_id"], "citekey": citekey,
             "title": item["title"], "authors": item["authors"], "year": item["year"],
             "venue": item["venue"], "kind": item["kind"], "status": item["status"],
-            "tags": item["tags"], "description": item["description"],
+            "tags": item["tags"], "user_tags": user_tags,
+            "description": item["description"],
             "locations": item["locations"],
+            "has_note": bool(citekey and citekey in note_keys),
+            "marks": item.get("marks") or 0,
+            "marked_pages": item.get("marked_pages") or 0,
+            "bib_keys": (work or {}).get("bib_keys") or {},
             # Collections: all of them (yours and the folders'), and yours alone.
             "collections": item.get("collections") or [],
             "own_collections": collection.explicit(work or {}),
@@ -292,23 +316,40 @@ def create_app(watch: bool = False) -> FastAPI:
         }
 
     def read_fields(work: dict | None) -> dict:
-        """Read status (yours, else detected from your markup) and queue time."""
+        """Read status (yours, else detected from your markup), reading log and queue details."""
         if not work:
-            return {"read_status": None, "read_source": None, "queued": None}
+            return {"read_status": None, "read_source": None, "queued": None,
+                    "queue_note": None, "queue_for": None, "queue_priority": None,
+                    "read_at": None, "reads": []}
         status, source = reading.effective(work)
-        return {"read_status": status, "read_source": source, "queued": work["user"].get("queued")}
+        user = work["user"]
+        return {
+            "read_status": status, "read_source": source,
+            "queued": user.get("queued"),
+            "queue_note": user.get("queue_note"),
+            "queue_for": user.get("queue_for"),
+            "queue_priority": user.get("queue_priority"),
+            "read_at": reading.last_read_at(work),
+            "reads": user.get("reads") or [],
+        }
 
-    def stub_item(work: dict) -> dict:
+    def stub_item(work: dict, note_keys: set[str] = frozenset()) -> dict:
         """A work saved without a PDF, shaped like a search result."""
         meta = work["meta"]
+        user_tags = work["user"].get("tags") or []
+        tags = list(dict.fromkeys([*(work.get("tags") or []), *user_tags]))
+        citekey = work["citekey"]
         return {
             **date_fields(dates([], work)[0], None, in_refs(None, work)),
             "venue_label": venues.label(meta), "abbr": venues.abbreviation(meta.get("venue")),
-            "id": work["id"], "work_id": work["id"], "citekey": work["citekey"],
+            "id": work["id"], "work_id": work["id"], "citekey": citekey,
             "title": meta.get("title"), "year": meta.get("year"), "venue": meta.get("venue"),
             "authors": [a["family"] for a in meta.get("authors") or [] if a.get("family")],
-            "kind": meta.get("kind"), "status": "no-file", "tags": work.get("tags") or [],
+            "kind": meta.get("kind"), "status": "no-file", "tags": tags, "user_tags": user_tags,
             "description": work.get("description"), "locations": [],
+            "has_note": bool(citekey and citekey in note_keys),
+            "marks": 0, "marked_pages": 0,
+            "bib_keys": work.get("bib_keys") or {},
             "collections": collection.explicit(work), "own_collections": collection.explicit(work),
             **read_fields(work),
         }
@@ -347,8 +388,9 @@ def create_app(watch: bool = False) -> FastAPI:
         which asks Haiku if the query reads like a description and the local
         results look unsure, or if it starts with "?" (ask.py)."""
         all_works = works.load_all_readonly(cfg)
+        note_keys = notes.existing_citekeys(cfg)
         if view == "wanted":
-            items = [stub_item(w) for w in all_works.values() if not w["files"]]
+            items = [stub_item(w, note_keys) for w in all_works.values() if not w["files"]]
             return {"items": items}
         user = lambda i: (all_works.get(i["work_id"] or "") or {}).get("user", {})  # noqa: E731
         words, forced = asking.strip_force(q.split())
@@ -372,9 +414,10 @@ def create_app(watch: bool = False) -> FastAPI:
             except ValueError as error:
                 return {"items": [], "error": str(error)}
         found = outcome.results
-        if view == "queue" and not terms:          # the queue's own order: first queued first
-            found = sorted(found, key=lambda i: user(i).get("queued") or "")
-        items = [shape(item, all_works) | {"why": item.get("why")} for item in found[:800]]
+        if view == "queue" and not terms:          # up-next first, then oldest queued first
+            found = sorted(found, key=lambda i: (user(i).get("queue_priority") != "next",
+                                                 user(i).get("queued") or ""))
+        items = [shape(item, all_works, note_keys) | {"why": item.get("why")} for item in found[:800]]
         return {"items": items, "asked": outcome.asked, "message": outcome.message}
 
     def inbox_waiting(conn, all_works: dict | None = None) -> int | None:
@@ -461,6 +504,7 @@ def create_app(watch: bool = False) -> FastAPI:
                     # Papers in inbox and shared folders the library lacks (None:
                     # neither kind of folder is set, so the entry is hidden).
                     "inbox": inbox_waiting(conn, all_works),
+                    "updates": len(updates.load(cfg)["items"]),
                     "unprocessed": conn.execute(
                         "SELECT COUNT(*) FROM files WHERE status IS NULL "
                         "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
@@ -486,9 +530,48 @@ def create_app(watch: bool = False) -> FastAPI:
             raise HTTPException(404)
         with db() as conn:
             work_copies = annotations.copies(cfg, conn, work_id)
+            work_highlights = highlights.for_work(cfg, conn, work_id)
         return {"work": found, "bibtex": bib.entry(found), "note": notes.read(cfg, found),
                 # Each copy's marks and whether to flag it (annotations.py).
-                "copies": work_copies}
+                "copies": work_copies,
+                "highlights": work_highlights,
+                "backlinks": notes.backlinks(cfg, found.get("citekey") or "")}
+
+    @app.post("/api/work/{work_id}/highlights/pull")
+    def pull_highlights_to_note(work_id: str, version: str = Body(default="", embed=True),
+                                x_refs: str | None = Header(default=None)) -> dict:
+        """Pull extracted PDF highlights and comments into the paper's Obsidian note."""
+        guard(x_refs)
+        found = works.load_one(cfg, work_id)
+        if found is None:
+            raise HTTPException(404)
+        with db() as conn:
+            items = highlights.for_work(cfg, conn, work_id)
+            cols = index.update_collections(conn, found)
+        if not items:
+            raise HTTPException(404, "no highlights or comments found in this paper's PDF")
+        try:
+            note = notes.pull_highlights(cfg, found, items, version, collections=cols)
+        except notes.Conflict:
+            raise HTTPException(409, "the note changed in Obsidian since this page loaded it")
+        except FileNotFoundError as error:
+            raise HTTPException(404, str(error))
+        return {"note": note, "count": len(items)}
+
+    @app.post("/api/work/{work_id}/note/sync")
+    def sync_note_properties(work_id: str, x_refs: str | None = Header(default=None)) -> dict:
+        """Refresh refs-managed YAML properties on the paper's Obsidian note."""
+        guard(x_refs)
+        found = works.load_one(cfg, work_id)
+        if found is None:
+            raise HTTPException(404)
+        with db() as conn:
+            cols = index.update_collections(conn, found)
+        try:
+            note = notes.sync_front_matter(cfg, found, collections=cols)
+        except FileNotFoundError as error:
+            raise HTTPException(404, str(error))
+        return {"note": note}
 
     @app.post("/api/work/{work_id}/pull")
     def pull_marks(work_id: str, path: str = Body(embed=True), into: str | None = Body(default=None, embed=True),
@@ -518,23 +601,56 @@ def create_app(watch: bool = False) -> FastAPI:
 
     @app.post("/api/work/{work_id}/read")
     def set_read(work_id: str, status: str = Body(embed=True),
+                 context: str | None = Body(default=None, embed=True),
+                 note: str | None = Body(default=None, embed=True),
                  x_refs: str | None = Header(default=None)) -> dict:
         guard(x_refs)
         found = works.load_one(cfg, work_id)
         if found is None or status not in reading.RANK:
             raise HTTPException(400)
-        reading.set_status(found, status)          # reading it also takes it off the queue
+        reading.set_status(found, status, context=context, note=note)
         return save_reading(found)
 
-    @app.post("/api/work/{work_id}/queue")
-    def set_queue(work_id: str, on: bool = Body(embed=True),
-                  x_refs: str | None = Header(default=None)) -> dict:
-        """Put a work on the reading queue, or take it off."""
+    @app.post("/api/work/{work_id}/reads")
+    def add_read_log(work_id: str, status: str = Body(default="read", embed=True),
+                     context: str | None = Body(default=None, embed=True),
+                     note: str | None = Body(default=None, embed=True),
+                     at: str | None = Body(default=None, embed=True),
+                     x_refs: str | None = Header(default=None)) -> dict:
+        """Log a reading or re-reading event on a work."""
         guard(x_refs)
         found = works.load_one(cfg, work_id)
         if found is None:
             raise HTTPException(404)
-        reading.set_queued(found, on)
+        try:
+            reading.log_read(found, status, context=context, note=note, at=at)
+        except ValueError as error:
+            raise HTTPException(400, str(error))
+        # Raise current status if this reading log exceeds it.
+        cur, _ = reading.effective(found)
+        if reading.RANK.get(status, 0) > reading.RANK.get(cur, 0):
+            found["user"]["read_status"] = status
+            found["user"]["read_set"] = reading.now()
+            if status == "read":
+                for k in ("queued", "queue_note", "queue_for", "queue_priority"):
+                    found["user"].pop(k, None)
+        return save_reading(found)
+
+    @app.post("/api/work/{work_id}/queue")
+    def set_queue(work_id: str, on: bool | None = Body(default=None, embed=True),
+                  note: str | None = Body(default=None, embed=True),
+                  for_collection: str | None = Body(default=None, embed=True),
+                  priority: str | None = Body(default=None, embed=True),
+                  x_refs: str | None = Header(default=None)) -> dict:
+        """Put a work on the reading queue, take it off, or update its queue note/priority."""
+        guard(x_refs)
+        found = works.load_one(cfg, work_id)
+        if found is None:
+            raise HTTPException(404)
+        if on is None:
+            reading.update_queue(found, note=note, for_collection=for_collection, priority=priority)
+        else:
+            reading.set_queued(found, on, note=note, for_collection=for_collection, priority=priority)
         return save_reading(found)
 
     def save_reading(found: dict) -> dict:
@@ -763,6 +879,47 @@ def create_app(watch: bool = False) -> FastAPI:
         collections_moved()
         return {"old": old, "name": new, "papers": count}
 
+    @app.post("/api/collections/append-bib")
+    def collections_append_bib(name: str = Body(embed=True),
+                               work_ids: list[str] = Body(default=[], embed=True),
+                               x_refs: str | None = Header(default=None)) -> dict:
+        """Append works (or all works in the collection) to the collection's `.bib` file."""
+        guard(x_refs)
+        try:
+            name = collection.clean_name(name)
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        entry = collection.load(cfg).get(name)
+        target = collection.bib_path(cfg, entry) if entry else None
+        if target is None:
+            raise HTTPException(404, f"#{name} has no .bib file set (edit collection details to add one)")
+        all_works = works.load_all_readonly(cfg)
+        if work_ids:
+            chosen = [all_works[wid] for wid in dict.fromkeys(work_ids)
+                      if wid in all_works and "meta" in all_works[wid]]
+        else:
+            terms, filters = _split_query([f"#{name}"])
+            with db() as conn:
+                ids = dict.fromkeys(i["work_id"] for i in index.search(conn, terms, filters, limit=None)
+                                    if i["work_id"] in all_works and "meta" in all_works[i["work_id"]])
+            chosen = sorted((all_works[i] for i in ids), key=lambda w: w["citekey"] or "")
+        if not chosen:
+            return {"added": [], "present": [], "bib_file": str(target)}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        added, present = bib.append(target, chosen)
+        if added:
+            from .. import bibkeys
+            mutable = works.load_all(cfg)
+            bibkeys.learn(cfg, mutable)
+            for wid, w in mutable.items():
+                if wid in {a["id"] for a in added}:
+                    records.write_json(works.works_dir(cfg) / f"{wid}.json", w)
+        return {
+            "added": [w["citekey"] for w in added],
+            "present": [{"citekey": w["citekey"], "key": k} for w, k in present],
+            "bib_file": entry.get("bib_file") or str(target),
+        }
+
     @app.get("/api/collections/bibtex")
     def collections_bibtex(name: str) -> dict:
         """The BibTeX of every paper in a collection (its parts included)."""
@@ -812,6 +969,7 @@ def create_app(watch: bool = False) -> FastAPI:
         found["user"]["overrides"] = clean
         found["user"]["override_source"] = "you"
         found["user"]["confirmed"] = bool(clean)
+        works.sync_keys(found)
         return save_work(found)
 
     @app.post("/api/work/{work_id}/confirm")
@@ -839,7 +997,55 @@ def create_app(watch: bool = False) -> FastAPI:
         found["user"]["overrides"] = {**fields, "kind": found["meta"].get("kind")}
         found["user"]["override_source"] = f"{record.source}, DOI given by you"
         found["user"]["confirmed"] = True
+        works.sync_keys(found)
         return save_work(found)
+
+    @app.post("/api/work/{work_id}/tags")
+    def edit_work_tags(work_id: str, add_user: list[str] = Body(default=[], embed=True),
+                       remove_user: list[str] = Body(default=[], embed=True),
+                       hide_auto: list[str] = Body(default=[], embed=True),
+                       restore_auto: bool = Body(default=False, embed=True),
+                       x_refs: str | None = Header(default=None)) -> dict:
+        """Add/remove personal tags (`user.tags`) or hide/restore model tags."""
+        guard(x_refs)
+        try:
+            updated = works.edit_tags(cfg, work_id, add_user=add_user, remove_user=remove_user,
+                                      hide_auto=hide_auto, restore_auto=restore_auto)
+        except ValueError as error:
+            raise HTTPException(404, str(error))
+        with db() as conn:
+            tags = index.update_tags(conn, updated)
+        return {"work": updated, "tags": tags, "user_tags": updated["user"].get("tags") or []}
+
+    @app.post("/api/work/{work_id}/merge")
+    def merge_works(work_id: str, other_id: str = Body(embed=True),
+                    x_refs: str | None = Header(default=None)) -> dict:
+        """Merge `other_id` into `work_id`, keeping `work_id`'s citekey and combining files/notes/collections."""
+        guard(x_refs)
+        with ingest.exclusive(cfg), db() as conn:
+            try:
+                result = works.merge(cfg, work_id, other_id)
+            except ValueError as error:
+                raise HTTPException(400, str(error))
+            scanner.scan(cfg, conn)
+        library_changed()
+        return result
+
+    @app.post("/api/work/{work_id}/remove")
+    def remove_work(work_id: str, trash_files: bool = Body(default=True, embed=True),
+                    x_refs: str | None = Header(default=None)) -> dict:
+        """Remove a work from the library (trash its PDFs if requested; archive its work JSON)."""
+        guard(x_refs)
+        with ingest.exclusive(cfg), db() as conn:
+            try:
+                result = works.remove(cfg, conn, work_id, trash_files=trash_files)
+            except ValueError as error:
+                raise HTTPException(404, str(error))
+            except organize.Refused as error:
+                raise refused(error)
+            scanner.scan(cfg, conn)
+        library_changed()
+        return result
 
     # --- review: renames, identical copies, filing -------------------------------------
 
@@ -1242,11 +1448,192 @@ def create_app(watch: bool = False) -> FastAPI:
                  "source_url": thing if thing.lower().startswith("http") else None}
         return start_add(thing, thing, queue, hints if doi or pdf_url else None, collections)
 
+    def _is_pdf_bytes(body: bytes) -> bool:
+        """True if `body` is a PDF (allows leading BOM/whitespace per PDF spec §7.5.2)."""
+        return body.startswith(b"%PDF") or b"%PDF-" in body[:1024]
+
+    def _verify_bookmarklet_token(token: str | None) -> None:
+        if not token or not secrets.compare_digest(token.encode(), capture.token(cfg).encode()):
+            raise HTTPException(403, "this bookmarklet is out of date: drag it to the bookmarks bar "
+                                     "again from the refs bookmarklet page")
+
+    # Rendezvous store for bookmarklet captures keyed by `cid` (pruned after 10 min)
+    # and saved defaults (queue + collections) synced from /capture.
+    captures: dict[str, dict] = {}
+    captures_lock = threading.Lock()
+
+    def _prefs_path() -> Path:
+        return cfg.index_db.parent / "capture-prefs.json"
+
+    def _load_capture_prefs() -> dict:
+        try:
+            data = json.loads(_prefs_path().read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {"queue": bool(data.get("queue")),
+                        "collections": [str(c).strip().lstrip("#") for c in (data.get("collections") or []) if str(c).strip()]}
+        except (OSError, ValueError):
+            pass
+        return {"queue": False, "collections": []}
+
+    def _save_capture_prefs(queue: bool, collections: list[str]) -> dict:
+        prefs = {"queue": bool(queue),
+                 "collections": [str(c).strip().lstrip("#") for c in collections if str(c).strip()]}
+        try:
+            _prefs_path().parent.mkdir(parents=True, exist_ok=True)
+            _prefs_path().write_text(json.dumps(prefs), encoding="utf-8")
+        except OSError:
+            pass
+        return prefs
+
+    def _prune_captures() -> None:
+        cutoff = time.time() - 600
+        for k in [cid for cid, v in captures.items() if v.get("at", 0) < cutoff]:
+            captures.pop(k, None)
+
+    def _ingest_captured_pdf(body: bytes, url: str, meta: dict, queue: bool,
+                             collections: list[str], cid: str | None = None) -> dict:
+        """Save and add a PDF handed over by the bookmarklet, deduplicating on `cid` and SHA-256."""
+        if cid:
+            with captures_lock:
+                _prune_captures()
+                if cid in captures:
+                    return captures[cid]["result"]
+        if not _is_pdf_bytes(body):
+            raise HTTPException(400, "what the page gave is not a PDF")
+        hints = {"doi": meta.get("doi") or None, "pdf_url": None,
+                 "source_url": url if url.lower().startswith(("http://", "https://")) else None}
+        label = str(meta.get("title") or url or "paper.pdf")[:160]
+        with db() as conn:
+            known = conn.execute(
+                "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
+                (hashlib.sha256(body).hexdigest(),)).fetchone()
+        if known is not None and known["status"] is not None:
+            used = collect_known([known["path"]], collections)
+            result = {"ok": True, "bytes": len(body), "title": label,
+                      "message": f"Already in the library: {known['path']}"
+                                 + (f"; now in {', '.join('#' + n for n in used)}" if used else "")}
+        elif known is not None:
+            result = start_add(str(cfg.absolute(known["path"])), label, queue, hints, collections) | {
+                "ok": True, "bytes": len(body), "title": label}
+        else:
+            dump_dir = cfg.absolute(cfg.dump)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            path = capture.save(body, dump_dir)
+            result = start_add(str(path), label, queue, hints, collections) | {
+                "ok": True, "bytes": len(body), "title": label}
+        if cid:
+            with captures_lock:
+                captures[cid] = {"at": time.time(), "result": result}
+        return result
+
+    def _parse_multipart(content_type: str, body: bytes) -> dict[str, bytes]:
+        header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("latin-1", "ignore")
+        msg = BytesParser(policy=email_policy).parsebytes(header + body)
+        parts: dict[str, bytes] = {}
+        if msg.is_multipart():
+            for part in msg.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if name:
+                    parts[name] = part.get_payload(decode=True) or b""
+        return parts
+
+    @app.post("/api/capture-prefs")
+    def set_capture_prefs(queue: bool = Body(default=False, embed=True),
+                          collections: list[str] = Body(default=[], embed=True),
+                          x_refs: str | None = Header(default=None)) -> dict:
+        """Remember the capture window's queue & collection defaults for direct bookmarklet uploads."""
+        guard(x_refs)
+        return _save_capture_prefs(queue, collections)
+
+    @app.options("/api/capture-upload")
+    def capture_upload_preflight(request: Request) -> Response:
+        return Response(status_code=204, headers=_cors_headers(request))
+
+    @app.post("/api/capture-upload")
+    async def capture_upload_direct(request: Request, cid: str = "", url: str = "",
+                                    doi: str = "", title: str = "",
+                                    token: str = "",
+                                    x_refs_token: str | None = Header(default=None)) -> JSONResponse:
+        """Direct token-authenticated raw PDF upload from the bookmarklet.
+
+        Bypasses Cross-Origin-Opener-Policy (COOP) and popup blockers, and streams
+        raw PDF bytes with zero base64 overhead. Authenticated by the Mac's secret key.
+        """
+        headers = _cors_headers(request)
+        try:
+            _verify_bookmarklet_token(x_refs_token or token)
+            body = await request.body()
+            prefs = _load_capture_prefs()
+            meta = {"doi": doi or None, "title": title or None}
+            result = _ingest_captured_pdf(body, url, meta, prefs["queue"], prefs["collections"], cid=cid or None)
+            return JSONResponse(result, headers=headers)
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=headers)
+
+    @app.post("/api/capture-raw")
+    async def capture_raw(request: Request, cid: str = "", url: str = "", doi: str = "",
+                          title: str = "", queue: bool = False, to: str = "",
+                          token: str = "",
+                          x_refs: str | None = Header(default=None),
+                          x_refs_token: str | None = Header(default=None)) -> dict:
+        """Same-origin raw binary PDF upload from /capture (zero base64 overhead)."""
+        guard(x_refs)
+        _verify_bookmarklet_token(x_refs_token or token)
+        body = await request.body()
+        cols = [n.strip().lstrip("#") for n in to.split(",") if n.strip()]
+        meta = {"doi": doi or None, "title": title or None}
+        return _ingest_captured_pdf(body, url, meta, queue, cols, cid=cid or None)
+
+    @app.post("/capture-form")
+    async def capture_form(request: Request) -> RedirectResponse:
+        """Multipart <form> fallback when a site has BOTH strict COOP and strict connect-src CSP."""
+        body = await request.body()
+        parts = _parse_multipart(request.headers.get("content-type", ""), body)
+        token = parts.get("token", b"").decode("utf-8", "ignore").strip()
+        _verify_bookmarklet_token(token)
+        cid = parts.get("cid", b"").decode("utf-8", "ignore").strip() or secrets.token_hex(6)
+        url = parts.get("url", b"").decode("utf-8", "ignore").strip()
+        doi = parts.get("doi", b"").decode("utf-8", "ignore").strip()
+        title = parts.get("title", b"").decode("utf-8", "ignore").strip()
+        pdf_bytes = parts.get("pdf", b"")
+        prefs = _load_capture_prefs()
+        _ingest_captured_pdf(pdf_bytes, url, {"doi": doi or None, "title": title or None},
+                             prefs["queue"], prefs["collections"], cid=cid)
+        return RedirectResponse(f"/capture?cid={cid}", status_code=303)
+
+    @app.options("/api/capture-status/{cid}")
+    def capture_status_preflight(cid: str, request: Request) -> Response:
+        return Response(status_code=204, headers=_cors_headers(request))
+
+    @app.get("/api/capture-status/{cid}")
+    def capture_status(cid: str, request: Request, token: str = "",
+                       x_refs_token: str | None = Header(default=None)) -> JSONResponse:
+        """Rendezvous status for /capture?cid=... (same-origin) or bookmarklet toast (token)."""
+        origin = request.headers.get("origin")
+        headers = _cors_headers(request) if origin else {}
+        if origin and not _refs_origin(origin):
+            try:
+                _verify_bookmarklet_token(x_refs_token or token)
+            except HTTPException as exc:
+                return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=headers)
+        with captures_lock:
+            entry = captures.get(cid)
+        if entry is None:
+            return JSONResponse({"found": False}, headers=headers)
+        res = dict(entry["result"])
+        job_info = None
+        if job_id := res.get("job"):
+            found_job = jobs.get(job_id)
+            if found_job:
+                job_info = {**found_job, "seconds": int(time.time() - found_job["started"])}
+        return JSONResponse({"found": True, **res, "job_info": job_info}, headers=headers)
+
     @app.post("/api/capture")
     def capture_add(token: str = Body(embed=True), url: str = Body(embed=True),
                     meta: dict = Body(default={}, embed=True), pdf: str | None = Body(default=None, embed=True),
                     queue: bool = Body(default=False, embed=True),
                     collections: list[str] = Body(default=[], embed=True),
+                    cid: str | None = Body(default=None, embed=True),
                     x_refs: str | None = Header(default=None)) -> dict:
         """What the bookmarklet read in your browser: the page address, its
         citation tags (`meta`: doi, title, pdf_url) and, when the browser could
@@ -1255,9 +1642,7 @@ def create_app(watch: bool = False) -> FastAPI:
         Starts at once, without Enter, but only with the bookmarklet's key:
         any website can open the refs window, none can know the key."""
         guard(x_refs)
-        if not secrets.compare_digest(token.encode(), capture.token(cfg).encode()):
-            raise HTTPException(403, "this bookmarklet is out of date: drag it to the bookmarks bar "
-                                     "again from the refs bookmarklet page")
+        _verify_bookmarklet_token(token)
         hints = {"doi": meta.get("doi") or None, "pdf_url": meta.get("pdf_url") or None,
                  "source_url": url if url.lower().startswith(("http://", "https://")) else None}
         label = str(meta.get("title") or url)[:160]
@@ -1272,21 +1657,7 @@ def create_app(watch: bool = False) -> FastAPI:
             body = base64.b64decode(pdf, validate=True)
         except (binascii.Error, ValueError):
             raise HTTPException(400, "the PDF did not arrive intact")
-        if not body.startswith(b"%PDF"):
-            raise HTTPException(400, "what the page gave is not a PDF")
-        with db() as conn:
-            known = conn.execute(
-                "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
-                (hashlib.sha256(body).hexdigest(),)).fetchone()
-        if known is not None and known["status"] is not None:
-            used = collect_known([known["path"]], collections)
-            return {"ok": True, "message": f"Already in the library: {known['path']}"
-                                          + (f"; now in {', '.join('#' + n for n in used)}" if used else "")}
-        if known is not None:                       # on disk but never identified
-            return start_add(str(cfg.absolute(known["path"])), label, queue, hints | {"pdf_url": None},
-                             collections)
-        path = capture.save(body, cfg.absolute(cfg.dump))
-        return start_add(str(path), label, queue, hints | {"pdf_url": None}, collections)
+        return _ingest_captured_pdf(body, url, meta, queue, collections, cid=cid)
 
     @app.get("/api/inbox")
     def inbox_list() -> dict:
@@ -1333,6 +1704,78 @@ def create_app(watch: bool = False) -> FastAPI:
                 raise HTTPException(404)
         return start_add(str(cfg.absolute(path)), Path(path).name)
 
+    @app.post("/api/reread")
+    def reread_pdfs(work_ids: list[str] = Body(default=[], embed=True),
+                    paths: list[str] = Body(default=[], embed=True),
+                    clear_overrides: bool = Body(default=False, embed=True),
+                    x_refs: str | None = Header(default=None)) -> dict:
+        """Re-read one or many PDFs through Claude and fresh registry lookups to
+        repopulate their metadata. Preserves citekeys, collections, reading log and notes."""
+        guard(x_refs)
+        targets: list[tuple[str | None, str, str]] = []
+        seen_hashes: set[str] = set()
+        skipped_no_pdf = 0
+        lib_prefix = library.folder(cfg) + "/"
+        with db() as conn:
+            for wid in dict.fromkeys(work_ids):
+                rows = conn.execute(
+                    "SELECT p.path, f.hash FROM paths p JOIN files f ON f.hash = p.hash "
+                    "WHERE f.work_id = ? ORDER BY p.path", (wid,),
+                ).fetchall()
+                if not rows:
+                    skipped_no_pdf += 1
+                    continue
+                chosen = next((r for r in rows if r["path"].startswith(lib_prefix)), rows[0])
+                if chosen["hash"] not in seen_hashes:
+                    seen_hashes.add(chosen["hash"])
+                    targets.append((wid, chosen["path"], chosen["hash"]))
+            for rel in dict.fromkeys(paths):
+                row = conn.execute(
+                    "SELECT p.path, f.hash, f.work_id FROM paths p JOIN files f ON f.hash = p.hash "
+                    "WHERE p.path = ?", (rel,),
+                ).fetchone()
+                if row is not None and row["hash"] not in seen_hashes:
+                    seen_hashes.add(row["hash"])
+                    targets.append((row["work_id"], row["path"], row["hash"]))
+        if not targets:
+            raise HTTPException(400, "none of the selected papers has a PDF on disk to re-read")
+
+        job_id = secrets.token_hex(4)
+        label = Path(targets[0][1]).name if len(targets) == 1 else f"{len(targets)} PDFs"
+        jobs[job_id] = {"state": "running", "label": f"re-reading {label}",
+                        "message": "", "started": time.time()}
+
+        def run() -> None:
+            try:
+                def step(n: int, total: int, name: str) -> None:
+                    jobs[job_id]["message"] = f"{n} of {total}: {name}" if total > 1 else f"reading {name}"
+                with ingest.exclusive(cfg), db() as conn:
+                    res = ingest.reread(cfg, conn, targets, clear_overrides=clear_overrides, progress=step)
+                if res["done"]:
+                    library_changed()
+                if len(targets) == 1 and res["done"]:
+                    rel, status, issues = res["results"][0]
+                    msg = f"re-read {Path(rel).name}: {status}" + (f" ({issues[0]})" if issues else "")
+                    if skipped_no_pdf:
+                        msg += f" ({skipped_no_pdf} had no PDF)"
+                    jobs[job_id].update(state="done", message=msg)
+                elif res["done"]:
+                    n_fail = len(res["failed"])
+                    msg = f"re-read {res['done']} of {len(targets)} PDFs" + (
+                        f" ({skipped_no_pdf} had no PDF)" if skipped_no_pdf else ""
+                    ) + (
+                        f"; {n_fail} failed ({res['failed'][0][1]})" if n_fail else ""
+                    )
+                    jobs[job_id].update(state="done", message=msg)
+                else:
+                    why = res["failed"][0][1] if res["failed"] else "failed"
+                    jobs[job_id].update(state="failed", message=why)
+            except Exception as error:  # noqa: BLE001
+                jobs[job_id].update(state="failed", message=f"{type(error).__name__}: {error}")
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"job": job_id, "count": len(targets), "skipped_no_pdf": skipped_no_pdf}
+
     @app.post("/api/upload")
     async def upload(request: Request, name: str = "upload.pdf", to: str = "",
                      x_refs: str | None = Header(default=None)) -> dict:
@@ -1342,7 +1785,7 @@ def create_app(watch: bool = False) -> FastAPI:
         guard(x_refs)
         names = [n for n in to.split(",") if n.strip()]
         body = await request.body()
-        if not body.startswith(b"%PDF"):
+        if not _is_pdf_bytes(body):
             raise HTTPException(400, "that file is not a PDF")
         # The same PDF may already be in the library: do not store a second copy.
         with db() as conn:
@@ -1367,5 +1810,126 @@ def create_app(watch: bool = False) -> FastAPI:
             number += 1
         target.write_bytes(body)
         return start_add(str(target), target.name, collections=names)
+
+    # --- published updates (updates.py) & batch import (batch.py) ----------------------
+
+    @app.get("/api/updates")
+    def updates_list() -> dict:
+        """Working papers that have a verified published version waiting for review."""
+        return updates.load(cfg)
+
+    @app.post("/api/updates/check")
+    def updates_check(x_refs: str | None = Header(default=None)) -> dict:
+        """Re-check every working paper against Crossref and OpenAlex in the background."""
+        guard(x_refs)
+        job_id = secrets.token_hex(4)
+        jobs[job_id] = {"state": "running", "label": "checking for published versions",
+                        "message": "starting …", "started": time.time()}
+
+        def run() -> None:
+            try:
+                def step(done: int, total: int, label: str) -> None:
+                    jobs[job_id]["message"] = f"{done} of {total}: {label}"
+                result = updates.check_all(cfg, refresh=True, progress=step)
+                n = len(result["items"])
+                msg = (f"checked {result['checked']} working papers: "
+                       f"{n} published {'update' if n == 1 else 'updates'} found")
+                jobs[job_id].update(state="done", message=msg)
+            except Exception as error:  # noqa: BLE001
+                jobs[job_id].update(state="failed", message=f"{type(error).__name__}: {error}")
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"job": job_id}
+
+    @app.post("/api/updates/apply")
+    def updates_apply(work_id: str = Body(embed=True), proposed: dict | None = Body(default=None, embed=True),
+                      x_refs: str | None = Header(default=None)) -> dict:
+        """Upgrade a working paper's metadata to its published record."""
+        guard(x_refs)
+        try:
+            updated = updates.apply(cfg, work_id, proposed)
+        except ValueError as error:
+            raise HTTPException(404, str(error))
+        with db() as conn:
+            scanner.scan(cfg, conn)
+        library_changed()
+        return {"work": updated}
+
+    @app.post("/api/updates/ignore")
+    def updates_ignore(work_id: str = Body(embed=True), key: str = Body(embed=True),
+                       x_refs: str | None = Header(default=None)) -> dict:
+        """Dismiss a published-version proposal for a work."""
+        guard(x_refs)
+        try:
+            updates.ignore(cfg, work_id, key)
+        except ValueError as error:
+            raise HTTPException(404, str(error))
+        return {"ok": True}
+
+    @app.post("/api/import/preview")
+    def import_preview(text: str = Body(embed=True), use_llm: bool = Body(default=False, embed=True),
+                       resolve_online: bool = Body(default=True, embed=True),
+                       x_refs: str | None = Header(default=None)) -> dict:
+        """Parse a .bib, DOI/URL list, or syllabus and reconcile against the library (read-only)."""
+        guard(x_refs)
+        entries = batch.parse_input(text, use_llm=use_llm)
+        if not entries:
+            return {"items": [], "counts": {"existing": 0, "new_oa": 0, "new_stub": 0, "unresolved": 0}}
+        with db() as conn:
+            return batch.preview(cfg, conn, entries, resolve_online=resolve_online)
+
+    @app.post("/api/import/commit")
+    def import_commit(items: list[dict] = Body(embed=True),
+                      collection_name: str | None = Body(default=None, embed=True),
+                      queue: bool = Body(default=False, embed=True),
+                      download_oa: bool = Body(default=True, embed=True),
+                      x_refs: str | None = Header(default=None)) -> dict:
+        """Commit previewed import items: tag existing papers, create verified stubs, and
+        optionally download open-access PDFs sequentially in a background job."""
+        guard(x_refs)
+        try:
+            with db() as conn:
+                result = batch.commit(cfg, conn, items, collection_name=collection_name, queue=queue)
+        except collection.Invalid as error:
+            raise HTTPException(400, str(error))
+        library_changed()
+
+        job_id = None
+        targets = result["download_targets"] if download_oa else []
+        if targets:
+            job_id = secrets.token_hex(4)
+            jobs[job_id] = {"state": "running", "label": f"{len(targets)} open-access PDFs",
+                            "message": "", "started": time.time()}
+
+            def run_downloads() -> None:
+                got = 0
+                dump_dir = cfg.absolute(cfg.dump)
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                for n, target in enumerate(targets, 1):
+                    jobs[job_id]["message"] = f"{n} of {len(targets)}: {target['citekey']}"
+                    try:
+                        saved = capture.download_first(target["pdf_urls"], dump_dir)
+                        if saved is None:
+                            continue
+                        opts = []
+                        if target.get("doi"):
+                            opts += ["--doi", str(target["doi"]), "--no-page"]
+                        for col in target.get("collections") or []:
+                            opts += ["--to", col]
+                        done = subprocess.run([sys.executable, "-m", "refs.cli", "add", str(saved), *opts],
+                                              capture_output=True, text=True, timeout=300)
+                        if done.returncode == 0:
+                            got += 1
+                    except Exception:  # noqa: BLE001 (leave the stub cleanly behind)
+                        continue
+                jobs[job_id].update(
+                    state="done",
+                    message=f"downloaded {got} of {len(targets)} open-access PDFs (the rest stay as stubs)",
+                )
+
+            threading.Thread(target=run_downloads, daemon=True).start()
+
+        return {"tagged": result["tagged"], "created": result["created"],
+                "stubs": result["stubs"], "oa_queued": len(targets), "job": job_id}
 
     return app

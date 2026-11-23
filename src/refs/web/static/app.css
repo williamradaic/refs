@@ -522,3 +522,78 @@ header { position: relative; }
   .sbrow { grid-template-columns: 4ch 5ch minmax(0, 1fr); }
   .sbrow > :nth-child(n+4) { display: none; }
 }
+
+/* --- collection workspace header ------------------------------------------------------- */
+.wsbar {
+  padding: 8px 2ch 6px 1ch;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.wstop { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 1.5ch; }
+.wstitle { font-weight: 700; color: var(--fg); font-size: 14px; }
+.wsprog { margin-left: auto; color: var(--dim); font-size: 12px; }
+.wsacts { display: flex; flex-wrap: wrap; gap: 0 2ch; margin-top: 3px; font-size: 12px; }
+.wspills { display: flex; flex-wrap: wrap; gap: 4px 1ch; margin-top: 6px; }
+.pill {
+  background: none; border: 1px solid var(--line); color: var(--dim);
+  font: inherit; font-size: 11px; padding: 0 0.8ch; cursor: pointer;
+}
+.pill:hover { border-color: var(--fg); color: var(--fg); }
+.pill.on { border-color: var(--accent); color: var(--accent); background: var(--sel); }
+.pill .n { color: var(--faint); margin-left: 0.3ch; }
+.pill.on .n { color: var(--accent); }
+
+/* --- reading strip, reading log & queue intent ----------------------------------------- */
+.rdstrip { margin: 10px 0 6px; padding: 6px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.rdpills { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 0.7ch; }
+.qbar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 1.5ch; margin-top: 6px; font-size: 12px; }
+.qpin-on { font-weight: 700; }
+.qnote {
+  flex: 1 1 20ch; min-width: 14ch; font: inherit; color: var(--fg); background: none;
+  border: 0; border-bottom: 1px solid var(--line); padding: 1px 0; outline: 0;
+}
+.qnote:focus { border-bottom-color: var(--accent); }
+.readlog { margin-top: 6px; font-size: 12px; color: var(--dim); }
+.row .qhint { color: var(--dim); font-size: 12px; margin-left: 1ch; }
+.nt { text-align: center; color: var(--dim); font-size: 12px; }
+.nt.has { color: var(--accent); }
+
+/* --- personal & auto tags -------------------------------------------------------------- */
+.chip.utag { border-bottom-color: var(--accent); }
+.chip.atag .act { opacity: 0.35; }
+.chip.atag:hover .act { opacity: 1; }
+
+/* --- PDF highlights & Obsidian backlinks ----------------------------------------------- */
+.backlinks { margin-top: 6px; font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
+.hlbox { margin-top: 2px; }
+.hlbox > summary { cursor: pointer; font-size: 12px; user-select: none; }
+.hllist { margin-top: 6px; display: grid; gap: 6px; }
+.hlrow { display: flex; gap: 0.8ch; align-items: baseline; font-size: 12px; }
+.hlp { color: var(--dim); flex: none; min-width: 4ch; font-variant-numeric: tabular-nums; }
+.hldot { display: inline-block; width: 7px; height: 7px; flex: none; align-self: center; }
+.hlbody { min-width: 0; overflow-wrap: anywhere; }
+.hlq { color: var(--fg); }
+.hlc { color: var(--accent); margin-top: 2px; font-style: italic; }
+
+/* --- compact single-copy file row ------------------------------------------------------ */
+.filebar { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 1.5ch; }
+.filebar .path { font-size: 12px; margin-left: auto; }
+
+/* --- published updates & batch import -------------------------------------------------- */
+.updgrid {
+  display: grid; grid-template-columns: 7ch minmax(0, 1fr); gap: 2px 1ch;
+  padding: 2px 2ch 4px 4ch; font-size: 12px;
+}
+.updpub { color: var(--ok); overflow-wrap: anywhere; }
+.impwrap { padding: 4px 2ch 3em 2ch; }
+.imp-area { min-height: 8lh; max-height: 32vh; font-size: 12px; }
+.imp-inline {
+  background: none; border: 0; border-bottom: 1px solid var(--line);
+  color: var(--fg); font: inherit; outline: 0; width: 18ch; padding: 0 2px;
+}
+.imp-inline:focus { border-bottom-color: var(--accent); }
+.imp-ok { color: var(--ok); }
+.imp-accent { color: var(--accent); }
+.imp-warn { color: var(--warn); }
+.imp-bad { color: var(--bad); }
+.danger-act { color: var(--bad); }

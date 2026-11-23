@@ -837,11 +837,12 @@ def _collect_on_add(cfg, conn, work: dict, names: list[str] | None) -> None:
             index.update_collections(conn, updated)
 
 
-def _queue(cfg, work: dict, on: bool = True) -> None:
+def _queue(cfg, work: dict, on: bool = True, *, note: str | None = None,
+           for_collection: str | None = None, priority: str | None = None) -> None:
     """Put a work on the reading queue (or take it off), in its file and the index."""
     from . import reading, records, works
 
-    reading.set_queued(work, on)
+    reading.set_queued(work, on, note=note, for_collection=for_collection, priority=priority)
     records.write_json(works.works_dir(cfg) / f"{work['id']}.json", work)
     conn = index.connect(cfg)
     conn.execute("UPDATE files SET queued=? WHERE work_id=?", (work["user"].get("queued"), work["id"]))
@@ -864,16 +865,20 @@ def cmd_queue(args: argparse.Namespace) -> int:
             print("No matching paper.", file=sys.stderr)
             return 1
         work = all_works[found[0]["work_id"]]
-        _queue(cfg, work, on=not args.remove)
+        _queue(cfg, work, on=not args.remove, note=args.note,
+               for_collection=args.for_collection, priority="next" if args.next else None)
         print(("Off the queue: " if args.remove else "Queued: ") + _headline(found[0])
               + f"  @{work['citekey']}")
         return 0
 
     queued = sorted((w for w in all_works.values() if w["user"].get("queued") and "meta" in w),
-                    key=lambda w: w["user"]["queued"])
+                    key=lambda w: (w["user"].get("queue_priority") != "next", w["user"]["queued"]))
     if args.json:
         print(json.dumps([{"work_id": w["id"], "citekey": w["citekey"], "title": w["meta"].get("title"),
                            "year": w["meta"].get("year"), "queued": w["user"]["queued"],
+                           "queue_note": w["user"].get("queue_note"),
+                           "queue_for": w["user"].get("queue_for"),
+                           "queue_priority": w["user"].get("queue_priority"),
                            "read_status": reading.effective(w)[0]} for w in queued],
                          indent=2, ensure_ascii=False))
         return 0
@@ -884,9 +889,79 @@ def cmd_queue(args: argparse.Namespace) -> int:
         meta = w["meta"]
         who = ", ".join(a.get("family", "") for a in (meta.get("authors") or [])[:3])
         status = reading.effective(w)[0]
-        print(f"{n:>3}. {who} ({meta.get('year') or 'n.d.'}) {meta.get('title') or ''}"
+        star = "★ " if w["user"].get("queue_priority") == "next" else ""
+        print(f"{n:>3}. {star}{who} ({meta.get('year') or 'n.d.'}) {meta.get('title') or ''}"
               f"{f'   [{status}]' if status != 'unread' else ''}   @{w['citekey']}")
-        print(f"     queued {w['user']['queued'][:10]}" + ("" if w["files"] else " · no pdf yet"))
+        bits = [f"queued {w['user']['queued'][:10]}"]
+        if w["user"].get("queue_for"):
+            bits.append(f"#{w['user']['queue_for']}")
+        if w["user"].get("queue_note"):
+            bits.append(w["user"]["queue_note"])
+        if not w["files"]:
+            bits.append("no pdf yet")
+        print("     " + " · ".join(bits))
+    return 0
+
+
+def cmd_highlights(args: argparse.Namespace) -> int:
+    """Print (or pull into Obsidian) your PDF highlights and margin comments for a paper."""
+    from . import highlights, notes, works
+
+    cfg = config.load()
+    conn = index.connect(cfg)
+    all_works = works.load_all_readonly(cfg)
+    terms, filters = _split_query(args.query)
+    found = [r for r in index.search(conn, terms, filters, limit=5, semantic=True)
+             if r["work_id"] in all_works]
+    if not found:
+        print("No matching paper.", file=sys.stderr)
+        return 1
+    work = all_works[found[0]["work_id"]]
+    items = highlights.for_work(cfg, conn, work["id"])
+    if args.json:
+        print(json.dumps({"work_id": work["id"], "citekey": work["citekey"], "highlights": items},
+                         indent=2, ensure_ascii=False))
+        return 0
+    if not items:
+        print(f"No highlights or comments found for @{work['citekey']}.")
+        return 0
+    if args.to_note:
+        cur = notes.read(cfg, work)
+        cols = index.update_collections(conn, work)
+        notes.pull_highlights(cfg, work, items, cur["version"], collections=cols)
+        print(f"Pulled {len(items)} highlights into {cur['file']}.")
+        return 0
+    print(highlights.format_markdown(items))
+    return 0
+
+
+def cmd_updates(args: argparse.Namespace) -> int:
+    """List (or check for) published versions of working papers in your library."""
+    from . import updates
+
+    cfg = config.load()
+    if args.check:
+        def step(done: int, total: int, label: str) -> None:
+            if sys.stderr.isatty():
+                print(f"\r  checking {done}/{total}: {label:<30}", end="", file=sys.stderr)
+        data = updates.check_all(cfg, refresh=True, progress=step)
+        if sys.stderr.isatty():
+            print(file=sys.stderr)
+    else:
+        data = updates.load(cfg)
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0
+    items = data.get("items") or []
+    if not items:
+        hint = "" if args.check else " Run `refs updates --check` to query Crossref and OpenAlex."
+        print(f"No published-version updates waiting.{hint}")
+        return 0
+    for item in items:
+        cur, prop = item["current"], item["proposed"]
+        print(f"@{item['citekey']}  {item['title']}")
+        print(f"  now:   {cur.get('venue') or 'working paper'} ({cur.get('year') or 'n.d.'})")
+        print(f"  found: {prop.get('venue')} ({prop.get('year') or 'n.d.'})  {prop.get('doi') or ''}")
     return 0
 
 
@@ -1387,8 +1462,22 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("queue", help="the reading queue: list it, or `refs queue blp` to queue a paper")
     p.add_argument("query", nargs="*", help="words and key:value filters; the best match is queued")
     p.add_argument("--remove", action="store_true", help="take the match off the queue instead")
+    p.add_argument("--note", help="short reason for queuing this paper")
+    p.add_argument("--for", dest="for_collection", help="collection this paper is queued for")
+    p.add_argument("--next", action="store_true", help="pin to 'up next' at the top of the queue")
     p.add_argument("--json", action="store_true")
     p.set_defaults(run=cmd_queue)
+
+    p = sub.add_parser("highlights", help="show or pull into Obsidian your PDF highlights for a paper")
+    p.add_argument("query", nargs="+", help="words and key:value filters; the best match")
+    p.add_argument("--to-note", action="store_true", help="pull highlights into the paper's Obsidian note")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_highlights)
+
+    p = sub.add_parser("updates", help="working papers that have since been published")
+    p.add_argument("--check", action="store_true", help="re-query Crossref and OpenAlex now")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(run=cmd_updates)
 
     p = sub.add_parser("rename", help="propose canonical file names (add --apply to rename)")
     p.add_argument("query", nargs="*")

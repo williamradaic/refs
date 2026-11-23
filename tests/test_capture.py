@@ -139,3 +139,81 @@ def test_the_library_proxy_setting_is_checked():
     assert settings.normalize("library_proxy", "", None) == ""
     with pytest.raises(settings.SettingError):
         settings.normalize("library_proxy", "libproxy.berkeley.edu", None)
+
+
+def test_direct_capture_upload_cors_prefs_and_cid_dedup(server):
+    key = token(server)
+    # Sync capture preferences (queue + collection) from /capture
+    pref = server.post("/api/capture-prefs", headers=H, json={"queue": True, "collections": ["bets"]})
+    assert pref.status_code == 200
+
+    # Preflight CORS + Private Network Access headers
+    pre = server.options("/api/capture-upload", headers={"Origin": "https://oup.silverchair-cdn.com"})
+    assert pre.status_code == 204
+    assert pre.headers["access-control-allow-origin"] == "https://oup.silverchair-cdn.com"
+    assert pre.headers["access-control-allow-private-network"] == "true"
+
+    # Wrong token is rejected even from a publisher origin
+    bad = server.post("/api/capture-upload?cid=c1", content=b"%PDF-1.7 x",
+                      headers={"Origin": "https://oup.silverchair-cdn.com", "X-Refs-Token": "wrong"})
+    assert bad.status_code == 403 and server.ran == []
+
+    # Valid cross-origin direct upload (with leading whitespace before %PDF-1.7) succeeds and uses saved prefs
+    pdf = b"\n  %PDF-1.7 direct bytes"
+    ok = server.post(
+        "/api/capture-upload?cid=cid123&url=https://oup.silverchair-cdn.com/x.pdf&doi=10.1093/qje/qjad047",
+        content=pdf,
+        headers={"Origin": "https://oup.silverchair-cdn.com", "X-Refs-Token": key},
+    )
+    assert ok.status_code == 200
+    assert ok.headers["access-control-allow-origin"] == "https://oup.silverchair-cdn.com"
+    job_id = ok.json()["job"]
+    assert wait(server, job_id)["state"] == "done"
+    assert len(server.ran) == 1
+    cmd = server.ran[0]
+    assert "--queue" in cmd and "--to" in cmd and "bets" in cmd
+
+    # Duplicate upload with same cid is deduplicated (does not run refs add twice)
+    dup = server.post(
+        "/api/capture-upload?cid=cid123&url=https://oup.silverchair-cdn.com/x.pdf",
+        content=pdf,
+        headers={"Origin": "https://oup.silverchair-cdn.com", "X-Refs-Token": key},
+    )
+    assert dup.status_code == 200 and dup.json()["job"] == job_id and len(server.ran) == 1
+
+    # Rendezvous status works both same-origin and cross-origin with token
+    st = server.get("/api/capture-status/cid123")
+    assert st.status_code == 200 and st.json()["found"] is True and st.json()["job"] == job_id
+    st_cors = server.get(f"/api/capture-status/cid123?token={key}",
+                         headers={"Origin": "https://oup.silverchair-cdn.com"})
+    assert st_cors.status_code == 200 and st_cors.json()["found"] is True
+
+
+def test_raw_capture_and_multipart_form_fallback(server):
+    key = token(server)
+    # Channel 2: same-origin raw binary upload from capture.html
+    r_raw = server.post(
+        "/api/capture-raw?cid=raw1&url=https://example.org/p.pdf&to=220a&queue=true",
+        content=b"%PDF-1.7 raw upload",
+        headers={**H, "X-Refs-Token": key},
+    )
+    assert r_raw.status_code == 200
+    assert wait(server, r_raw.json()["job"])["state"] == "done"
+    assert "220a" in server.ran[0] and "--queue" in server.ran[0]
+
+    # Channel 3: multipart <form> upload fallback (defeats COOP + connect-src CSP)
+    r_form = server.post(
+        "/capture-form",
+        data={"token": key, "cid": "form1", "url": "https://wiley.com/doi/pdf/10.3982/ECTA1",
+              "doi": "10.3982/ECTA1", "title": "Econometrica Paper"},
+        files={"pdf": ("paper.pdf", b"%PDF-1.7 form fallback", "application/pdf")},
+        headers={"Origin": "https://onlinelibrary.wiley.com"},
+        follow_redirects=False,
+    )
+    assert r_form.status_code == 303
+    assert r_form.headers["location"] == "/capture?cid=form1"
+    st = server.get("/api/capture-status/form1").json()
+    assert st["found"] is True
+    assert wait(server, st["job"])["state"] == "done"
+    assert len(server.ran) == 2
+

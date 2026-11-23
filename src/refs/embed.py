@@ -30,7 +30,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from . import notes
+from . import highlights, notes
 from .config import Config
 
 if TYPE_CHECKING:
@@ -134,6 +134,7 @@ def unit_texts(cfg: Config, conn: sqlite3.Connection) -> dict[str, list[str]]:
         # Every file on disk gets an entry, even without a topic: it marks the file as present.
         topics.setdefault(loc["hash"], set()).update(filter(None, [loc["topic"], loc["section"]]))
     note_text = notes.bodies(cfg)
+    hl_text = highlights.all_text_by_hash(conn)
 
     texts: dict[str, list[str]] = {}
     for row in conn.execute("SELECT * FROM files ORDER BY hash"):
@@ -156,6 +157,9 @@ def unit_texts(cfg: Config, conn: sqlite3.Connection) -> dict[str, list[str]]:
         if row["citekey"] and (body := note_text.get(row["citekey"])):
             title = row["g_title"] or row["citekey"]
             parts += [f"{title}. My notes: {piece}" for piece in _pieces(body)]
+        if hl := hl_text.get(row["hash"]):
+            title = row["g_title"] or row["citekey"] or ""
+            parts += [f"{title}. My highlights: {piece}" for piece in _pieces(hl)[:6]]
         texts[unit] = parts
     return texts
 

@@ -44,7 +44,8 @@ def _match_dict(match: resolve.Match, via: str) -> dict:
 
 def process_file(cfg: Config, api, file_hash: str, rel: str,
                  known_topics: list[str] | None = None,
-                 previous: dict | None = None, hint_ids: dict[str, str] | None = None) -> dict:
+                 previous: dict | None = None, hint_ids: dict[str, str] | None = None,
+                 refresh: bool = False) -> dict:
     """Run the whole pipeline for one file and save its read record.
 
     If `previous` (an earlier read record) already holds the model's reading,
@@ -76,7 +77,7 @@ def process_file(cfg: Config, api, file_hash: str, rel: str,
 
     # --- Confidential folders: no text leaves the machine --------------------
     if _is_confidential(cfg, rel):
-        record, via = resolve.by_ids(ids)
+        record, via = resolve.by_ids(ids, refresh=refresh)
         result["status"] = "confidential"
         if record:
             result["registry"] = {"via": via, "record": record.to_dict()}
@@ -112,7 +113,7 @@ def process_file(cfg: Config, api, file_hash: str, rel: str,
     # --- Step 2: look the identifier up, and distrust it if the title differs --
     by_id: resolve.Match | None = None
     try:
-        record, via = resolve.by_ids(ids)
+        record, via = resolve.by_ids(ids, refresh=refresh)
         if record is not None:
             by_id = resolve.check(record, title, surnames, reading.year)
             if title and by_id.title_similarity < ID_TITLE_FLOOR:
@@ -128,7 +129,7 @@ def process_file(cfg: Config, api, file_hash: str, rel: str,
         if title and not id_is_published:
             found, skipped = resolve.best_match(
                 title, surnames, reading.year, venue=reading.venue,
-                is_working_paper=reading.is_working_paper)
+                is_working_paper=reading.is_working_paper, refresh=refresh)
             # A registry that could not be asked (quota used up) is noted, so
             # this file is looked up again once it is available.
             if found is None and skipped:

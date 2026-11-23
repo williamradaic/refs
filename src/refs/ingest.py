@@ -227,3 +227,60 @@ def headline(item: Ingested) -> str:
         return f"{name}: {item.read['status']} ({kind})"
     who = ", ".join(meta["surnames"][:3]) + (" et al." if len(meta["surnames"]) > 3 else "")
     return f"[{item.read['status']}] {who} ({meta['year']}) {meta['title']}"
+
+
+def reread(cfg: Config, conn: sqlite3.Connection,
+           targets: list[tuple[str | None, str, str]], *,
+           clear_overrides: bool = False,
+           progress: Callable[[int, int, str], None] | None = None) -> dict:
+    """Re-read existing PDFs through Claude and fresh registry lookups to repopulate metadata.
+
+    `targets` is a list of `(work_id | None, rel_path, file_hash)`. Citekeys,
+    collections, reading history, queue and Obsidian notes are preserved.
+    The caller holds `exclusive(cfg)`.
+    """
+    topics = pipeline.known_topics(cfg)
+    api, no_key = None, False
+    live_hashes = {row[0] for row in conn.execute("SELECT DISTINCT hash FROM paths")}
+    done, failed = [], []
+
+    for idx, (work_id, rel, file_hash) in enumerate(targets, 1):
+        if progress is not None:
+            progress(idx, len(targets), PurePosixPath(rel).name)
+        confidential = pipeline._is_confidential(cfg, rel)
+        if api is None and not confidential and not no_key:
+            try:
+                api = llm.client()
+            except SystemExit:
+                no_key = True
+        if api is None and not confidential:
+            failed.append((rel, "no Anthropic API key (run `refs setup-key`)"))
+            continue
+        try:
+            read = pipeline.process_file(cfg, api, file_hash, rel, topics, previous=None, refresh=True)
+        except Exception as error:  # noqa: BLE001
+            failed.append((rel, f"{type(error).__name__}: {error}"))
+            continue
+        cost = llm.cost(read.get("usage") or {})
+        if cost:
+            budget.record(conn, cost)
+
+        if work_id:
+            work = works.load_one(cfg, work_id)
+            if work is not None:
+                # Attach the freshly read hash and drop superseded hashes no longer on disk
+                # so works.sync() rebuilds metadata from this fresh read record.
+                kept = [h for h in work.get("files") or [] if h == file_hash or h in live_hashes]
+                if file_hash not in kept:
+                    kept.append(file_hash)
+                work["files"] = kept
+                if clear_overrides:
+                    for k in ("overrides", "override_source", "confirmed"):
+                        work["user"].pop(k, None)
+                records.write_json(works.works_dir(cfg) / f"{work_id}.json", work)
+        done.append((rel, read["status"], read.get("issues") or []))
+
+    if done:
+        works.sync(cfg)
+        scanner.scan(cfg, conn)
+    return {"done": len(done), "failed": failed, "results": done}

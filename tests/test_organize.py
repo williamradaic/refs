@@ -148,7 +148,7 @@ def test_undo_never_trashes_a_copy_whose_original_is_gone(lib):
 
 def test_bookmarklet_page_is_served(lib):
     page = lib.client.get("/bookmarklet")
-    assert page.status_code == 200 and "?add=" in page.text
+    assert page.status_code == 200 and "/api/capture-upload" in page.text and "/capture-form" in page.text
 
 
 def test_bib_append_skips_papers_already_there_under_another_key(tmp_path):

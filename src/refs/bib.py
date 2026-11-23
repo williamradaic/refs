@@ -16,6 +16,51 @@ def _tex(text: str) -> str:
     return str(text).translate(_SPECIAL)
 
 
+# Acronyms or mixed-case tokens (US, GDP, AI, OLS, COVID-19, PhD, R&D, iPhone)
+# that sentence-casing BibTeX/biblatex styles would otherwise lowercase.
+_ACRONYM_WORD = re.compile(r"\{[^{}]*\}|[A-Za-z0-9&'-]+")
+
+
+def _needs_bracing(word: str) -> bool:
+    """True when a word contains an acronym (2+ uppercase letters) or internal capital."""
+    letters = [ch for ch in word if ch.isalpha()]
+    if len(letters) < 2:
+        return False
+    # Skip words that are already ALL CAPS only if the entire title isn't all caps (caller checks).
+    if any(ch.isupper() for ch in letters[1:]):
+        return True
+    return False
+
+
+def _protect_title(title: str) -> str:
+    """Escape TeX specials and wrap acronyms/internal-cap tokens in `{...}`."""
+    if not title:
+        return ""
+    # If the whole title is ALL CAPS, don't brace every word.
+    alpha = [ch for ch in title if ch.isalpha()]
+    if alpha and all(ch.isupper() for ch in alpha):
+        return _tex(title)
+
+    def repl(match: re.Match) -> str:
+        tok = match.group(0)
+        if tok.startswith("{") and tok.endswith("}"):
+            return tok
+        escaped = _tex(tok)
+        return f"{{{escaped}}}" if _needs_bracing(tok) else escaped
+
+    # Apply token bracing, escaping any remaining special characters outside tokens.
+    out: list[str] = []
+    pos = 0
+    for m in _ACRONYM_WORD.finditer(title):
+        if m.start() > pos:
+            out.append(_tex(title[pos:m.start()]))
+        out.append(repl(m))
+        pos = m.end()
+    if pos < len(title):
+        out.append(_tex(title[pos:]))
+    return "".join(out)
+
+
 def _entry_type(meta: dict) -> str:
     kind, record_type = meta.get("kind"), meta.get("type") or ""
     if kind == "book":
@@ -45,7 +90,7 @@ def entry(work: dict, extra: list[tuple[str, str]] | None = None) -> str:
     )
     if authors:
         fields.append(("author", _tex(authors)))
-    fields.append(("title", _tex(meta.get("title") or "")))
+    fields.append(("title", _protect_title(meta.get("title") or "")))
     if meta.get("year"):
         fields.append(("year", str(meta["year"])))
 

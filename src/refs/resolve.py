@@ -113,11 +113,12 @@ class Record:
 
 # --- HTTP with an on-disk cache -------------------------------------------------
 
-def _get(url: str, params: dict | None = None) -> httpx.Response | None:
-    """GET a URL, returning None on 404. Successful bodies are cached forever."""
+def _get(url: str, params: dict | None = None, *, refresh: bool = False) -> httpx.Response | None:
+    """GET a URL, returning None on 404. Successful bodies are cached forever
+    unless `refresh=True` (used by updates.py to re-check working papers)."""
     key = hashlib.sha1((url + json.dumps(params or {}, sort_keys=True)).encode()).hexdigest()
     cached = CACHE_DIR / key
-    if cached.exists():
+    if not refresh and cached.exists():
         body = cached.read_bytes()
         if body == b"404":
             return None
@@ -204,14 +205,14 @@ def _from_crossref(msg: dict) -> Record:
     )
 
 
-def _openalex_authors(doi: str) -> list[dict]:
+def _openalex_authors(doi: str, *, refresh: bool = False) -> list[dict]:
     """Author list for a DOI from OpenAlex, as a fallback.
 
     OpenAlex gives full display names ("Henrik Jacobsen Kleven"); the last word
     is taken as the surname, which is right for most but not all names.
     """
     try:
-        response = _get(f"https://api.openalex.org/works/doi:{doi}")
+        response = _get(f"https://api.openalex.org/works/doi:{doi}", refresh=refresh)
     except Unavailable:
         return []
     if response is None:
@@ -225,15 +226,15 @@ def _openalex_authors(doi: str) -> list[dict]:
     return authors
 
 
-def by_doi(doi: str) -> Record | None:
+def by_doi(doi: str, *, refresh: bool = False) -> Record | None:
     """Look a DOI up in Crossref. None if Crossref does not know it."""
-    response = _get(f"https://api.crossref.org/works/{doi}")
+    response = _get(f"https://api.crossref.org/works/{doi}", refresh=refresh)
     if response is None:
         return None
     record = _from_crossref(response.json()["message"])
     # Crossref has no author list for some publishers (Econometrica is one).
     if not record.authors:
-        record.authors = _openalex_authors(doi)
+        record.authors = _openalex_authors(doi, refresh=refresh)
         if record.authors:
             record.authors_source = "openalex"
     return record
@@ -244,8 +245,8 @@ def by_doi(doi: str) -> Record | None:
 _ATOM = {"a": "http://www.w3.org/2005/Atom"}
 
 
-def by_arxiv(arxiv_id: str) -> Record | None:
-    response = _get("https://export.arxiv.org/api/query", {"id_list": arxiv_id})
+def by_arxiv(arxiv_id: str, *, refresh: bool = False) -> Record | None:
+    response = _get("https://export.arxiv.org/api/query", {"id_list": arxiv_id}, refresh=refresh)
     if response is None:
         return None
     entry = ET.fromstring(response.text).find("a:entry", _ATOM)
@@ -271,21 +272,21 @@ def by_arxiv(arxiv_id: str) -> Record | None:
 
 # --- One entry point ----------------------------------------------------------------
 
-def by_ids(ids: dict[str, str]) -> tuple[Record | None, str | None]:
+def by_ids(ids: dict[str, str], *, refresh: bool = False) -> tuple[Record | None, str | None]:
     """Try each identifier in order of reliability. Returns (record, which id worked)."""
     if doi := ids.get("doi"):
-        if record := by_doi(doi):
+        if record := by_doi(doi, refresh=refresh):
             return record, "doi"
     if nber := ids.get("nber"):
         # NBER registers every working paper under this DOI pattern.
-        if record := by_doi(f"10.3386/w{nber}"):
+        if record := by_doi(f"10.3386/w{nber}", refresh=refresh):
             return record, "nber"
     if arxiv := ids.get("arxiv"):
-        if record := by_arxiv(arxiv):
+        if record := by_arxiv(arxiv, refresh=refresh):
             return record, "arxiv"
     if jstor := ids.get("jstor"):
         # Older JSTOR-hosted articles are registered as 10.2307/<stable id>.
-        if record := by_doi(f"10.2307/{jstor}"):
+        if record := by_doi(f"10.2307/{jstor}", refresh=refresh):
             return record, "jstor"
     return None, None
 
@@ -340,10 +341,11 @@ def _from_openalex(work: dict) -> Record:
 
 
 def search_crossref(title: str, surnames: list[str], year: int | None,
-                    venue: str | None = None) -> list[Record]:
+                    venue: str | None = None, *, refresh: bool = False) -> list[Record]:
     # The venue helps Crossref rank the original article above later reprints.
     query = " ".join([title, *surnames[:3], str(year or ""), venue or ""]).strip()
-    response = _get("https://api.crossref.org/works", {"query.bibliographic": query, "rows": 12})
+    response = _get("https://api.crossref.org/works", {"query.bibliographic": query, "rows": 12},
+                    refresh=refresh)
     if response is None:
         return []
     items = response.json()["message"].get("items") or []
@@ -351,10 +353,11 @@ def search_crossref(title: str, surnames: list[str], year: int | None,
             if i.get("type") not in _CROSSREF_SKIP_TYPES and i.get("title")]
 
 
-def search_openalex(title: str) -> list[Record]:
+def search_openalex(title: str, *, refresh: bool = False) -> list[Record]:
     # OpenAlex treats commas and some punctuation as query syntax; send plain words.
     plain = re.sub(r"[^\w\s]", " ", title)
-    response = _get("https://api.openalex.org/works", {"search": plain, "per-page": 8})
+    response = _get("https://api.openalex.org/works", {"search": plain, "per-page": 8},
+                    refresh=refresh)
     if response is None:
         return []
     return [_from_openalex(w) for w in response.json().get("results") or [] if w.get("title")]
@@ -431,7 +434,7 @@ def check(record: Record, title: str, surnames: list[str], year: int | None) -> 
 
 def best_match(title: str, surnames: list[str], year: int | None, *,
                venue: str | None = None, is_working_paper: bool = False,
-               ) -> tuple[Match | None, list[str]]:
+               refresh: bool = False) -> tuple[Match | None, list[str]]:
     """Search the registries and return the best candidate that passes the check,
     plus the names of any registry that had to be skipped (quota used up).
 
@@ -460,8 +463,8 @@ def best_match(title: str, surnames: list[str], year: int | None, *,
 
     accepted: list[Match] = []
     skipped: list[str] = []
-    for name, candidates in (("crossref", lambda: search_crossref(title, surnames, year, venue)),
-                             ("openalex", lambda: search_openalex(title))):
+    for name, candidates in (("crossref", lambda: search_crossref(title, surnames, year, venue, refresh=refresh)),
+                             ("openalex", lambda: search_openalex(title, refresh=refresh))):
         try:
             found = candidates()
         except Unavailable:
@@ -478,3 +481,28 @@ def best_match(title: str, surnames: list[str], year: int | None, *,
     if is_published(best.record) and not ideal(best):
         return None, skipped
     return best, skipped
+
+
+def find_published(title: str, surnames: list[str], year: int | None, *,
+                   doi: str | None = None, refresh: bool = True) -> tuple[Match | None, str | None]:
+    """Look specifically for a finished published version of a working paper.
+
+    Tries OpenAlex's record for the working-paper DOI first (OpenAlex often links
+    an NBER/arXiv DOI directly to its published journal article), then searches
+    Crossref and OpenAlex by title and authors with `refresh=True`.
+    """
+    if doi:
+        try:
+            response = _get(f"https://api.openalex.org/works/doi:{doi}", refresh=refresh)
+        except (httpx.HTTPError, Unavailable):
+            response = None
+        if response is not None:
+            rec = _from_openalex(response.json())
+            if is_published(rec):
+                m = check(rec, title, surnames, year)
+                if m.accepted and (not year or not rec.year or rec.year >= year - 1):
+                    return m, "openalex-doi"
+    match, _ = best_match(title, surnames, year, is_working_paper=True, refresh=refresh)
+    if match is not None and is_published(match.record):
+        return match, match.record.source or "search"
+    return None, None

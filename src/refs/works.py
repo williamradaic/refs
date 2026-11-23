@@ -204,6 +204,37 @@ EDITABLE = ("title", "authors", "year", "venue", "kind", "type", "doi", "volume"
             "pages", "publisher")
 
 
+def override_keys(work: dict) -> list[str]:
+    """Keys derived from user corrections (DOI, or overridden title/authors).
+
+    Added to `work["keys"]` so a PDF arriving later with the corrected DOI or
+    title attaches to this work instead of creating a second one.
+    """
+    overrides = (work.get("user") or {}).get("overrides") or {}
+    if not overrides:
+        return []
+    meta = work.get("meta") or {}
+    keys: list[str] = []
+    if doi := (overrides.get("doi") or "").strip().lower():
+        keys.append(f"doi:{doi}")
+    if "title" in overrides or "authors" in overrides:
+        title = overrides.get("title") or meta.get("title") or ""
+        authors = overrides.get("authors") or meta.get("authors") or []
+        surnames = [a["family"] for a in authors if a.get("family")]
+        if title:
+            first = naming.slugify(surnames[0]) if surnames else ""
+            keys.append(f"title:{naming.slugify(title)[:80]}|{first}")
+    return keys
+
+
+def sync_keys(work: dict) -> None:
+    """Ensure override-derived keys are present on `work["keys"]`."""
+    have = work.setdefault("keys", [])
+    for key in override_keys(work):
+        if key not in have:
+            have.append(key)
+
+
 def apply_user_edits(work: dict) -> None:
     """Lay your own corrections over the pipeline's metadata.
 
@@ -223,6 +254,7 @@ def apply_user_edits(work: dict) -> None:
         work["meta"]["status"] = "confirmed"
         work["meta"]["is_working_paper"] = work["meta"].get("type") in {None, "report", "posted-content"} \
             and work["meta"].get("kind") == "paper" and not venues.abbreviation(work["meta"].get("venue"))
+    sync_keys(work)
 
 
 def sync(cfg: Config) -> dict[str, str]:
@@ -242,7 +274,7 @@ def sync(cfg: Config) -> dict[str, str]:
     works = load_all(cfg)
     before = {wid: json.dumps(w, sort_keys=True) for wid, w in works.items()}
     by_file = {h: wid for wid, w in works.items() for h in w["files"]}
-    by_key = {k: wid for wid, w in works.items() for k in w["keys"]}
+    by_key = {k: wid for wid, w in works.items() for k in [*w["keys"], *override_keys(w)]}
     taken = {w["citekey"] for w in works.values()}
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -289,8 +321,10 @@ def sync(cfg: Config) -> dict[str, str]:
         apply_user_edits(work)
         reading = best.get("reading") or {}
         work["description"] = reading.get("description")
-        work["tags"] = [*reading.get("fields", []), *reading.get("methods", []),
-                        *reading.get("topics", [])]
+        hidden = {t.lower() for t in (work["user"].get("hidden_tags") or [])}
+        raw_tags = [*reading.get("fields", []), *reading.get("methods", []),
+                    *reading.get("topics", [])]
+        work["tags"] = [t for t in raw_tags if t.lower() not in hidden]
 
     # 3. Keys that project .bib files use for these works (bibkeys.py).
     from . import bibkeys
@@ -411,3 +445,190 @@ class Importer:
     def save(self) -> None:
         for wid, work in self.works.items():
             records.write_json(works_dir(self.cfg) / f"{wid}.json", work)
+
+
+# --- User tag editing, merging and removing works -------------------------------------
+
+def _clean_tag(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def edit_tags(cfg: Config, work_id: str, *, add_user: list[str] = (),
+              remove_user: list[str] = (), hide_auto: list[str] = (),
+              restore_auto: bool = False) -> dict:
+    """Add or remove personal tags (`user.tags`), or hide/restore model tags.
+
+    Hidden model tags are stored in `user.hidden_tags` so `sync()` does not
+    re-add them on the next scan. Returns the updated work.
+    """
+    work = load_one(cfg, work_id)
+    if work is None:
+        raise ValueError(f"no work {work_id}")
+    user = work.setdefault("user", {})
+    mine = list(user.get("tags") or [])
+    mine_lower = {t.lower() for t in mine}
+    for raw in add_user:
+        tag = _clean_tag(raw)
+        if tag and tag.lower() not in mine_lower:
+            mine.append(tag)
+            mine_lower.add(tag.lower())
+    drop_user = {t.strip().lower() for t in remove_user if t.strip()}
+    if drop_user:
+        mine = [t for t in mine if t.lower() not in drop_user]
+    user["tags"] = mine
+
+    hidden = list(user.get("hidden_tags") or [])
+    hidden_lower = {t.lower() for t in hidden}
+    if restore_auto:
+        hidden, hidden_lower = [], set()
+    else:
+        for raw in hide_auto:
+            tag = _clean_tag(raw)
+            if tag and tag.lower() not in hidden_lower:
+                hidden.append(tag)
+                hidden_lower.add(tag.lower())
+    if hidden:
+        user["hidden_tags"] = hidden
+    else:
+        user.pop("hidden_tags", None)
+
+    if restore_auto:
+        # Rebuild model tags from the work's read records if available.
+        all_reads = [r for h in work.get("files") or [] if (r := records.load_read(cfg, h)) is not None]
+        if all_reads:
+            best = min(all_reads, key=lambda r: (_STATUS_RANK.get(r["status"], 9),
+                                                 _meta_from(r)["is_working_paper"]))
+            reading_rec = best.get("reading") or {}
+            work["tags"] = [*reading_rec.get("fields", []), *reading_rec.get("methods", []),
+                            *reading_rec.get("topics", [])]
+    else:
+        work["tags"] = [t for t in (work.get("tags") or []) if t.lower() not in hidden_lower]
+
+    records.write_json(works_dir(cfg) / f"{work_id}.json", work)
+    return work
+
+
+def merge(cfg: Config, keep_id: str, drop_id: str) -> dict:
+    """Merge `drop_id` into `keep_id`: files, keys, collections, tags, read
+    history, queue and notes all move onto `keep_id`, and `drop_id` is moved
+    to `<state>/trash/`. `drop_id`'s citekey stays in `keep_id`'s aliases so
+    existing references still resolve."""
+    from . import collection, notes, reading
+
+    if keep_id == drop_id:
+        raise ValueError("cannot merge a work into itself")
+    keep = load_one(cfg, keep_id)
+    drop = load_one(cfg, drop_id)
+    if keep is None or drop is None:
+        raise ValueError("one of those works no longer exists")
+
+    for h in drop.get("files") or []:
+        if h not in keep["files"]:
+            keep["files"].append(h)
+    for k in [*drop.get("keys", []), *override_keys(drop)]:
+        if k not in keep["keys"]:
+            keep["keys"].append(k)
+    aliases = [*keep.get("aliases", []), *drop.get("aliases", [])]
+    if drop.get("citekey") and drop["citekey"] != keep.get("citekey"):
+        aliases.append(drop["citekey"])
+    if aliases:
+        keep["aliases"] = list(dict.fromkeys(aliases))
+
+    ku, du = keep.setdefault("user", {}), drop.get("user") or {}
+    # Collections, personal tags, hidden tags, former names, Zotero notes.
+    cols = collection.cleaned([*collection.explicit(keep), *collection.explicit(drop)])
+    if cols:
+        ku["collections"] = cols
+    tags = list(dict.fromkeys([*(ku.get("tags") or []), *(du.get("tags") or [])]))
+    ku["tags"] = tags
+    if hidden := list(dict.fromkeys([*(ku.get("hidden_tags") or []), *(du.get("hidden_tags") or [])])):
+        ku["hidden_tags"] = hidden
+    if former := list(dict.fromkeys([*(ku.get("former_names") or []), *(du.get("former_names") or [])])):
+        ku["former_names"] = former
+    if du.get("notes") and du["notes"] not in (ku.get("notes") or ""):
+        ku["notes"] = ((ku.get("notes") or "") + "\n\n" + du["notes"]).strip()
+    if not ku.get("source_url") and du.get("source_url"):
+        ku["source_url"] = du["source_url"]
+    if du.get("reads"):
+        existing_reads = list(ku.get("reads") or [])
+        for entry in du["reads"]:
+            if entry not in existing_reads:
+                existing_reads.append(entry)
+        existing_reads.sort(key=lambda r: r.get("at") or "")
+        ku["reads"] = existing_reads
+
+    # Read status: keep the higher effective status (manual wins if set).
+    k_stat, _ = reading.effective(keep)
+    d_stat, _ = reading.effective(drop)
+    if reading.RANK.get(d_stat, 0) > reading.RANK.get(k_stat, 0):
+        if du.get("read_set"):
+            ku["read_status"] = du.get("read_status", d_stat)
+            ku["read_set"] = du["read_set"]
+    if drop.get("read_auto"):
+        k_auto = (keep.get("read_auto") or {}).get("status")
+        d_auto = drop["read_auto"].get("status")
+        if reading.RANK.get(d_auto, -1) > reading.RANK.get(k_auto, -1):
+            keep["read_auto"] = drop["read_auto"]
+
+    # Queue: preserve queue info if keep was not queued.
+    if not ku.get("queued") and du.get("queued"):
+        for qkey in ("queued", "queue_note", "queue_for", "queue_priority"):
+            if qkey in du:
+                ku[qkey] = du[qkey]
+
+    # Obsidian notes: if drop has a note and keep does not, copy drop's note body over.
+    note_status = "none"
+    if notes.enabled(cfg):
+        k_note = notes.read(cfg, keep)
+        d_note = notes.read(cfg, drop)
+        if d_note["exists"] and d_note["body"].strip():
+            if not k_note["exists"] or not k_note["body"].strip():
+                notes.write(cfg, keep, d_note["body"], k_note["version"])
+                note_status = "copied"
+            else:
+                note_status = "both"
+
+    records.write_json(works_dir(cfg) / f"{keep_id}.json", keep)
+    trash_dir = cfg.absolute(cfg.state_dir) / "trash"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    drop_file = works_dir(cfg) / f"{drop_id}.json"
+    if drop_file.exists():
+        drop_file.replace(trash_dir / f"merged-{drop_id}.json")
+    return {"work": keep, "dropped": drop_id, "dropped_citekey": drop.get("citekey"),
+            "note_status": note_status}
+
+
+def remove(cfg: Config, conn, work_id: str, *, trash_files: bool = True) -> dict:
+    """Remove a work from the library: move its PDFs (if any and `trash_files`)
+    to the macOS Trash and archive its work record in `<state>/trash/`.
+    Managed folders (canvas-sync, Git, Overleaf) are skipped rather than touched."""
+    from . import library, organize, rename
+
+    work = load_one(cfg, work_id)
+    if work is None:
+        raise ValueError(f"no work {work_id}")
+    paths = library.paths_of(conn, work_id)
+    trashed: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    if trash_files and paths:
+        for rel in paths:
+            if reason := rename.blocked_reason(cfg, rel):
+                skipped.append((rel, reason))
+                continue
+            full = cfg.absolute(rel)
+            if full.exists():
+                rename.to_trash(full)
+                trashed.append(rel)
+        if paths and not trashed and skipped:
+            raise organize.Refused(f"cannot remove files: {skipped[0][1]}")
+
+    trash_dir = cfg.absolute(cfg.state_dir) / "trash"
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    work_file = works_dir(cfg) / f"{work_id}.json"
+    if work_file.exists():
+        work_file.replace(trash_dir / f"{work_id}.json")
+    conn.execute("DELETE FROM files WHERE hash=?", (f"work:{work_id}",))
+    conn.execute("DELETE FROM search WHERE hash=?", (f"work:{work_id}",))
+    conn.commit()
+    return {"id": work_id, "citekey": work.get("citekey"), "trashed": trashed,
+            "skipped": [{"path": p, "why": why} for p, why in skipped]}

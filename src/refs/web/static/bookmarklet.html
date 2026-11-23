@@ -23,22 +23,20 @@
     <p>Drag this to your bookmarks bar (if you have an older <b>+ refs</b> there, replace it):</p>
     <a class="grab off" id="grab" href="#">+ refs</a>
     <ol>
-      <li>On a paper's page (a journal such as the AEA's or OUP's, NBER, arXiv, an author's site) or on a PDF open in the browser, click <b>+ refs</b>.</li>
-      <li>It reads the page's citation details and, if your browser can open the PDF (open access, or signed in through the library), takes the PDF from the page itself. No downloading, no Enter.</li>
-      <li>A small refs window shows the paper being added, and closes itself when it is done. The PDF lands in your quick-add folder, renamed; you can close the window early, the add carries on.</li>
-      <li>Paywalled? With a library proxy in the settings (UC Berkeley: <code>https://libproxy.berkeley.edu/login?qurl=</code>), refs opens the page through it: sign in if asked, then click <b>+ refs</b> again. Without one, refs looks for an open copy, and otherwise saves the paper without a file; save the PDF into the quick-add folder later and it attaches itself.</li>
-      <li>Some journals (OUP's, for one) serve the PDF from another site, which the page may not read. Open the PDF and click <b>+ refs</b> on it.</li>
+      <li>Open any paper's PDF in your browser (publisher PDF, signed CDN link, Wiley/JPE/T&amp;F/AEA viewer, arXiv, NBER, SSRN, or an author's homepage) — or its article page — and click <b>+ refs</b>.</li>
+      <li><b>1-click PDF capture:</b> refs reads the PDF straight from your browser's own cache/session (signed in as you, through your library proxy) and uploads it directly into your library folder. No downloading to Downloads, no Enter.</li>
+      <li>A small refs window confirms the PDF arrived, follows identification and renaming, and closes itself automatically. Even if a publisher blocks popups or sets strict cross-origin policies, the PDF still lands straight in your library.</li>
+      <li>On a paywalled article page (before opening the PDF), with a library proxy set under settings, refs opens the page through your proxy so you can sign in and click <b>+ refs</b> again.</li>
     </ol>
-    <p>The bookmarklet carries a key that belongs to this Mac's refs, so only it, not some other website, can add papers without your Enter. Another browser or Mac needs its own copy from its own refs.</p>
+    <p>The bookmarklet carries a per-Mac key so only your own bookmark can upload directly to refs. After updating refs, drag <b>+ refs</b> to your bookmarks bar again.</p>
     <p><a href="/">back to refs</a></p>
   </div>
   <script>
-    // What the bookmarklet runs, in the paper's page. It is turned into the
-    // link's code below (grab.toString()), so it may use only what it is
-    // given: the refs address and key. Block comments only inside it.
+    // What the bookmarklet runs inside the open PDF or article page.
+    // Serialized with grab.toString(), so use BLOCK COMMENTS ONLY inside grab().
     function grab(refs, token) {
-      var d = document;
-      /* A <meta name=…> or <meta property=…> value; all of them for authors. */
+      var d = document, loc = location.href;
+      var cid = Math.random().toString(36).slice(2) + Date.now().toString(36);
       var one = function (n) {
         var e = d.querySelector('meta[name="' + n + '" i],meta[property="' + n + '" i]');
         return e && e.content ? e.content.trim() : "";
@@ -46,65 +44,276 @@
       var all = function (n) {
         return [].map.call(d.querySelectorAll('meta[name="' + n + '" i]'), function (e) { return e.content.trim(); });
       };
-      var isPdf = d.contentType === "application/pdf";
+      var doiRe = /(10\.\d{4,9}\/[^\s"<>#?]+)/i;
       var doi = one("citation_doi") || one("dc.identifier") || one("prism.doi") || one("bepress_citation_doi");
-      if (!/10\.\d{4,9}\//.test(doi)) {
-        /* Some pages (NBER, AEA) show the DOI only as a doi.org link. */
+      if (!doiRe.test(doi)) {
         var a = d.querySelector('a[href*="doi.org/10."]');
         doi = a ? a.href : "";
       }
+      if (!doiRe.test(doi)) {
+        var m = (loc.match(doiRe) || (d.referrer || "").match(doiRe));
+        doi = m ? decodeURIComponent(m[1]).replace(/[.,;:)\]]+$/, "") : "";
+      }
+
+      /* Build prioritized candidate PDF URLs for native PDFs, publisher PDF viewers, and article pages. */
+      var pdfs = [], seen = {};
+      var addUrl = function (u) {
+        if (!u || u === "about:blank") return;
+        try { u = new URL(u, loc).href; } catch (e) { return; }
+        if (/^(https?|blob):/i.test(u) && !seen[u]) { seen[u] = 1; pdfs.push(u); }
+      };
+      var isPdf = d.contentType === "application/pdf" ||
+        (/\.pdf($|[?#])/i.test(loc) && !d.querySelector("article,main"));
+      if (isPdf) addUrl(loc);
+
+      /* Publisher HTML PDF viewers (Wiley/Econometrica, Chicago/JPE, T&F, AEA, ScienceDirect, SSRN, PDF.js). */
+      if (/\/doi\/epdf\//i.test(loc)) {
+        addUrl(loc.replace(/\/doi\/epdf\//i, "/doi/pdfdirect/") + (loc.indexOf("?") < 0 ? "?download=true" : ""));
+        addUrl(loc.replace(/\/doi\/epdf\//i, "/doi/pdf/"));
+      }
+      if (/\/doi\/pdfplus\//i.test(loc)) {
+        addUrl(loc.replace(/\/doi\/pdfplus\//i, "/doi/pdf/"));
+        addUrl(loc);
+      }
+      if (/(\/pdfft\b|\/sol3\/Delivery\.cfm|\/article-pdf\/|\/content\/pdf\/)/i.test(loc)) addUrl(loc);
+      try {
+        var fileParam = new URLSearchParams(location.search).get("file");
+        if (fileParam) addUrl(fileParam);
+      } catch (e) {}
+
+      /* Embedded PDF elements (<embed>, <object>, <iframe>). */
+      [].forEach.call(d.querySelectorAll("embed,object,iframe"), function (el) {
+        var t = (el.getAttribute("type") || "").toLowerCase();
+        var s = el.getAttribute("src") || el.getAttribute("data") || "";
+        if (t === "application/pdf" || /(\.pdf($|[?#])|\/(pdf|pdfdirect|article-pdf)\/|Delivery\.cfm|^blob:)/i.test(s)) {
+          addUrl(s);
+        }
+      });
+
+      /* Standard citation meta tag, then same-origin PDF links as fallback. */
+      addUrl(one("citation_pdf_url"));
+      if (!pdfs.length) {
+        [].forEach.call(d.querySelectorAll("a[href]"), function (el) {
+          if (pdfs.length >= 4) return;
+          var h = el.href || "";
+          if (h.indexOf(location.origin) === 0 &&
+              /(\.pdf($|[?#])|\/(article-pdf|pdfdirect|pdf|pdfplus)\/|Delivery\.cfm)/i.test(h)) {
+            addUrl(h);
+          }
+        });
+      }
+
       var meta = {
         doi: doi,
-        title: one("citation_title") || one("dc.title") || one("og:title") || d.title,
+        title: one("citation_title") || one("dc.title") || one("og:title") || d.title || "",
         authors: all("citation_author"),
         year: (one("citation_publication_date") || one("citation_date") || one("citation_online_date")).slice(0, 4),
         venue: one("citation_journal_title") || one("citation_conference_title"),
-        pdf_url: isPdf ? location.href : one("citation_pdf_url")
+        pdf_url: pdfs[0] || "",
+        referrer: d.referrer || ""
       };
-      var win = window.open(refs + "/capture?add=" + encodeURIComponent(location.href) +
-        (doi ? "&doi=" + encodeURIComponent(doi) : ""), "refs-add", "width=720,height=420");
-      var pdf = null, fetched = !meta.pdf_url, ready = false, sent = false;
-      function send() {
-        if (sent || !ready || !win) return;
-        if (!fetched) { win.postMessage({ type: "refs-pending" }, refs); return; }
-        sent = true;
-        var message = { type: "refs-capture", token: token, url: location.href, meta: meta, pdf: pdf };
-        try { win.postMessage(message, refs, pdf ? [pdf] : []); }
-        catch (e) { message.pdf = null; win.postMessage(message, refs); }
+
+      /* Minimal floating toast on the tab (shown when popup is blocked or on direct upload). */
+      var toastEl = null;
+      function toast(text, kind) {
+        try {
+          if (!toastEl) {
+            toastEl = d.createElement("div");
+            toastEl.style.cssText =
+              "position:fixed;top:14px;right:14px;z-index:2147483647;max-width:44ch;" +
+              "padding:8px 14px;background:#101211;color:#d8d5cb;border:1px solid #e3a750;" +
+              "font:13px/1.5 ui-monospace,Menlo,monospace;box-shadow:0 4px 18px rgba(0,0,0,.35);";
+            (d.body || d.documentElement).appendChild(toastEl);
+          }
+          toastEl.style.borderColor = kind === "ok" ? "#8fbf7f" : kind === "bad" ? "#e07a63" : "#e3a750";
+          toastEl.textContent = "refs: " + text;
+        } catch (e) {}
+      }
+      function hideToast(ms) {
+        setTimeout(function () { if (toastEl && toastEl.parentNode) toastEl.parentNode.removeChild(toastEl); }, ms);
+      }
+
+      /* Open capture window synchronously inside click handler so popup blockers allow it. */
+      var win = window.open(
+        refs + "/capture?cid=" + encodeURIComponent(cid) +
+        "&add=" + encodeURIComponent(loc) +
+        (doi ? "&doi=" + encodeURIComponent(doi) : ""),
+        "refs-add", "width=720,height=420"
+      );
+
+      var ready = false, sent = false, pendingPayload = null;
+      function postWin(msg, transfer) {
+        if (!win) return false;
+        try { win.postMessage(msg, refs, transfer || []); return true; }
+        catch (e) {
+          /* Safari/WebKit sometimes rejects transferring an ArrayBuffer; retry structured clone without dropping pdf. */
+          try { win.postMessage(msg, refs); return true; }
+          catch (e2) { return false; }
+        }
       }
       window.addEventListener("message", function hear(e) {
         if (e.origin !== refs || !e.data || e.data.type !== "refs-ready") return;
         ready = true;
-        send();
-        if (sent) window.removeEventListener("message", hear);
+        if (pendingPayload && !sent) {
+          sent = true;
+          postWin(pendingPayload.msg, pendingPayload.transfer);
+          window.removeEventListener("message", hear);
+        } else if (!sent) {
+          postWin({ type: "refs-pending" });
+        }
       });
-      if (!fetched) {
-        /* Fetched here, as you: the site sees your cookies and your library
-           access. A PDF served by another site (a redirect elsewhere) is
-           refused by the browser; refs then tries the link itself. */
+
+      function isPdfBytes(buf) {
+        if (!buf || buf.byteLength < 8) return false;
+        var a = new Uint8Array(buf, 0, Math.min(1024, buf.byteLength));
+        for (var i = 0; i <= a.length - 4; i++) {
+          if (a[i] === 37 && a[i + 1] === 80 && a[i + 2] === 68 && a[i + 3] === 70) return true;
+        }
+        return false;
+      }
+
+      function tryFetch(url, cacheMode, signal) {
+        var opts = { credentials: "include", signal: signal };
+        if (cacheMode) opts.cache = cacheMode;
+        return fetch(url, opts).then(function (r) {
+          if (!r.ok) return { ok: false, html: false };
+          return r.arrayBuffer().then(function (b) {
+            return isPdfBytes(b) ? { ok: true, buf: b } : { ok: false, html: true };
+          });
+        });
+      }
+
+      /* Try each candidate PDF URL: cache-first when it matches the open page/blob so it never re-hits signed URLs. */
+      function grabPdf() {
+        if (!pdfs.length) return Promise.resolve(null);
         var stop = new AbortController();
         setTimeout(function () { stop.abort(); }, 90000);
-        /* Why there is no PDF, for the refs window: "paywall" = the site
-           answered with something else (a sign-in or purchase page), which
-           the library proxy can fix; "elsewhere" = another site serves it. */
-        fetch(meta.pdf_url, { credentials: "include", signal: stop.signal })
-          .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
-          .then(function (b) {
-            var head = b ? new Uint8Array(b, 0, Math.min(4, b.byteLength)) : [];
-            if (head[0] === 37 && head[1] === 80 && head[2] === 68 && head[3] === 70) pdf = b;   /* %PDF */
-            else meta.pdf_problem = "paywall";
-          })
-          .catch(function () { meta.pdf_problem = stop.signal.aborted ? "slow" : "elsewhere"; })
-          .then(function () { fetched = true; send(); });
+        var sawHtml = false, idx = 0;
+        function next() {
+          if (idx >= pdfs.length) {
+            meta.pdf_problem = stop.signal.aborted ? "slow" : (sawHtml ? "paywall" : "elsewhere");
+            return Promise.resolve(null);
+          }
+          var u = pdfs[idx++];
+          var useCache = (u === loc || u.indexOf("blob:") === 0 || isPdf);
+          var first = useCache
+            ? tryFetch(u, "force-cache", stop.signal).catch(function () { return { ok: false }; })
+            : Promise.resolve({ ok: false });
+          return first.then(function (res) {
+            if (res.ok) return res.buf;
+            return tryFetch(u, null, stop.signal).catch(function () { return { ok: false }; });
+          }).then(function (res) {
+            if (res && res.byteLength) return res;
+            if (res && res.ok) return res.buf;
+            if (res && res.html) sawHtml = true;
+            return next();
+          });
+        }
+        return next();
       }
+
+      /* Multipart <form> fallback: defeats sites with BOTH strict COOP and strict connect-src CSP. */
+      function submitFormFallback(pdfBuf) {
+        try {
+          var form = d.createElement("form");
+          form.method = "POST";
+          form.enctype = "multipart/form-data";
+          form.action = refs + "/capture-form";
+          form.target = "refs-add";
+          form.style.display = "none";
+          var addField = function (k, v) {
+            var inp = d.createElement("input");
+            inp.type = "hidden"; inp.name = k; inp.value = v || "";
+            form.appendChild(inp);
+          };
+          addField("token", token);
+          addField("cid", cid);
+          addField("url", loc);
+          addField("doi", meta.doi);
+          addField("title", meta.title);
+          var fileInp = d.createElement("input");
+          fileInp.type = "file"; fileInp.name = "pdf";
+          var dt = new DataTransfer();
+          dt.items.add(new File([pdfBuf], "paper.pdf", { type: "application/pdf" }));
+          fileInp.files = dt.files;
+          form.appendChild(fileInp);
+          (d.body || d.documentElement).appendChild(form);
+          form.submit();
+          setTimeout(function () { if (form.parentNode) form.parentNode.removeChild(form); }, 2000);
+          return true;
+        } catch (e) { return false; }
+      }
+
+      function pollToast() {
+        var tries = 0;
+        var iv = setInterval(function () {
+          if (++tries > 90) { clearInterval(iv); hideToast(2000); return; }
+          fetch(refs + "/api/capture-status/" + encodeURIComponent(cid) + "?token=" + encodeURIComponent(token))
+            .then(function (r) { return r.json(); })
+            .then(function (s) {
+              if (!s.found) return;
+              if (s.message) { toast("✓ " + s.message, "ok"); clearInterval(iv); hideToast(4000); return; }
+              if (s.job_info && s.job_info.state !== "running") {
+                var ok = s.job_info.state === "done";
+                toast((ok ? "✓ " : "✗ ") + (s.job_info.message || s.job_info.state).split("\n")[0], ok ? "ok" : "bad");
+                clearInterval(iv); hideToast(ok ? 4500 : 8000);
+              }
+            }).catch(function () { clearInterval(iv); hideToast(3000); });
+        }, 1200);
+      }
+
+      if (!win) toast("reading PDF …");
+      grabPdf().then(function (pdfBuf) {
+        if (pdfBuf) {
+          /* Channel 1: direct raw binary upload (immune to COOP & popup blockers; zero base64 overhead). */
+          var q = "?cid=" + encodeURIComponent(cid) +
+            "&url=" + encodeURIComponent(loc) +
+            "&doi=" + encodeURIComponent(meta.doi || "") +
+            "&title=" + encodeURIComponent((meta.title || "").slice(0, 160));
+          return fetch(refs + "/api/capture-upload" + q, {
+            method: "POST",
+            headers: { "Content-Type": "application/pdf", "X-Refs-Token": token },
+            body: pdfBuf
+          }).then(function (r) {
+            if (!r.ok) throw new Error("upload " + r.status);
+            return r.json();
+          }).then(function (result) {
+            sent = true;
+            postWin({ type: "refs-uploaded", cid: cid, result: result, meta: meta });
+            if (!win) {
+              if (result.message) { toast("✓ " + result.message, "ok"); hideToast(4000); }
+              else { toast("PDF saved (" + (pdfBuf.byteLength / 1048576).toFixed(1) + " MB) — adding …"); pollToast(); }
+            }
+          }).catch(function () {
+            /* Channel 2: postMessage to popup (immune to connect-src CSP). */
+            var msg = { type: "refs-capture", cid: cid, token: token, url: loc, meta: meta, pdf: pdfBuf };
+            if (ready && win) {
+              sent = true;
+              postWin(msg, [pdfBuf]);
+            } else {
+              pendingPayload = { msg: msg, transfer: [pdfBuf] };
+              /* Channel 3: if popup never answers (COOP + CSP together), submit via multipart <form>. */
+              setTimeout(function () {
+                if (sent) return;
+                sent = true;
+                if (!submitFormFallback(pdfBuf) && !win) {
+                  toast("could not hand PDF to refs (blocked by site policy)", "bad");
+                  hideToast(6000);
+                }
+              }, 1600);
+            }
+          });
+        }
+        /* No PDF fetched (e.g. paywalled landing page): hand metadata to capture window. */
+        var msg = { type: "refs-capture", cid: cid, token: token, url: loc, meta: meta, pdf: null };
+        if (ready && win) { sent = true; postWin(msg); }
+        else pendingPayload = { msg: msg, transfer: [] };
+      });
     }
 
-    // Built from this page's own address, so it points at whichever name you
-    // use for refs (refs.localhost, 127.0.0.1, refs.test), with this Mac's key.
     fetch("/api/bookmarklet").then((r) => r.json()).then(({ token }) => {
       const code = `(${grab})(${JSON.stringify(location.origin)},${JSON.stringify(token)})`;
       const link = document.getElementById("grab");
-      // Percent-encoded, so line breaks and % signs survive as a bookmark.
       link.href = "javascript:" + encodeURIComponent(`void ${code}`);
       link.classList.remove("off");
     });
