@@ -8,6 +8,7 @@ the venue.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import html
 import json
 import re
@@ -64,6 +65,7 @@ _ABBREVIATIONS = {
 }
 
 
+@lru_cache(maxsize=1024)
 def _norm(name: str) -> str:
     name = html.unescape(name).lower().replace("&", " and ")
     name = re.sub(r"[^a-z0-9 ]+", " ", name)

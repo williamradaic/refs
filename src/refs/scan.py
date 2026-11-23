@@ -219,10 +219,12 @@ def scan(cfg: Config, conn: sqlite3.Connection,
 
     # --- Whatever vanished and was not claimed by a move is gone -------------
     # The `files` row stays: if the same content reappears it is recognised.
-    for p in sorted(gone - claimed):
-        conn.execute("DELETE FROM paths WHERE path=?", (p,))
-        _log(conn, now, "removed", p, known[p]["hash"])
-        report.removed.append(p)
+    removed = sorted(gone - claimed)
+    if removed:
+        conn.executemany("DELETE FROM paths WHERE path=?", [(p,) for p in removed])
+        conn.executemany("INSERT INTO events (ts, kind, path, old_path, hash) VALUES (?,?,?,?,?)",
+                         [(now, "removed", p, None, known[p]["hash"]) for p in removed])
+        report.removed.extend(removed)
 
     # --- Your markup in files not counted yet (reading.py) --------------------
     local = {rel: row["hash"] for row in conn.execute("SELECT path, hash FROM paths")

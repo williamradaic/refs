@@ -60,7 +60,8 @@ def _mode(cfg: Config, rel: str, in_shared: bool) -> str:
     return "copy" if in_shared or rename.blocked_reason(cfg, rel) else "move"
 
 
-def listing(cfg: Config, conn: sqlite3.Connection, *, look: bool = True) -> dict:
+def listing(cfg: Config, conn: sqlite3.Connection, *, look: bool = True,
+            all_works: dict | None = None) -> dict:
     """Papers in inbox folders and shared folders that the library lacks.
 
     `look=False` reads nothing (for the sidebar count): files not judged yet
@@ -70,19 +71,43 @@ def listing(cfg: Config, conn: sqlite3.Connection, *, look: bool = True) -> dict
     """
     layout = contexts.layout_for(cfg)
     shared_map = shared.folders(cfg)
-    all_works = works.load_all(cfg)
+    all_works = works.load_all_readonly(cfg) if all_works is None else all_works
     items, unseen, looked = [], 0, 0
+
+    # Preload library membership and indexed paths in two queries instead of N+1 per file.
+    lib_prefix = library.folder(cfg) + "/"
+    lib_hashes: set[str] = set()
+    lib_works: set[str] = set()
+    for row in conn.execute(
+            "SELECT p.hash, f.work_id FROM paths p JOIN files f ON f.hash = p.hash WHERE p.path LIKE ?",
+            (lib_prefix + "%",)):
+        lib_hashes.add(row["hash"])
+        if row["work_id"]:
+            lib_works.add(row["work_id"])
+
+    no_rename_lower = frozenset(n.lower() for n in cfg.no_rename)
+    blocked_cache: dict[str, str | None] = {}
+
+    def folder_mode(folder_rel: str, in_shared: bool) -> str:
+        if in_shared:
+            return "copy"
+        if folder_rel not in blocked_cache:
+            blocked_cache[folder_rel] = rename._folder_blocked(cfg, folder_rel, no_rename_lower)
+        return "copy" if blocked_cache[folder_rel] else "move"
 
     def describe(rel: str, file_hash: str | None, work_id: str | None, kind: str, why: str,
                  source: str, suggested: str | None) -> dict:
         work = all_works.get(work_id or "") or {}
         meta = work.get("meta") or {}
         authors = [a.get("family") for a in meta.get("authors") or [] if a.get("family")]
-        return {"path": rel, "name": PurePosixPath(rel).name, "folder": str(PurePosixPath(rel).parent),
+        p = PurePosixPath(rel)
+        folder_rel = str(p.parent)
+        return {"path": rel, "name": p.name, "folder": folder_rel,
                 "source": source, "kind": kind, "why": why, "work_id": work_id,
                 "title": meta.get("title"), "authors": authors, "year": meta.get("year"),
-                "suggested": suggested, "mode": _mode(cfg, rel, source == "shared"),
-                "in_library": _in_library(cfg, conn, file_hash, work_id)}
+                "suggested": suggested, "mode": folder_mode(folder_rel, source == "shared"),
+                "in_library": (bool(file_hash) and file_hash in lib_hashes)
+                              or (bool(work_id) and work_id in lib_works)}
 
     # 1. Shared folders: indexed, so the index says what each file is.
     for name, folder in shared_map.items():
@@ -96,49 +121,60 @@ def listing(cfg: Config, conn: sqlite3.Connection, *, look: bool = True) -> dict
 
     # 2. Inbox folders: not indexed (after the switch), so each file is hashed
     #    and judged once, then remembered while it is unchanged (downloads.py).
-    for top in cfg.inboxes:
-        for rel in _walk(cfg, top):
-            if shared.collection_at(cfg, rel, shared_map):
-                continue                                 # listed above, with its collection
-            known = conn.execute("SELECT f.hash, f.work_id, f.kind FROM paths p JOIN files f "
-                                 "ON f.hash = p.hash WHERE p.path=?", (rel,)).fetchone()
-            if known is not None:
-                file_hash, work_id, kind, why = known["hash"], known["work_id"], known["kind"], "indexed"
-                if work_id is None and kind not in PAPER_KINDS:
-                    continue
-            else:
-                path = cfg.absolute(rel)
-                try:
-                    stat = path.stat()
-                except OSError:
-                    continue
-                key = (str(path), stat.st_size, stat.st_mtime_ns)
-                if key not in downloads._seen:
-                    if not look or looked >= LIMIT:
-                        unseen += 1
+    if cfg.inboxes:
+        indexed_paths = {
+            row["path"]: (row["hash"], row["work_id"], row["kind"])
+            for row in conn.execute("SELECT p.path, f.hash, f.work_id, f.kind FROM paths p JOIN files f ON f.hash = p.hash")
+        }
+        files_meta: dict[str, tuple[str | None, str | None, str | None]] | None = None
+        for top in cfg.inboxes:
+            for rel in _walk(cfg, top):
+                if shared.collection_at(cfg, rel, shared_map):
+                    continue                                 # listed above, with its collection
+                known = indexed_paths.get(rel)
+                if known is not None:
+                    file_hash, work_id, kind = known
+                    why = "indexed"
+                    if work_id is None and kind not in PAPER_KINDS:
                         continue
-                    looked += 1
-                try:
-                    file_hash, verdict = downloads._look(path, stat)
-                except OSError:
-                    continue
-                # A file refs read before (when the folder was still indexed)
-                # keeps its work: the `files` row outlives the path.
-                row = conn.execute("SELECT work_id, kind, status FROM files WHERE hash=?", (file_hash,)).fetchone()
-                work_id = row["work_id"] if row else None
-                read = row is not None and row["status"] is not None
-                kind, why = (row["kind"], "read before") if read and row["kind"] else (verdict.kind, verdict.why)
-                if work_id is None and kind not in {"paper", "maybe", *PAPER_KINDS}:
-                    continue
-            items.append(describe(rel, file_hash, work_id, kind or "paper", why, "inbox",
-                                  collection.suggested(layout.derive(rel))))
+                else:
+                    path = cfg.absolute(rel)
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    key = (str(path), stat.st_size, stat.st_mtime_ns)
+                    if key not in downloads._seen:
+                        if not look or looked >= LIMIT:
+                            unseen += 1
+                            continue
+                        looked += 1
+                    try:
+                        file_hash, verdict = downloads._look(path, stat)
+                    except OSError:
+                        continue
+                    # A file refs read before (when the folder was still indexed)
+                    # keeps its work: the `files` row outlives the path.
+                    if files_meta is None:
+                        files_meta = {
+                            r["hash"]: (r["work_id"], r["kind"], r["status"])
+                            for r in conn.execute("SELECT hash, work_id, kind, status FROM files")
+                        }
+                    row = files_meta.get(file_hash)
+                    work_id = row[0] if row else None
+                    read = row is not None and row[2] is not None
+                    kind, why = (row[1], "read before") if read and row[1] else (verdict.kind, verdict.why)
+                    if work_id is None and kind not in {"paper", "maybe", *PAPER_KINDS}:
+                        continue
+                items.append(describe(rel, file_hash, work_id, kind or "paper", why, "inbox",
+                                      collection.suggested(layout.derive(rel))))
     items.sort(key=lambda i: (i["source"] != "shared", i["folder"], i["name"]))
     return {"items": items, "unseen": unseen, "inboxes": list(cfg.inboxes), "shared": shared_map}
 
 
-def waiting(cfg: Config, conn: sqlite3.Connection) -> tuple[int, int]:
+def waiting(cfg: Config, conn: sqlite3.Connection, *, all_works: dict | None = None) -> tuple[int, int]:
     """For the sidebar, reading nothing: (papers to take in, files not judged yet)."""
-    found = listing(cfg, conn, look=False)
+    found = listing(cfg, conn, look=False, all_works=all_works)
     return sum(not i["in_library"] for i in found["items"]), found["unseen"]
 
 

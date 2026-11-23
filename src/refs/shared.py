@@ -107,8 +107,10 @@ def collect(cfg: Config, conn: sqlite3.Connection, work_ids: list[str], names: l
                 if copy_in(cfg, conn, work_ids, name)["copied"]:
                     scanner.scan(cfg, conn)
         used.append(name)
-    all_works = works.load_all(cfg)
-    for work_id in work_ids:
-        if work_id in all_works:
-            index.update_collections(conn, all_works[work_id])
+    unique_ids = list(dict.fromkeys(work_ids))
+    all_works = works.load_all_readonly(cfg) if len(unique_ids) > 20 else None
+    for work_id in unique_ids:
+        work = all_works.get(work_id) if all_works is not None else works.load_one(cfg, work_id)
+        if work is not None:
+            index.update_collections(conn, work)
     return used

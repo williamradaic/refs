@@ -124,8 +124,8 @@ let layout = loadLayout();
 
 // --- talking to the server ---------------------------------------------------
 
-async function get(url) {
-  return (await fetch(url)).json();
+async function get(url, signal = undefined) {
+  return (await fetch(url, signal ? { signal } : undefined)).json();
 }
 async function post(url, body) {
   // The X-Refs header is what the server checks before changing anything.
@@ -513,15 +513,19 @@ function authorsShort(names) {
 }
 
 // Every load of the list gets a number; an answer that arrives after a newer
-// load started is dropped, so a slow search never overwrites the view you
-// switched to in the meantime.
+// load started is dropped, and any in-flight search fetch is cancelled, so a
+// slow search never wastes work or overwrites the view you switched to.
 let listToken = 0;
+let searchAbort = null;
+const COLLATOR = new Intl.Collator();
 
 // `ask`: "off" while typing (local search only, instant); "auto" on Enter, which
 // lets the server ask Haiku when the query reads like a description and the
 // local results look unsure, or when it starts with "?".
 async function search(keepId = null, ask = "off") {
   const token = ++listToken;
+  searchAbort?.abort();
+  searchAbort = null;
   if (REVIEW_VIEWS[state.view] && !state.context && !state.tag && !state.collection) {
     return REVIEW_VIEWS[state.view](token);
   }
@@ -535,9 +539,18 @@ async function search(keepId = null, ask = "off") {
   if (state.query) parts.unshift(parts.pop());
   const url = `/api/search?q=${encodeURIComponent(parts.join(" "))}&view=${state.view}` +
     `&scope=${state.scope}&ask=${ask}`;
+  const controller = new AbortController();
+  searchAbort = controller;
   // Asking Haiku takes a few seconds: say so if the answer is slow to come.
   const waiting = ask !== "off" && setTimeout(() => say("asking Haiku …", 0), 400);
-  const data = await get(url);
+  let data;
+  try {
+    data = await get(url, controller.signal);
+  } catch (error) {
+    clearTimeout(waiting);
+    if (error?.name === "AbortError") return;
+    throw error;
+  }
   clearTimeout(waiting);
   if (token !== listToken) return;
   state.raw = data.items;                 // the server's order, kept for "no sort"
@@ -577,26 +590,28 @@ function groupOf(item) {
 }
 
 function sortItems() {
-  state.items = [...(state.raw ?? [])];
+  const raw = state.raw ?? [];
   const chosen = state.asked ? null : layout.sort;
   if (chosen) {
     const key = COLUMNS[chosen.col].sort, direction = chosen.dir === "desc" ? -1 : 1;
-    state.items.sort((a, b) => {
-      const x = key(a), y = key(b);
-      return (x < y ? -1 : x > y ? 1 : 0) * direction;
-    });
+    const decorated = raw.map((item, idx) => ({ item, k: key(item), idx }));
+    decorated.sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : a.idx - b.idx) * direction);
+    state.items = decorated.map((d) => d.item);
   } else if (state.collection && !state.query) {
     // A collection: like a reading list, part by part (groupOf), each part's
     // papers in the server's order.
-    const at = new Map(state.items.map((item, i) => [item, i]));
-    state.items.sort((a, b) => {
-      const x = groupOf(a), y = groupOf(b);
-      return x.order - y.order || x.label.localeCompare(y.label) || at.get(a) - at.get(b);
-    });
+    const decorated = raw.map((item, idx) => ({ item, g: groupOf(item), idx }));
+    decorated.sort((a, b) => a.g.order - b.g.order || COLLATOR.compare(a.g.label, b.g.label) || a.idx - b.idx);
+    state.items = decorated.map((d) => d.item);
   } else if (!state.context && !state.query) {
     // No column chosen, no course, nothing typed: list like a bibliography.
-    const key = (i) => `${(i.authors?.[0] ?? last).toLowerCase()} ${i.year ?? 9999}`;
-    state.items.sort((a, b) => key(a).localeCompare(key(b)));
+    const decorated = raw.map((item) => ({
+      item, k: `${(item.authors?.[0] ?? last).toLowerCase()} ${item.year ?? 9999}`,
+    }));
+    decorated.sort((a, b) => COLLATOR.compare(a.k, b.k));
+    state.items = decorated.map((d) => d.item);
+  } else {
+    state.items = [...raw];
   }
 }
 
@@ -633,21 +648,30 @@ function renderList() {
   // chosen sort, show the reading-list structure: a heading whenever the
   // part or topic changes.
   const grouped = (state.context || state.collection) && !state.query && !layout.sort;
-  let html = renderHead(), lastTopic;
-  items.forEach((item, i) => {
-    const group = grouped ? groupOf(item) : null;
-    if (group && group.heading !== lastTopic) {
-      lastTopic = group.heading;
-      html += `<div class="topic">${esc(group.heading)}</div>`;
+  const cols = visibleColumns().map((id) => COLUMNS[id]);
+  const chunks = [renderHead()];
+  let lastTopic;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (grouped) {
+      const group = groupOf(item);
+      if (group.heading !== lastTopic) {
+        lastTopic = group.heading;
+        chunks.push(`<div class="topic">${esc(group.heading)}</div>`);
+      }
     }
-    const cls = ["row", i === state.selected ? "sel" : "", state.marked.has(item.id) ? "mk" : ""].join(" ");
-    html += `<div class="${cls}" data-i="${i}">` + visibleColumns().map((id) => {
-      const column = COLUMNS[id];
-      return column.cell ? column.cell(item)
+    const cls = i === state.selected
+      ? (state.marked.has(item.id) ? "row sel mk" : "row sel")
+      : (state.marked.has(item.id) ? "row mk" : "row");
+    let row = `<div class="${cls}" data-i="${i}">`;
+    for (let c = 0; c < cols.length; c++) {
+      const column = cols[c];
+      row += column.cell ? column.cell(item)
         : `<span class="${column.cls} ${column.align ?? "left"}">${esc(column.text(item))}</span>`;
-    }).join("") + `</div>`;
-  });
-  $("list").innerHTML = html;
+    }
+    chunks.push(row + `</div>`);
+  }
+  $("list").innerHTML = chunks.join("");
 }
 
 // --- header: click to sort, drag to reorder, drag the edge to resize ---------------
@@ -771,11 +795,16 @@ window.addEventListener("pointerup", () => {
 
 function select(i, scroll = true) {
   if (!state.items.length) return;
-  state.selected = Math.max(0, Math.min(state.items.length - 1, i));
-  for (const row of $("list").querySelectorAll(".row")) {
-    row.classList.toggle("sel", Number(row.dataset.i) === state.selected);
+  const next = Math.max(0, Math.min(state.items.length - 1, i));
+  state.selected = next;
+  const listEl = $("list");
+  const prevRow = listEl.querySelector(".row.sel");
+  const nextRow = listEl.querySelector(`.row[data-i="${next}"]`);
+  if (prevRow && prevRow !== nextRow) prevRow.classList.remove("sel");
+  if (nextRow) {
+    nextRow.classList.add("sel");
+    if (scroll) nextRow.scrollIntoView({ block: "nearest" });
   }
-  if (scroll) $("list").querySelector(".row.sel")?.scrollIntoView({ block: "nearest" });
   return renderDetail();
 }
 
@@ -886,9 +915,12 @@ async function batchAct(name) {
 // --- detail ------------------------------------------------------------------------
 
 let detailToken = 0;
+let detailAbort = null;
 let detailDone = Promise.resolve();   // the detail pane's latest draw (menu actions wait for it)
 function renderDetail() { return (detailDone = drawDetail()); }
 async function drawDetail() {
+  detailAbort?.abort();
+  detailAbort = null;
   if (state.marked.size) { ++detailToken; renderBatch(); return; }
   const item = state.items[state.selected];
   if (!item) { $("detail").innerHTML = ""; return; }
@@ -897,7 +929,15 @@ async function drawDetail() {
   // Full metadata (first names, volume, pages, BibTeX) exists only for works.
   let work = null, bibtex = "", noteData = null, copies = [];
   if (item.work_id) {
-    const data = await get(`/api/work/${item.work_id}`);
+    const controller = new AbortController();
+    detailAbort = controller;
+    let data;
+    try {
+      data = await get(`/api/work/${item.work_id}`, controller.signal);
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      throw error;
+    }
     if (token !== detailToken) return;
     work = data.work; bibtex = data.bibtex; noteData = data.note; copies = data.copies ?? [];
   }

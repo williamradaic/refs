@@ -41,17 +41,19 @@ def record(conn: sqlite3.Connection, cost: float, kind: str = "read") -> None:
     """Enter one reading's cost in the ledger."""
     if cost <= 0:
         return
-    conn.executescript(SCHEMA)
+    conn.execute(SCHEMA.strip())
     conn.execute("INSERT INTO spending VALUES (?, ?, ?)",
                  (datetime.now(timezone.utc).isoformat(timespec="seconds"), kind, cost))
     conn.commit()
 
 
 def spent_this_month(conn: sqlite3.Connection, kind: str = "read") -> float:
-    conn.executescript(SCHEMA)
     month_start = datetime.now(timezone.utc).strftime("%Y-%m-01")
-    row = conn.execute("SELECT COALESCE(SUM(cost), 0) FROM spending WHERE kind = ? AND created >= ?",
-                       (kind, month_start)).fetchone()
+    try:
+        row = conn.execute("SELECT COALESCE(SUM(cost), 0) FROM spending WHERE kind = ? AND created >= ?",
+                           (kind, month_start)).fetchone()
+    except sqlite3.OperationalError:
+        return 0.0
     return float(row[0])
 
 

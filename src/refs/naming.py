@@ -127,14 +127,20 @@ def parse_filename(filename: str) -> NameGuess:
 
 # --- Building the canonical name --------------------------------------------
 
+_APOSTROPHE_RE = re.compile(r"['’`]")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_SUBTITLE_RE = re.compile(r"[:?]")
+
+
 def slugify(text: str) -> str:
     """Lowercase ASCII with hyphens: "Kőszegi & Rabin" -> "koszegi-rabin"."""
-    text = text.translate(SPECIAL_LETTERS)
-    # NFKD splits "ő" into "o" + a combining accent; the accent is then dropped.
-    text = unicodedata.normalize("NFKD", text)
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = re.sub(r"['’`]", "", text.lower())       # O'Donoghue -> odonoghue
-    return re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    if not text.isascii():
+        text = text.translate(SPECIAL_LETTERS)
+        # NFKD splits "ő" into "o" + a combining accent; the accent is then dropped.
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = _APOSTROPHE_RE.sub("", text.lower())     # O'Donoghue -> odonoghue
+    return _NON_ALNUM_RE.sub("-", text).strip("-")
 
 
 def canonical_name(
@@ -146,11 +152,11 @@ def canonical_name(
     Four or more authors become `first-et-al`. The title is cut at a colon
     (subtitle dropped), limited to `max_words`, and never ends on a filler word.
     """
-    authors = [slugify(name) for name in surnames if slugify(name)]
+    authors = [slug for name in surnames if (slug := slugify(name))]
     if len(authors) >= 4:
         authors = [authors[0], "et", "al"]
 
-    main_title = re.split(r"[:?]", title, maxsplit=1)[0]
+    main_title = _SUBTITLE_RE.split(title, maxsplit=1)[0]
     words = slugify(main_title).split("-")
     if words and words[0] in {"a", "an", "the"}:     # leading article adds nothing
         words = words[1:]

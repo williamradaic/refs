@@ -14,8 +14,10 @@ What is rebuilt from the read records on every sync:
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,17 +27,91 @@ from .config import Config
 _CITEKEY_SKIP = naming.STOPWORDS | {"is", "are", "do", "does", "how", "why", "what", "when", "some"}
 _STATUS_RANK = {"verified": 0, "extracted": 1, "needs-review": 2}
 
+# Per-file stat-validated cache of parsed work dicts for read-only callers:
+# works_dir -> {filename: ((ino, size, mtime_ns), work_dict)}
+_readonly_cache: dict[str, dict[str, tuple[tuple[int, int, int], dict]]] = {}
+_readonly_lock = threading.Lock()
+
 
 def works_dir(cfg: Config) -> Path:
     return cfg.absolute(cfg.state_dir) / "works"
 
 
+def load_one(cfg: Config, work_id: str) -> dict | None:
+    """Load a single work by id without scanning the whole works folder."""
+    if not work_id or "/" in work_id or "\\" in work_id or ".." in work_id or work_id.startswith("."):
+        return None
+    return records.read_json(works_dir(cfg) / f"{work_id}.json")
+
+
 def load_all(cfg: Config) -> dict[str, dict]:
-    """Every work, keyed by id."""
-    if not works_dir(cfg).is_dir():
+    """Every work, keyed by id (fresh mutable dicts, stat-cached against disk)."""
+    folder = works_dir(cfg)
+    if not folder.is_dir():
         return {}
-    loaded = (records.read_json(p) for p in works_dir(cfg).glob("*.json"))
-    return {w["id"]: w for w in loaded if w}
+    out: dict[str, dict] = {}
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json") or entry.name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                work = records.read_json(Path(entry.path), _stat=st)
+                if work and "id" in work:
+                    out[work["id"]] = work
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def load_all_readonly(cfg: Config) -> dict[str, dict]:
+    """Every work, keyed by id, for callers that only read the dicts.
+
+    Stat-validates every file in works/ via a single os.scandir and reuses the
+    already-parsed dicts for unchanged files (zero disk reads and zero JSON
+    re-parsing when nothing changed). Callers MUST NOT mutate returned dicts.
+    """
+    # Respect tests that monkeypatch works.load_all.
+    if load_all is not _ORIGINAL_LOAD_ALL:
+        return load_all(cfg)
+    folder = works_dir(cfg)
+    if not folder.is_dir():
+        return {}
+    dir_key = str(folder)
+    with _readonly_lock:
+        prev = _readonly_cache.get(dir_key, {})
+    fresh: dict[str, tuple[tuple[int, int, int], dict]] = {}
+    out: dict[str, dict] = {}
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json") or entry.name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                sig = (st.st_ino, st.st_size, st.st_mtime_ns)
+                cached = prev.get(entry.name)
+                if cached is not None and cached[0] == sig:
+                    work = cached[1]
+                else:
+                    work = records.read_json(Path(entry.path), _stat=st)
+                    if not work or "id" not in work:
+                        continue
+                fresh[entry.name] = (sig, work)
+                out[work["id"]] = work
+    except FileNotFoundError:
+        pass
+    with _readonly_lock:
+        _readonly_cache[dir_key] = fresh
+    return out
+
+
+_ORIGINAL_LOAD_ALL = load_all
 
 
 # --- Deciding which files are the same work -------------------------------------------
@@ -155,13 +231,13 @@ def sync(cfg: Config) -> dict[str, str]:
     Returns a map from file hash to work id. Safe to run any number of times:
     a file stays in the work it is already in, ids and citekeys never change.
     """
-    if not records.reads_dir(cfg).is_dir():
+    all_reads = records.load_all_reads(cfg)
+    if not all_reads:
         return {}
-    reads = {}
-    for path in records.reads_dir(cfg).glob("*.json"):
-        read = records.read_json(path)
-        if read and (read.get("reading") or {}).get("kind") in records.LIBRARY_KINDS:
-            reads[path.stem] = read
+    reads = {
+        h: read for h, read in all_reads.items()
+        if (read.get("reading") or {}).get("kind") in records.LIBRARY_KINDS
+    }
 
     works = load_all(cfg)
     before = {wid: json.dumps(w, sort_keys=True) for wid, w in works.items()}
@@ -202,9 +278,14 @@ def sync(cfg: Config) -> dict[str, str]:
         candidates = [reads[h] for h in work["files"] if h in reads]
         if not candidates:
             continue                      # its files are gone from the reads; keep as is
-        best = min(candidates, key=lambda r: (
-            _STATUS_RANK.get(r["status"], 9), _meta_from(r)["is_working_paper"]))
-        work["meta"] = _meta_from(best)
+        if len(candidates) == 1:
+            best = candidates[0]
+            best_meta = _meta_from(best)
+        else:
+            scored = [(_STATUS_RANK.get(r["status"], 9), (m := _meta_from(r))["is_working_paper"], r, m)
+                      for r in candidates]
+            _, _, best, best_meta = min(scored, key=lambda item: (item[0], item[1]))
+        work["meta"] = best_meta
         apply_user_edits(work)
         reading = best.get("reading") or {}
         work["description"] = reading.get("description")

@@ -50,7 +50,8 @@ def _hash_of(conn: sqlite3.Connection, rel: str) -> str:
 
 # --- Identical copies -----------------------------------------------------------------
 
-def copies(cfg: Config, conn: sqlite3.Connection, *, kept: bool = False) -> list[dict]:
+def copies(cfg: Config, conn: sqlite3.Connection, *, kept: bool = False,
+           items: list[dict] | None = None) -> list[dict]:
     """Files stored in more than one place: the sets still to review, or with
     `kept=True` the sets you marked as on purpose (so they can be un-kept).
 
@@ -60,8 +61,9 @@ def copies(cfg: Config, conn: sqlite3.Connection, *, kept: bool = False) -> list
     from . import shared                                # shared.py uses this module
     kept_hashes = set(_review(cfg)["kept_copies"])
     shared_folders = shared.folders(cfg)
+    pool = index.search(conn, [], {}, limit=None) if items is None else items
     found = []
-    for item in index.search(conn, [], {}, limit=None):
+    for item in pool:
         paths = [loc["path"] for loc in item["locations"]]
         if len(paths) < 2 or (item["hash"] in kept_hashes) != kept:
             continue

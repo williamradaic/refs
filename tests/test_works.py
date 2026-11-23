@@ -247,3 +247,26 @@ def test_syncing_twice_writes_nothing_the_second_time(cfg):
     assert files and all(json.loads(f.read_text())["schema"] == 1 for f in files)
     works.sync(cfg)
     assert {f: f.stat().st_mtime_ns for f in files} == stamps
+
+
+def test_load_one_and_readonly_cache_invalidation(cfg):
+    from refs import records
+    write_read(cfg, "aaa", title="Automobile Prices in Market Equilibrium", family="Berry",
+               year=1995, doi="10.2307/2171802", venue="Econometrica")
+    wid = works.sync(cfg)["aaa"]
+
+    # load_one loads a single work and refuses path-traversal names.
+    single = works.load_one(cfg, wid)
+    assert single is not None and single["citekey"] == "berry1995automobile"
+    assert works.load_one(cfg, "../escape") is None
+    assert works.load_one(cfg, ".hidden") is None
+
+    # load_all_readonly reflects writes and deletions immediately via stat validation.
+    first = works.load_all_readonly(cfg)
+    assert first[wid]["user"]["read_status"] == "unread"
+    single["user"]["read_status"] = "read"
+    records.write_json(works.works_dir(cfg) / f"{wid}.json", single)
+    second = works.load_all_readonly(cfg)
+    assert second[wid]["user"]["read_status"] == "read"
+    (works.works_dir(cfg) / f"{wid}.json").unlink()
+    assert wid not in works.load_all_readonly(cfg)

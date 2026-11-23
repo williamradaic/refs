@@ -100,9 +100,11 @@ def _made(cfg: Config, rel: str) -> str | None:
         doc.close()
 
 
-def facts(cfg: Config, conn: sqlite3.Connection, work: dict | None, paths: list[str]) -> list[Copy]:
+def facts(cfg: Config, conn: sqlite3.Connection, work: dict | None, paths: list[str], *,
+          supersedes: dict[str, str | None] | None = None) -> list[Copy]:
     """What refs knows about each copy of a paper."""
-    supersedes = dict(conn.execute("SELECT hash, supersedes FROM files").fetchall())
+    if supersedes is None:
+        supersedes = dict(conn.execute("SELECT hash, supersedes FROM files").fetchall())
     found = []
     for rel in paths:
         row = conn.execute(
@@ -180,12 +182,13 @@ def _describe(copy: Copy) -> str:
     return ", ".join(p for p in parts if p)
 
 
-def recommend(cfg: Config, conn: sqlite3.Connection, work: dict | None, paths: list[str]) -> dict:
+def recommend(cfg: Config, conn: sqlite3.Connection, work: dict | None, paths: list[str], *,
+              supersedes: dict[str, str | None] | None = None) -> dict:
     """The recommendation for one paper's copies: {"keep", "verdict", "summary",
     "copies": [...each copy's facts, action and why], "rename_to"}. The
     verdict: "safe" (only safe trashing), "optional" (some versions you may
     want), "merge" (marks to bring over first), "keep" (keep them all)."""
-    copies = facts(cfg, conn, work, paths)
+    copies = facts(cfg, conn, work, paths, supersedes=supersedes)
     if len(copies) < 2:
         return {"keep": copies[0].path if copies else None, "verdict": "keep", "summary": "", "copies": [],
                 "rename_to": None}

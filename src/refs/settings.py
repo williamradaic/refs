@@ -393,14 +393,21 @@ def choose_folder(prompt: str, start: Path | None = None) -> Path | None:
 
 def annotation_authors(cfg: config.Config, conn) -> list[dict]:
     """Every author name on highlights and notes in the library's PDFs, with
-    how many files and marks carry it, most files first. About 4 ms a file."""
+    how many files and marks carry it, most files first. Reuses the index's
+    cached per-file mark counts and only opens PDFs not yet counted."""
     from . import reading
 
     files: Counter[str] = Counter()
     marks: Counter[str] = Counter()
-    rows = conn.execute("SELECT MIN(path) AS path FROM paths GROUP BY hash").fetchall()
+    rows = conn.execute(
+        "SELECT f.marks_by, MIN(p.path) AS path FROM paths p "
+        "LEFT JOIN files f ON f.hash = p.hash GROUP BY p.hash"
+    ).fetchall()
     for row in rows:
-        found = reading.marks_by_author(cfg.absolute(row["path"]))
+        if row["marks_by"] is not None:
+            found = json.loads(row["marks_by"])
+        else:
+            found = reading.marks_by_author(cfg.absolute(row["path"]))
         for name, count in found.items():
             files[name] += 1
             marks[name] += count

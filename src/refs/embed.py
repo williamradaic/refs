@@ -28,12 +28,13 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Callable
-
-import numpy as np
+from typing import TYPE_CHECKING, Callable
 
 from . import notes
 from .config import Config
+
+if TYPE_CHECKING:
+    import numpy as np
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS vectors (
@@ -64,7 +65,7 @@ NOTE_PIECE_CHARS = 1200     # about 300 tokens; the model reads at most 512
 
 # An encoder takes texts and whether they are queries, and returns one
 # unit-length row per text. Tests swap in a tiny fake with set_encoder().
-Encoder = Callable[[list[str], bool], np.ndarray]
+Encoder = Callable[[list[str], bool], "np.ndarray"]
 _encoders: dict[str, Encoder] = {}
 _override: Encoder | None = None
 
@@ -77,6 +78,7 @@ def set_encoder(encoder: Encoder | None) -> None:
 
 
 def _fastembed(model_name: str) -> Encoder:
+    import numpy as np
     from fastembed import TextEmbedding          # imported here: it takes ~0.3 s
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -165,7 +167,7 @@ def _digest(model_name: str, text: str) -> str:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.executescript(SCHEMA)
+    conn.execute(SCHEMA.strip())
 
 
 def refresh(cfg: Config, conn: sqlite3.Connection) -> int:
@@ -183,20 +185,21 @@ def refresh(cfg: Config, conn: sqlite3.Connection) -> int:
             for r in conn.execute("SELECT unit, part, digest FROM vectors")}
 
     stale = [key for key in have if key not in wanted]
-    todo = [(key, text) for key, text in wanted.items()
-            if have.get(key) != _digest(model_name, text)]
-    for unit, part in stale:
-        conn.execute("DELETE FROM vectors WHERE unit=? AND part=?", (unit, part))
+    todo = [(key, text, digest) for key, text in wanted.items()
+            if have.get(key) != (digest := _digest(model_name, text))]
+    if stale:
+        conn.executemany("DELETE FROM vectors WHERE unit=? AND part=?", stale)
 
     if todo:
+        import numpy as np
         encode = encoder(model_name)
         for start in range(0, len(todo), 256):
             batch = todo[start:start + 256]
-            rows = encode([text for _, text in batch], False)
+            rows = encode([text for _, text, _ in batch], False)
             conn.executemany(
                 "INSERT OR REPLACE INTO vectors (unit, part, digest, vector) VALUES (?,?,?,?)",
-                [(unit, part, _digest(model_name, text), rows[i].astype(np.float32).tobytes())
-                 for i, ((unit, part), text) in enumerate(batch)],
+                [(unit, part, digest, rows[i].astype(np.float32).tobytes())
+                 for i, ((unit, part), _, digest) in enumerate(batch)],
             )
             if sys.stderr.isatty() and len(todo) > 256:
                 print(f"\r  embedding {min(start + 256, len(todo)):,}/{len(todo):,}",
@@ -212,11 +215,12 @@ def refresh(cfg: Config, conn: sqlite3.Connection) -> int:
 
 # The vectors of one index, kept in memory between queries (the web server
 # answers many). Reloaded when vectors_version changes.
-_matrices: dict[str, tuple[str, list[str], np.ndarray]] = {}
+_matrices: dict[str, tuple[str, list[str], "np.ndarray"]] = {}
 
 
-def _matrix(conn: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
+def _matrix(conn: sqlite3.Connection) -> tuple[list[str], "np.ndarray"]:
     """(unit of each row, matrix of vectors) for the whole index."""
+    import numpy as np
     db = conn.execute("PRAGMA database_list").fetchone()["file"]
     version = conn.execute("SELECT value FROM meta WHERE key='vectors_version'").fetchone()
     version = version["value"] if version else ""
@@ -224,7 +228,11 @@ def _matrix(conn: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
     if cached and cached[0] == version:
         return cached[1], cached[2]
     units, rows = [], []
-    for row in conn.execute("SELECT unit, vector FROM vectors ORDER BY unit, part"):
+    try:
+        cursor = conn.execute("SELECT unit, vector FROM vectors ORDER BY unit, part")
+    except sqlite3.OperationalError:
+        return [], np.zeros((0, 1), dtype=np.float32)
+    for row in cursor:
         units.append(row["unit"])
         rows.append(np.frombuffer(row["vector"], dtype=np.float32))
     matrix = np.vstack(rows) if rows else np.zeros((0, 1), dtype=np.float32)
@@ -237,7 +245,6 @@ def rank(conn: sqlite3.Connection, text: str) -> list[tuple[str, float]]:
 
     Empty if the library has not been embedded yet.
     """
-    ensure_schema(conn)
     units, matrix = _matrix(conn)
     if not units:
         return []

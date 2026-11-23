@@ -35,8 +35,6 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-import pymupdf
-
 from . import extract, naming, organize, rename
 from .config import Config
 
@@ -135,6 +133,7 @@ def judge(path: Path) -> Verdict:
     """Sort one PDF into paper / maybe / other, from its first and last pages."""
     if not _complete(path):
         return Verdict("incomplete", "not a whole PDF (still downloading?)")
+    import pymupdf
     try:
         with pymupdf.open(path) as doc:
             pages = doc.page_count
@@ -207,11 +206,8 @@ _seen: dict[tuple[str, int, int], tuple[str, Verdict]] = {}
 
 
 def _hash(path: Path) -> str:
-    digest = hashlib.sha256()
     with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _look(path: Path, stat: os.stat_result) -> tuple[str, Verdict]:
@@ -227,23 +223,56 @@ def _known(conn: sqlite3.Connection, file_hash: str) -> str | None:
     return row["path"] if row else None
 
 
+def _known_map(conn: sqlite3.Connection, hashes: set[str]) -> dict[str, str]:
+    """Batch lookup of where the library already has each hash (first path alphabetically)."""
+    if not hashes:
+        return {}
+    hash_list = list(hashes)
+    found: dict[str, str] = {}
+    for start in range(0, len(hash_list), 500):
+        chunk = hash_list[start:start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"SELECT hash, MIN(path) AS path FROM paths WHERE hash IN ({placeholders}) GROUP BY hash",
+            chunk,
+        ):
+            found[row["hash"]] = row["path"]
+    return found
+
+
+def _sorted_pdfs(where: Path) -> list[tuple[os.DirEntry, os.stat_result]]:
+    """PDFs directly inside `where`, newest first, with stat() called once per entry."""
+    pairs = []
+    for entry in _pdfs(where):
+        try:
+            pairs.append((entry, entry.stat()))
+        except OSError:
+            continue
+    pairs.sort(key=lambda pair: pair[1].st_mtime, reverse=True)
+    return pairs
+
+
 def listing(cfg: Config, conn: sqlite3.Connection, limit: int = LIMIT) -> dict:
     """The PDFs in Downloads, newest first, each with its verdict and, when the
     library has the same file already, where it is."""
     where = folder(cfg)
     if where is None:
         return {"folder": None, "items": [], "older": 0}
-    entries = sorted(_pdfs(where), key=lambda e: e.stat().st_mtime, reverse=True)
-    items = []
-    for entry in entries[:limit]:
+    entries = _sorted_pdfs(where)
+    looked = []
+    for entry, stat in entries[:limit]:
         try:
-            stat = entry.stat()
             file_hash, verdict = _look(Path(entry.path), stat)
         except OSError:
             continue                                # removed or unreadable meanwhile
-        items.append({"name": entry.name, "size": stat.st_size, "modified": stat.st_mtime,
-                      "kind": verdict.kind, "why": verdict.why, "pages": verdict.pages,
-                      "in_refs": _known(conn, file_hash)})
+        looked.append((entry, stat, file_hash, verdict))
+    known = _known_map(conn, {h for _, _, h, _ in looked})
+    items = [
+        {"name": entry.name, "size": stat.st_size, "modified": stat.st_mtime,
+         "kind": verdict.kind, "why": verdict.why, "pages": verdict.pages,
+         "in_refs": known.get(file_hash)}
+        for entry, stat, file_hash, verdict in looked
+    ]
     return {"folder": str(where), "items": items, "older": max(0, len(entries) - limit)}
 
 
@@ -254,15 +283,17 @@ def waiting(cfg: Config, conn: sqlite3.Connection) -> tuple[int, int]:
     where = folder(cfg)
     if where is None:
         return 0, 0
-    entries = sorted(_pdfs(where), key=lambda e: e.stat().st_mtime, reverse=True)[:LIMIT]
-    count = unseen = 0
-    for entry in entries:
-        stat = entry.stat()
+    entries = _sorted_pdfs(where)[:LIMIT]
+    paper_hashes = []
+    unseen = 0
+    for entry, stat in entries:
         found = _seen.get((entry.path, stat.st_size, stat.st_mtime_ns))
         if found is None:
             unseen += 1
-        else:
-            count += found[1].kind in {"paper", "maybe"} and _known(conn, found[0]) is None
+        elif found[1].kind in {"paper", "maybe"}:
+            paper_hashes.append(found[0])
+    known = _known_map(conn, set(paper_hashes))
+    count = sum(1 for h in paper_hashes if h not in known)
     return count, unseen
 
 
@@ -271,9 +302,9 @@ def warm(cfg: Config) -> None:
     where = folder(cfg)
     if where is None:
         return
-    for entry in sorted(_pdfs(where), key=lambda e: e.stat().st_mtime, reverse=True)[:LIMIT]:
+    for entry, stat in _sorted_pdfs(where)[:LIMIT]:
         try:
-            _look(Path(entry.path), entry.stat())
+            _look(Path(entry.path), stat)
         except OSError:
             continue                                # gone, or not readable: listed later
 

@@ -216,7 +216,8 @@ def pull(cfg: Config, conn: sqlite3.Connection, work_id: str, source: str, *, in
         if not added:
             return {"added": 0, "skipped": skipped, "backup": None}
         # Keep the library copy as it was, then write it in place.
-        work = (works_of(cfg).get(work_id) or {})
+        from . import works
+        work = works.load_one(cfg, work_id) or {}
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = f"{cfg.state_dir}/annotation-backups/{work.get('citekey') or work_id}-{stamp}.pdf"
         cfg.absolute(backup).parent.mkdir(parents=True, exist_ok=True)

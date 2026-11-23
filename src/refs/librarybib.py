@@ -56,7 +56,7 @@ def _library_copy(cfg: Config, locations: list[str]) -> str | None:
 
 def render(cfg: Config, conn: sqlite3.Connection) -> str:
     """The text of library.bib: one entry per work, ordered by citekey."""
-    all_works = works.load_all(cfg)
+    all_works = works.load_all_readonly(cfg)
     # Each work's PDFs on disk and its collections, from the index.
     located: dict[str, list[str]] = {}
     member_of: dict[str, list[str]] = {}

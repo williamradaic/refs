@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -157,16 +157,19 @@ def create_app(watch: bool = False) -> FastAPI:
         threading.Thread(target=run, daemon=True).start()
         return {"job": job_id}
 
+    def db():
+        return closing(index.connect(cfg))
+
     def collect_known(paths: list[str], names: list[str]) -> list[str]:
         """PDFs refs already has, added again with collections: put their
         papers in those collections. Returns the names used."""
         if not names or not paths:
             return []
-        conn = index.connect(cfg)
-        ids = [row["work_id"] for path in paths
-               if (row := conn.execute("SELECT f.work_id FROM paths p JOIN files f ON f.hash = p.hash "
-                                       "WHERE p.path=?", (path,)).fetchone()) and row["work_id"]]
-        used = shared.collect(cfg, conn, ids, names) if ids else []
+        with db() as conn:
+            ids = [row["work_id"] for path in paths
+                   if (row := conn.execute("SELECT f.work_id FROM paths p JOIN files f ON f.hash = p.hash "
+                                           "WHERE p.path=?", (path,)).fetchone()) and row["work_id"]]
+            used = shared.collect(cfg, conn, ids, names) if ids else []
         if used:
             library_changed()
         return used
@@ -212,8 +215,22 @@ def create_app(watch: bool = False) -> FastAPI:
             return None
         return (when if when.tzinfo else when.replace(tzinfo=timezone.utc)).timestamp()
 
+    _day_cache: dict[int, str] = {}
+
     def local_day(t: float | None) -> str | None:
-        return datetime.fromtimestamp(t).strftime("%Y-%m-%d") if t is not None else None
+        if t is None:
+            return None
+        # Local timezone offsets change at most on hour/half-hour boundaries, so
+        # bucketing by 1800s (30 min) is exact across DST transitions and avoids
+        # repeated strftime calls across hundreds of rows.
+        bucket = int(t) // 1800
+        day = _day_cache.get(bucket)
+        if day is None:
+            day = datetime.fromtimestamp(t).strftime("%Y-%m-%d")
+            if len(_day_cache) > 4096:
+                _day_cache.clear()
+            _day_cache[bucket] = day
+        return day
 
     def dates(locations: list[dict], work: dict | None) -> tuple[float | None, float | None]:
         """(added, modified) as moments.
@@ -223,9 +240,10 @@ def create_app(watch: bool = False) -> FastAPI:
         moment it entered the library. Modified: the newest change to any of its PDFs.
         """
         created, changed = [], []
+        root_str = str(cfg.dropbox_root)
         for loc in locations:
             try:
-                info = os.stat(cfg.absolute(loc["path"]))
+                info = os.stat(f"{root_str}/{loc['path']}")
             except OSError:
                 continue
             created.append(getattr(info, "st_birthtime", info.st_mtime))
@@ -328,8 +346,7 @@ def create_app(watch: bool = False) -> FastAPI:
         `ask`: "off" while typing (local only); "auto" when Enter is pressed,
         which asks Haiku if the query reads like a description and the local
         results look unsure, or if it starts with "?" (ask.py)."""
-        conn = index.connect(cfg)
-        all_works = works.load_all(cfg)
+        all_works = works.load_all_readonly(cfg)
         if view == "wanted":
             items = [stub_item(w) for w in all_works.values() if not w["files"]]
             return {"items": items}
@@ -349,19 +366,21 @@ def create_app(watch: bool = False) -> FastAPI:
             keep = lambda i: bool(user(i).get("queued"))  # noqa: E731
         else:
             keep = lambda i: scope == "all" or bool(i["work_id"])  # noqa: E731
-        try:
-            outcome = asking.search(cfg, conn, terms, filters, mode=mode, keep=keep)
-        except ValueError as error:
-            return {"items": [], "error": str(error)}
-        items = [shape(item, all_works) | {"why": item.get("why")} for item in outcome.results]
+        with db() as conn:
+            try:
+                outcome = asking.search(cfg, conn, terms, filters, mode=mode, keep=keep)
+            except ValueError as error:
+                return {"items": [], "error": str(error)}
+        found = outcome.results
         if view == "queue" and not terms:          # the queue's own order: first queued first
-            items.sort(key=lambda i: i["queued"] or "")
-        return {"items": items[:800], "asked": outcome.asked, "message": outcome.message}
+            found = sorted(found, key=lambda i: user(i).get("queued") or "")
+        items = [shape(item, all_works) | {"why": item.get("why")} for item in found[:800]]
+        return {"items": items, "asked": outcome.asked, "message": outcome.message}
 
-    def inbox_waiting(conn) -> int | None:
+    def inbox_waiting(conn, all_works: dict | None = None) -> int | None:
         if not cfg.inboxes and not shared.folders(cfg):
             return None
-        count, unseen = inbox.waiting(cfg, conn)
+        count, unseen = inbox.waiting(cfg, conn, all_works=all_works)
         if unseen:
             warm_inbox()
         return count
@@ -375,7 +394,8 @@ def create_app(watch: bool = False) -> FastAPI:
 
         def run() -> None:
             try:
-                inbox.listing(cfg, index.connect(cfg))
+                with closing(index.connect(cfg)) as conn:
+                    inbox.listing(cfg, conn)
             finally:
                 inbox_warming.release()
         threading.Thread(target=run, daemon=True).start()
@@ -391,75 +411,84 @@ def create_app(watch: bool = False) -> FastAPI:
     @app.get("/api/sidebar")
     def sidebar() -> dict:
         """Counts for the left pane: presets, then works per course and project."""
-        conn = index.connect(cfg)
-        all_works = works.load_all(cfg)
-        everything = index.search(conn, [], {}, limit=None)   # read once: renames needs it too
-        library = [i for i in everything if i["work_id"]]
-        contexts: dict[str, set] = {}
-        fields: dict[str, int] = {}
-        slug_of: dict[str, str | None] = {}                   # context key -> its folder's name
-        for item in library:
-            for loc in item["locations"]:
-                contexts.setdefault(loc["context"], set()).add(item["work_id"])
-                slug_of.setdefault(loc["context"], loc["slug"])
-            for tag in item["tags"][:2]:           # the first tags are the broad fields
-                fields[tag] = fields.get(tag, 0) + 1
-        # Each context's area and term, so the page groups without parsing keys.
-        about = {row["context"]: {"area": row["area"], "term": row["term"]} for row in conn.execute(
-            "SELECT context, MIN(area) AS area, MIN(term) AS term FROM paths GROUP BY context")}
-        user = lambda i: (all_works.get(i["work_id"]) or {}).get("user", {})   # noqa: E731
-        def stands_for(key: str) -> str | None:
-            info = about.get(key) or {}
-            found = collection.implicit(contexts_mod.Context(key, info.get("area") or "", info.get("term"),
-                                                             slug_of.get(key)))
-            return found[0] if found else None
+        with db() as conn:
+            all_works = works.load_all_readonly(cfg)
+            everything = index.search(conn, [], {}, limit=None)   # read once: renames and copies reuse it
+            library_items = [i for i in everything if i["work_id"]]
+            contexts: dict[str, set] = {}
+            fields: dict[str, int] = {}
+            slug_of: dict[str, str | None] = {}                   # context key -> its folder's name
+            read_counts = {status: 0 for status in reading.RANK}
+            review_count = 0
+            for item in library_items:
+                wid = item["work_id"]
+                for loc in item["locations"]:
+                    contexts.setdefault(loc["context"], set()).add(wid)
+                    slug_of.setdefault(loc["context"], loc["slug"])
+                for tag in item["tags"][:2]:           # the first tags are the broad fields
+                    fields[tag] = fields.get(tag, 0) + 1
+                if item["status"] == "needs-review":
+                    review_count += 1
+                if (work_rec := all_works.get(wid)) is not None:
+                    status_val = reading.effective(work_rec)[0]
+                    if status_val in read_counts:
+                        read_counts[status_val] += 1
+            # Each context's area and term, so the page groups without parsing keys.
+            about = {row["context"]: {"area": row["area"], "term": row["term"]} for row in conn.execute(
+                "SELECT context, MIN(area) AS area, MIN(term) AS term FROM paths GROUP BY context")}
 
-        return {
-            "presets": {
-                "all": len(library),
-                # Works by read status (yours, else detected): unread, reading, read.
-                **{status: sum(i["work_id"] in all_works
-                               and reading.effective(all_works[i["work_id"]])[0] == status
-                               for i in library) for status in reading.RANK},
-                # Queued works, with or without a PDF.
-                "queue": sum(bool(w["user"].get("queued")) for w in all_works.values()
-                             if "meta" in w),
-                "review": sum(i["status"] == "needs-review" for i in library),
-                "wanted": sum(not w["files"] for w in all_works.values()),
-                "renames": len(rename.plan(cfg, conn, everything, all_works)[0]),
-                "copies": len(organize.copies(cfg, conn)),
-                # PDFs in Downloads that look like papers and are not in refs
-                # (None = no Downloads folder: the entry is hidden).
-                "downloads": downloads_waiting(conn),
-                # Papers in inbox and shared folders the library lacks (None:
-                # neither kind of folder is set, so the entry is hidden).
-                "inbox": inbox_waiting(conn),
-                "unprocessed": conn.execute(
-                    "SELECT COUNT(*) FROM files WHERE status IS NULL "
-                    "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
-            },
-            # Folders; `collection` names the collection a folder stands for
-            # (listed under courses and projects instead).
-            "contexts": [{"key": key, "count": len(ids), **about.get(key, {}), "collection": stands_for(key)}
-                         for key, ids in sorted(contexts.items())],
-            "collections": collection.listing(cfg, conn, all_works),
-            # Areas the sidebar lists by name, in order (others go under "Other").
-            "areas": contexts_mod.layout_for(cfg).areas,
-            "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
-            # The quick-add folder's name, for the page's hints ("save it into …").
-            "dump": cfg.dump,
-            # The library proxy, for a "through the library" link on papers without a PDF.
-            "proxy": cfg.library_proxy,
-        }
+            def stands_for(key: str) -> str | None:
+                info = about.get(key) or {}
+                found = collection.implicit(contexts_mod.Context(key, info.get("area") or "", info.get("term"),
+                                                                 slug_of.get(key)))
+                return found[0] if found else None
+
+            return {
+                "presets": {
+                    "all": len(library_items),
+                    # Works by read status (yours, else detected): unread, reading, read.
+                    **read_counts,
+                    # Queued works, with or without a PDF.
+                    "queue": sum(bool(w["user"].get("queued")) for w in all_works.values()
+                                 if "meta" in w),
+                    "review": review_count,
+                    "wanted": sum(not w["files"] for w in all_works.values()),
+                    "renames": len(rename.plan(cfg, conn, everything, all_works)[0]),
+                    "copies": len(organize.copies(cfg, conn, items=everything)),
+                    # PDFs in Downloads that look like papers and are not in refs
+                    # (None = no Downloads folder: the entry is hidden).
+                    "downloads": downloads_waiting(conn),
+                    # Papers in inbox and shared folders the library lacks (None:
+                    # neither kind of folder is set, so the entry is hidden).
+                    "inbox": inbox_waiting(conn, all_works),
+                    "unprocessed": conn.execute(
+                        "SELECT COUNT(*) FROM files WHERE status IS NULL "
+                        "AND hash IN (SELECT hash FROM paths)").fetchone()[0],
+                },
+                # Folders; `collection` names the collection a folder stands for
+                # (listed under courses and projects instead).
+                "contexts": [{"key": key, "count": len(ids), **about.get(key, {}), "collection": stands_for(key)}
+                             for key, ids in sorted(contexts.items())],
+                "collections": collection.listing(cfg, conn, all_works),
+                # Areas the sidebar lists by name, in order (others go under "Other").
+                "areas": contexts_mod.layout_for(cfg).areas,
+                "fields": sorted(fields.items(), key=lambda kv: -kv[1])[:12],
+                # The quick-add folder's name, for the page's hints ("save it into …").
+                "dump": cfg.dump,
+                # The library proxy, for a "through the library" link on papers without a PDF.
+                "proxy": cfg.library_proxy,
+            }
 
     @app.get("/api/work/{work_id}")
     def work(work_id: str) -> dict:
-        found = works.load_all(cfg).get(work_id)
+        found = works.load_one(cfg, work_id)
         if found is None or "meta" not in found:
             raise HTTPException(404)
+        with db() as conn:
+            work_copies = annotations.copies(cfg, conn, work_id)
         return {"work": found, "bibtex": bib.entry(found), "note": notes.read(cfg, found),
                 # Each copy's marks and whether to flag it (annotations.py).
-                "copies": annotations.copies(cfg, index.connect(cfg), work_id)}
+                "copies": work_copies}
 
     @app.post("/api/work/{work_id}/pull")
     def pull_marks(work_id: str, path: str = Body(embed=True), into: str | None = Body(default=None, embed=True),
@@ -467,8 +496,7 @@ def create_app(watch: bool = False) -> FastAPI:
         """Bring the marks of another copy (`path`) into the library copy, or
         into `into` (annotations.pull): a copy of that file is kept first."""
         guard(x_refs)
-        with ingest.exclusive(cfg):
-            conn = index.connect(cfg)
+        with ingest.exclusive(cfg), db() as conn:
             try:
                 result = annotations.pull(cfg, conn, work_id, path, into=into)
             except annotations.Refused as error:
@@ -480,9 +508,9 @@ def create_app(watch: bool = False) -> FastAPI:
     @app.get("/file")
     def file(path: str) -> FileResponse:
         """Serve one PDF, but only a path the index knows (no arbitrary files)."""
-        conn = index.connect(cfg)
-        if conn.execute("SELECT 1 FROM paths WHERE path=?", (path,)).fetchone() is None:
-            raise HTTPException(404)
+        with db() as conn:
+            if conn.execute("SELECT 1 FROM paths WHERE path=?", (path,)).fetchone() is None:
+                raise HTTPException(404)
         return FileResponse(cfg.absolute(path), media_type="application/pdf",
                             content_disposition_type="inline")
 
@@ -492,7 +520,7 @@ def create_app(watch: bool = False) -> FastAPI:
     def set_read(work_id: str, status: str = Body(embed=True),
                  x_refs: str | None = Header(default=None)) -> dict:
         guard(x_refs)
-        found = works.load_all(cfg).get(work_id)
+        found = works.load_one(cfg, work_id)
         if found is None or status not in reading.RANK:
             raise HTTPException(400)
         reading.set_status(found, status)          # reading it also takes it off the queue
@@ -503,7 +531,7 @@ def create_app(watch: bool = False) -> FastAPI:
                   x_refs: str | None = Header(default=None)) -> dict:
         """Put a work on the reading queue, or take it off."""
         guard(x_refs)
-        found = works.load_all(cfg).get(work_id)
+        found = works.load_one(cfg, work_id)
         if found is None:
             raise HTTPException(404)
         reading.set_queued(found, on)
@@ -513,10 +541,10 @@ def create_app(watch: bool = False) -> FastAPI:
         """Write a work's read status or queue change, and copy it into the
         index so `read:` and `queued:` searches see it (no rescan needed)."""
         records.write_json(works.works_dir(cfg) / f"{found['id']}.json", found)
-        conn = index.connect(cfg)
-        conn.execute("UPDATE files SET read_status=?, queued=? WHERE work_id=?",
-                     (reading.effective(found)[0], found["user"].get("queued"), found["id"]))
-        conn.commit()
+        with db() as conn:
+            conn.execute("UPDATE files SET read_status=?, queued=? WHERE work_id=?",
+                         (reading.effective(found)[0], found["user"].get("queued"), found["id"]))
+            conn.commit()
         return read_fields(found)
 
     @app.post("/api/work/{work_id}/note")
@@ -525,7 +553,7 @@ def create_app(watch: bool = False) -> FastAPI:
         """Save your reading note (a Markdown file in the Obsidian vault).
         409 if the file changed since the page loaded it (edited in Obsidian)."""
         guard(x_refs)
-        found = works.load_all(cfg).get(work_id)
+        found = works.load_one(cfg, work_id)
         if found is None:
             raise HTTPException(404)
         try:
@@ -538,9 +566,10 @@ def create_app(watch: bool = False) -> FastAPI:
     def save_work(found: dict) -> dict:
         """Write a work, re-derive its metadata, and refresh the index."""
         records.write_json(works.works_dir(cfg) / f"{found['id']}.json", found)
-        scanner.scan(cfg, index.connect(cfg))       # runs works.sync and rebuilds search
+        with db() as conn:
+            scanner.scan(cfg, conn)       # runs works.sync and rebuilds search
         library_changed()
-        return {"work": works.load_all(cfg)[found["id"]]}
+        return {"work": works.load_one(cfg, found["id"])}
 
     def library_changed() -> None:
         """Works or collections changed: library.bib follows in a few seconds."""
@@ -552,7 +581,8 @@ def create_app(watch: bool = False) -> FastAPI:
     @app.get("/api/collections")
     def collections_list() -> dict:
         """Every collection, for the picker and the sidebar."""
-        return {"collections": collection.listing(cfg, index.connect(cfg))}
+        with db() as conn:
+            return {"collections": collection.listing(cfg, conn)}
 
     @app.post("/api/collections/change")
     def collections_change(work_ids: list[str] = Body(embed=True), name: str = Body(embed=True),
@@ -572,22 +602,24 @@ def create_app(watch: bool = False) -> FastAPI:
             changed = collection.change(cfg, work_ids, name, add=add)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
-        conn = index.connect(cfg)
-        copied, not_copied, shared_copies = [], [], []
-        if add and name in shared.folders(cfg):
-            with ingest.exclusive(cfg):
-                result = shared.copy_in(cfg, conn, work_ids, name)
-                if result["copied"]:
-                    scanner.scan(cfg, conn)
-            copied, not_copied = result["copied"], result["refused"]
-        elif not add:
-            shared_copies = shared.copies_of(cfg, conn, changed, name)
-        all_works = works.load_all(cfg)
-        after = {}
-        for work_id in work_ids:
-            if work_id in all_works:
-                after[work_id] = {"collections": index.update_collections(conn, all_works[work_id]),
-                                  "own_collections": collection.explicit(all_works[work_id])}
+        with db() as conn:
+            copied, not_copied, shared_copies = [], [], []
+            if add and name in shared.folders(cfg):
+                with ingest.exclusive(cfg):
+                    result = shared.copy_in(cfg, conn, work_ids, name)
+                    if result["copied"]:
+                        scanner.scan(cfg, conn)
+                copied, not_copied = result["copied"], result["refused"]
+            elif not add:
+                shared_copies = shared.copies_of(cfg, conn, changed, name)
+            unique_ids = list(dict.fromkeys(work_ids))
+            all_works = works.load_all_readonly(cfg) if len(unique_ids) > 20 else None
+            after = {}
+            for work_id in unique_ids:
+                work_rec = all_works.get(work_id) if all_works is not None else works.load_one(cfg, work_id)
+                if work_rec is not None:
+                    after[work_id] = {"collections": index.update_collections(conn, work_rec),
+                                      "own_collections": collection.explicit(work_rec)}
         if changed:
             library_changed()
         return {"name": name, "changed": changed, "works": after,
@@ -606,7 +638,9 @@ def create_app(watch: bool = False) -> FastAPI:
         """A collection's name as refs stores it, refusing one that does not
         exist (so a delete or rename never reports success for nothing)."""
         name = collection.clean_name(name)
-        if name not in {c["name"] for c in collection.listing(cfg, index.connect(cfg))}:
+        with db() as conn:
+            known = {c["name"] for c in collection.listing(cfg, conn)}
+        if name not in known:
             raise collection.Invalid(f"there is no collection #{name}")
         return name
 
@@ -620,9 +654,9 @@ def create_app(watch: bool = False) -> FastAPI:
             count = collection.delete(cfg, name)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
-        conn = index.connect(cfg)
-        index.refresh_derived(cfg, conn)
-        conn.commit()
+        with db() as conn:
+            index.refresh_derived(cfg, conn)
+            conn.commit()
         library_changed()
         collections_moved()
         return {"name": collection.clean_name(name), "papers": count}
@@ -675,7 +709,8 @@ def create_app(watch: bool = False) -> FastAPI:
             if reset:
                 collection.unarrange(cfg, names)
             else:
-                names = collection.arrange(cfg, names, index.connect(cfg), field)
+                with db() as conn:
+                    names = collection.arrange(cfg, names, conn, field)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
         return {"names": names}
@@ -687,7 +722,8 @@ def create_app(watch: bool = False) -> FastAPI:
         else changes: their papers, memberships and #name searches stay."""
         guard(x_refs)
         try:
-            names = collection.set_hidden(cfg, names, hidden, index.connect(cfg))
+            with db() as conn:
+                names = collection.set_hidden(cfg, names, hidden, conn)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
         return {"names": names, "hidden": hidden}
@@ -698,7 +734,8 @@ def create_app(watch: bool = False) -> FastAPI:
         """Pin collections at the top of the sidebar, or unpin them."""
         guard(x_refs)
         try:
-            names = collection.pin(cfg, names, pinned, index.connect(cfg))
+            with db() as conn:
+                names = collection.pin(cfg, names, pinned, conn)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
         return {"names": names, "pinned": pinned}
@@ -713,14 +750,15 @@ def create_app(watch: bool = False) -> FastAPI:
             old, new = existing(old), collection.clean_name(new)
             if old == new:
                 raise collection.Invalid("that is its name already")
-            if any(collection.matches(c["name"], new) for c in collection.listing(cfg, index.connect(cfg))):
-                raise collection.Invalid(f"#{new} exists already")
+            with db() as conn:
+                if any(collection.matches(c["name"], new) for c in collection.listing(cfg, conn)):
+                    raise collection.Invalid(f"#{new} exists already")
             count = collection.rename(cfg, old, new)
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
-        conn = index.connect(cfg)
-        index.refresh_derived(cfg, conn)
-        conn.commit()
+        with db() as conn:
+            index.refresh_derived(cfg, conn)
+            conn.commit()
         library_changed()
         collections_moved()
         return {"old": old, "name": new, "papers": count}
@@ -733,9 +771,10 @@ def create_app(watch: bool = False) -> FastAPI:
         except collection.Invalid as error:
             raise HTTPException(400, str(error))
         terms, filters = _split_query([f"#{name}"])
-        all_works = works.load_all(cfg)
-        ids = dict.fromkeys(i["work_id"] for i in index.search(index.connect(cfg), terms, filters, limit=None)
-                            if i["work_id"] in all_works and "meta" in all_works[i["work_id"]])
+        all_works = works.load_all_readonly(cfg)
+        with db() as conn:
+            ids = dict.fromkeys(i["work_id"] for i in index.search(conn, terms, filters, limit=None)
+                                if i["work_id"] in all_works and "meta" in all_works[i["work_id"]])
         found = sorted((all_works[i] for i in ids), key=lambda w: w["citekey"] or "")
         return {"name": name, "count": len(found), "bibtex": "\n".join(bib.entry(w) for w in found)}
 
@@ -764,7 +803,7 @@ def create_app(watch: bool = False) -> FastAPI:
         """Save your corrections. They override the pipeline and are never overwritten.
         An empty `fields` removes all corrections (back to the pipeline's record)."""
         guard(x_refs)
-        found = works.load_all(cfg).get(work_id)
+        found = works.load_one(cfg, work_id)
         if found is None:
             raise HTTPException(404)
         clean = {k: v for k, v in fields.items() if k in works.EDITABLE and v not in ("", None)}
@@ -779,7 +818,7 @@ def create_app(watch: bool = False) -> FastAPI:
     def confirm(work_id: str, x_refs: str | None = Header(default=None)) -> dict:
         """Accept the record as it is: it leaves the review queue."""
         guard(x_refs)
-        found = works.load_all(cfg).get(work_id)
+        found = works.load_one(cfg, work_id)
         if found is None:
             raise HTTPException(404)
         found["user"]["confirmed"] = True
@@ -790,7 +829,7 @@ def create_app(watch: bool = False) -> FastAPI:
                 x_refs: str | None = Header(default=None)) -> dict:
         """Replace the record with the registry's record for a DOI you supply."""
         guard(x_refs)
-        found = works.load_all(cfg).get(work_id)
+        found = works.load_one(cfg, work_id)
         doi = doi.strip().lower().removeprefix("https://doi.org/")
         record = resolve.by_doi(doi) if found and doi else None
         if record is None:
@@ -804,9 +843,10 @@ def create_app(watch: bool = False) -> FastAPI:
 
     # --- review: renames, identical copies, filing -------------------------------------
 
-    def rename_plan() -> tuple[list, list, list]:
-        conn = index.connect(cfg)
-        return rename.plan(cfg, conn, index.search(conn, [], {}, limit=None), works.load_all(cfg))
+    def rename_plan(all_works: dict | None = None) -> tuple[list, list, list]:
+        with db() as conn:
+            loaded = works.load_all_readonly(cfg) if all_works is None else all_works
+            return rename.plan(cfg, conn, index.search(conn, [], {}, limit=None), loaded)
 
     def refused(error: organize.Refused) -> HTTPException:
         return HTTPException(409, str(error))
@@ -815,8 +855,8 @@ def create_app(watch: bool = False) -> FastAPI:
     def renames() -> dict:
         """Every file whose name differs from the house convention, outside
         protected folders. Nothing is renamed until you approve it."""
-        proposals, copies, protected = rename_plan()
-        all_works = works.load_all(cfg)
+        all_works = works.load_all_readonly(cfg)
+        proposals, copies, protected = rename_plan(all_works)
 
         def shape_proposal(proposal) -> dict:
             meta = (all_works.get(proposal.work_id) or {}).get("meta") or {}
@@ -834,37 +874,46 @@ def create_app(watch: bool = False) -> FastAPI:
         can only approve names refs itself proposes."""
         guard(x_refs)
         wanted = set(paths)
-        with ingest.exclusive(cfg):
-            proposals = [p for p in rename_plan()[0] if p.path in wanted]
+        with ingest.exclusive(cfg), db() as conn:
+            proposals = [p for p in rename.plan(cfg, conn, index.search(conn, [], {}, limit=None),
+                                                works.load_all_readonly(cfg))[0] if p.path in wanted]
             done = rename.apply_many(cfg, proposals)
-            scanner.scan(cfg, index.connect(cfg))
+            scanner.scan(cfg, conn)
         return {"done": len(done)}
 
     @app.post("/api/undo")
     def undo(count: int = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
         """Reverse the last `count` renames or moves (the journal is shared with the CLI)."""
         guard(x_refs)
-        with ingest.exclusive(cfg):
+        with ingest.exclusive(cfg), db() as conn:
             restored = rename.undo(cfg, max(0, min(count, 500)))
-            scanner.scan(cfg, index.connect(cfg))
+            scanner.scan(cfg, conn)
         return {"restored": len(restored)}
 
     @app.get("/api/copies")
     def copies() -> dict:
         """Papers stored more than once, each with which copy to keep and what
         to do with the others (keep.py); and the sets kept on purpose."""
-        conn, all_works = index.connect(cfg), works.load_all(cfg)
-        def rows(found, advise: bool):
-            out = []
-            for item in found:
-                row = shape(item, all_works) | {"hash": item["hash"]}
-                if advise:
-                    row["advice"] = keeping.recommend(cfg, conn, all_works.get(item["work_id"] or ""),
-                                                   [loc["path"] for loc in item["locations"]])
-                out.append(row)
-            return out
-        return {"items": rows(organize.copies(cfg, conn), True),
-                "kept": rows(organize.copies(cfg, conn, kept=True), False)}
+        with db() as conn:
+            all_works = works.load_all_readonly(cfg)
+            everything = index.search(conn, [], {}, limit=None)
+            supersedes = dict(conn.execute("SELECT hash, supersedes FROM files").fetchall())
+
+            def rows(found, advise: bool):
+                out = []
+                for item in found:
+                    row = shape(item, all_works) | {"hash": item["hash"]}
+                    if advise:
+                        row["advice"] = keeping.recommend(
+                            cfg, conn, all_works.get(item["work_id"] or ""),
+                            [loc["path"] for loc in item["locations"]],
+                            supersedes=supersedes,
+                        )
+                    out.append(row)
+                return out
+
+            return {"items": rows(organize.copies(cfg, conn, items=everything), True),
+                    "kept": rows(organize.copies(cfg, conn, kept=True, items=everything), False)}
 
     @app.post("/api/copies/apply")
     def copies_apply(work_ids: list[str] = Body(embed=True), optional: bool = Body(default=False, embed=True),
@@ -873,12 +922,12 @@ def create_app(watch: bool = False) -> FastAPI:
         it marks "trash" (and "trash?" when `optional`), then give the kept
         copy its tidy name. Recomputed here, never taken from the page."""
         guard(x_refs)
-        all_works = works.load_all(cfg)
+        unique_ids = list(dict.fromkeys(work_ids))
+        all_works = works.load_all(cfg) if len(unique_ids) > 20 else None
         trashed, renamed, refused = [], [], []
-        with ingest.exclusive(cfg):
-            conn = index.connect(cfg)
-            for work_id in dict.fromkeys(work_ids):
-                work = all_works.get(work_id)
+        with ingest.exclusive(cfg), db() as conn:
+            for work_id in unique_ids:
+                work = all_works.get(work_id) if all_works is not None else works.load_one(cfg, work_id)
                 if work is None:
                     continue
                 result = keeping.apply(cfg, conn, work, library.paths_of(conn, work_id), optional=optional)
@@ -911,8 +960,7 @@ def create_app(watch: bool = False) -> FastAPI:
     def trash(path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
         """Move one copy to the macOS Trash (never the last copy)."""
         guard(x_refs)
-        with ingest.exclusive(cfg):
-            conn = index.connect(cfg)
+        with ingest.exclusive(cfg), db() as conn:
             try:
                 organize.trash(cfg, conn, path)
             except organize.Refused as error:
@@ -923,15 +971,15 @@ def create_app(watch: bool = False) -> FastAPI:
     @app.get("/api/folders")
     def folders() -> dict:
         """Where a PDF can be filed (for the "file to…" picker)."""
-        return {"folders": organize.destinations(cfg, index.connect(cfg))}
+        with db() as conn:
+            return {"folders": organize.destinations(cfg, conn)}
 
     @app.post("/api/move")
     def move(path: str = Body(embed=True), folder: str = Body(embed=True),
              x_refs: str | None = Header(default=None)) -> dict:
         """File a PDF into another folder. Undo with the rename journal."""
         guard(x_refs)
-        with ingest.exclusive(cfg):
-            conn = index.connect(cfg)
+        with ingest.exclusive(cfg), db() as conn:
             try:
                 new_path = organize.move(cfg, conn, path, folder)
             except organize.Refused as error:
@@ -944,8 +992,7 @@ def create_app(watch: bool = False) -> FastAPI:
              x_refs: str | None = Header(default=None)) -> dict:
         """Copy a PDF into another folder; the original stays. Undo trashes the copy."""
         guard(x_refs)
-        with ingest.exclusive(cfg):
-            conn = index.connect(cfg)
+        with ingest.exclusive(cfg), db() as conn:
             try:
                 new_path = organize.copy(cfg, conn, path, folder)
             except organize.Refused as error:
@@ -963,8 +1010,7 @@ def create_app(watch: bool = False) -> FastAPI:
         guard(x_refs)
         if mode not in {"move", "copy"}:
             raise HTTPException(400, "mode is move or copy")
-        with ingest.exclusive(cfg):
-            conn = index.connect(cfg)
+        with ingest.exclusive(cfg), db() as conn:
             try:
                 folder = organize.make_folder(cfg, folder) if create else folder.strip("/")
             except organize.Refused as error:
@@ -996,7 +1042,8 @@ def create_app(watch: bool = False) -> FastAPI:
     def downloads_list() -> dict:
         """The PDFs directly in the Downloads folder, newest first, each with
         whether it looks like a paper and whether refs has it already."""
-        found = downloads.listing(cfg, index.connect(cfg))
+        with db() as conn:
+            found = downloads.listing(cfg, conn)
         return found | {"setting": str(cfg.downloads_folder or ""), "dump": cfg.dump,
                         "where": settings._home(found["folder"]) if found["folder"] else ""}
 
@@ -1012,8 +1059,7 @@ def create_app(watch: bool = False) -> FastAPI:
         and reported in `known`. Names only: nothing outside Downloads, and
         nothing in its subfolders, can be named."""
         guard(x_refs)
-        with ingest.exclusive(cfg):              # the watcher must not read them half-moved
-            conn = index.connect(cfg)
+        with ingest.exclusive(cfg), db() as conn:              # the watcher must not read them half-moved
             try:
                 if create and folder:
                     folder = organize.make_folder(cfg, folder)
@@ -1040,7 +1086,8 @@ def create_app(watch: bool = False) -> FastAPI:
         byte for byte. Anything refs does not have is refused and stays."""
         guard(x_refs)
         try:
-            result = downloads.trash_known(cfg, index.connect(cfg), names)
+            with db() as conn:
+                result = downloads.trash_known(cfg, conn, names)
         except organize.Refused as error:
             raise refused(error)
         return {"trashed": [{"name": n, "path": p} for n, p in result["trashed"]],
@@ -1051,9 +1098,9 @@ def create_app(watch: bool = False) -> FastAPI:
                   x_refs: str | None = Header(default=None)) -> dict:
         """Open a PDF in the default viewer, or show it in Finder."""
         guard(x_refs)
-        conn = index.connect(cfg)
-        if conn.execute("SELECT 1 FROM paths WHERE path=?", (path,)).fetchone() is None:
-            raise HTTPException(404)
+        with db() as conn:
+            if conn.execute("SELECT 1 FROM paths WHERE path=?", (path,)).fetchone() is None:
+                raise HTTPException(404)
         subprocess.run(["open", *(["-R"] if reveal else []), str(cfg.absolute(path))])
         return {"ok": True}
 
@@ -1070,8 +1117,10 @@ def create_app(watch: bool = False) -> FastAPI:
         if watcher is not None:
             watcher.reconfigure(new_cfg)
         else:
-            threading.Thread(target=lambda: scanner.scan(new_cfg, index.connect(new_cfg)),
-                             daemon=True).start()
+            def _scan_bg() -> None:
+                with closing(index.connect(new_cfg)) as bg_conn:
+                    scanner.scan(new_cfg, bg_conn)
+            threading.Thread(target=_scan_bg, daemon=True).start()
 
     @app.get("/api/settings")
     def get_settings():
@@ -1158,8 +1207,9 @@ def create_app(watch: bool = False) -> FastAPI:
 
     @app.get("/api/settings/authors")
     def found_authors() -> dict:
-        """Annotation author names in the library's PDFs (a few seconds)."""
-        return {"authors": settings.annotation_authors(cfg, index.connect(cfg))}
+        """Annotation author names in the library's PDFs."""
+        with db() as conn:
+            return {"authors": settings.annotation_authors(cfg, conn)}
 
     @app.post("/api/settings/key")
     def save_key(key: str = Body(embed=True), x_refs: str | None = Header(default=None)):
@@ -1174,7 +1224,8 @@ def create_app(watch: bool = False) -> FastAPI:
     @app.post("/api/scan")
     def rescan(x_refs: str | None = Header(default=None)) -> dict:
         guard(x_refs)
-        report = scanner.scan(cfg, index.connect(cfg))
+        with db() as conn:
+            report = scanner.scan(cfg, conn)
         return {"seen": report.seen, "changes": report.changes}
 
     @app.post("/api/add")
@@ -1223,9 +1274,10 @@ def create_app(watch: bool = False) -> FastAPI:
             raise HTTPException(400, "the PDF did not arrive intact")
         if not body.startswith(b"%PDF"):
             raise HTTPException(400, "what the page gave is not a PDF")
-        known = index.connect(cfg).execute(
-            "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
-            (hashlib.sha256(body).hexdigest(),)).fetchone()
+        with db() as conn:
+            known = conn.execute(
+                "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
+                (hashlib.sha256(body).hexdigest(),)).fetchone()
         if known is not None and known["status"] is not None:
             used = collect_known([known["path"]], collections)
             return {"ok": True, "message": f"Already in the library: {known['path']}"
@@ -1240,7 +1292,8 @@ def create_app(watch: bool = False) -> FastAPI:
     def inbox_list() -> dict:
         """Papers in inbox folders (course folders) and shared folders that the
         library lacks, each with the collection it would go in (inbox.py)."""
-        return inbox.listing(cfg, index.connect(cfg))
+        with db() as conn:
+            return inbox.listing(cfg, conn)
 
     @app.post("/api/inbox/take")
     def inbox_take(choices: list[dict] = Body(embed=True), extra: list[str] = Body(default=[], embed=True),
@@ -1250,19 +1303,18 @@ def create_app(watch: bool = False) -> FastAPI:
         A known paper goes straight into its collections (`choices[].collections`
         plus `extra`); a PDF never read is read as a new one, then filed."""
         guard(x_refs)
-        with ingest.exclusive(cfg):              # the watcher must not read them half-moved
-            conn = index.connect(cfg)
+        with ingest.exclusive(cfg), db() as conn:              # the watcher must not read them half-moved
             result = inbox.take(cfg, conn, choices)
             if result["taken"]:
                 scanner.scan(cfg, conn)
-        conn = index.connect(cfg)
         jobs_started, unread = [], {}
-        for _, new_rel, work_id, names in result["taken"]:
-            names = list(dict.fromkeys([*names, *extra]))
-            if work_id:
-                shared.collect(cfg, conn, [work_id], names)
-            else:                                # read it first; `refs add --to` files it
-                unread.setdefault(tuple(names), []).append(str(cfg.absolute(new_rel)))
+        with db() as conn:
+            for _, new_rel, work_id, names in result["taken"]:
+                names = list(dict.fromkeys([*names, *extra]))
+                if work_id:
+                    shared.collect(cfg, conn, [work_id], names)
+                else:                                # read it first; `refs add --to` files it
+                    unread.setdefault(tuple(names), []).append(str(cfg.absolute(new_rel)))
         for names, paths in unread.items():
             label = Path(paths[0]).name if len(paths) == 1 else f"{len(paths)} PDFs from the inbox"
             jobs_started.append(start_add(paths, label, collections=list(names))["job"])
@@ -1276,9 +1328,9 @@ def create_app(watch: bool = False) -> FastAPI:
     def identify(path: str = Body(embed=True), x_refs: str | None = Header(default=None)) -> dict:
         """Run the pipeline on a PDF that is indexed but was never identified."""
         guard(x_refs)
-        conn = index.connect(cfg)
-        if conn.execute("SELECT 1 FROM paths WHERE path=?", (path,)).fetchone() is None:
-            raise HTTPException(404)
+        with db() as conn:
+            if conn.execute("SELECT 1 FROM paths WHERE path=?", (path,)).fetchone() is None:
+                raise HTTPException(404)
         return start_add(str(cfg.absolute(path)), Path(path).name)
 
     @app.post("/api/upload")
@@ -1293,9 +1345,10 @@ def create_app(watch: bool = False) -> FastAPI:
         if not body.startswith(b"%PDF"):
             raise HTTPException(400, "that file is not a PDF")
         # The same PDF may already be in the library: do not store a second copy.
-        known = index.connect(cfg).execute(
-            "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
-            (hashlib.sha256(body).hexdigest(),)).fetchone()
+        with db() as conn:
+            known = conn.execute(
+                "SELECT p.path, f.status FROM paths p JOIN files f USING(hash) WHERE p.hash=?",
+                (hashlib.sha256(body).hexdigest(),)).fetchone()
         if known is not None and known["status"] is None:
             # On disk, but never identified (an earlier attempt was interrupted).
             return start_add(str(cfg.absolute(known["path"])), Path(known["path"]).name, collections=names)

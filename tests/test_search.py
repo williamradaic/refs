@@ -225,3 +225,19 @@ def test_answers_are_stored_as_json(lib):
     ask.search(lib.cfg, lib.conn, ["automobile", "demand", "paper"], {}, mode="force", api=api)
     row = lib.conn.execute("SELECT answer FROM asks").fetchone()
     assert json.loads(row["answer"]) == []
+
+
+def test_search_loads_surnames_at_most_once_and_only_for_semantic(lib, monkeypatch):
+    calls = 0
+    real_surnames = index.surnames
+
+    def counted(conn):
+        nonlocal calls
+        calls += 1
+        return real_surnames(conn)
+
+    monkeypatch.setattr(index, "surnames", counted)
+    index.search(lib.conn, ["automobile", "demand", "market"], {}, semantic=False)
+    assert calls == 0
+    index.search(lib.conn, ["automobile", "demand", "market"], {}, semantic=True)
+    assert calls == 1

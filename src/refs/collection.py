@@ -21,6 +21,7 @@ only adds those details.
 
 from __future__ import annotations
 
+from functools import lru_cache
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,7 @@ class Invalid(ValueError):
 
 # --- Names ------------------------------------------------------------------------------
 
+@lru_cache(maxsize=4096)
 def clean_name(text: str) -> str:
     """A collection name as stored: "#Econ 220A" -> "econ-220a", "219A / PF" -> "219a/pf"."""
     parts = [re.sub(r"[^a-z0-9._-]+", "-", part.strip().lower()).strip("-")
@@ -253,10 +255,11 @@ def change(cfg: Config, work_ids: list[str], name: str, *, add: bool = True) -> 
     from . import works
 
     name = clean_name(name)
-    all_works = works.load_all(cfg)
+    unique_ids = list(dict.fromkeys(work_ids))
+    all_works = works.load_all(cfg) if len(unique_ids) > 20 else None
     changed = []
-    for work_id in work_ids:
-        work = all_works.get(work_id)
+    for work_id in unique_ids:
+        work = all_works.get(work_id) if all_works is not None else works.load_one(cfg, work_id)
         if work is None:
             continue
         if put(work, name) if add else take(work, name):
@@ -407,32 +410,42 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
 
     from . import works
 
-    all_works = works.load_all(cfg) if all_works is None else all_works
+    all_works = works.load_all_readonly(cfg) if all_works is None else all_works
     registry = load(cfg)
     # Members by collection, from the index (explicit and folder-derived alike).
     members: dict[str, set[str]] = {}
     for row in conn.execute("SELECT work_id, collections FROM files "
                             "WHERE work_id IS NOT NULL AND collections IS NOT NULL"):
+        wid = row["work_id"]
         for name in cleaned(json.loads(row["collections"])):     # an index made before names were cleaned
-            members.setdefault(name, set()).add(row["work_id"])
-    # Works the index has not seen yet (just added) still count by their own field.
+            members.setdefault(name, set()).add(wid)
+    # Works the index has not seen yet (just added) still count by their own field,
+    # and we track which collections have at least one explicit member in O(W).
+    explicit_names: set[str] = set()
     for work_id, work in all_works.items():
         for name in explicit(work):
+            explicit_names.add(name)
             members.setdefault(name, set()).add(work_id)
     folder_born = derived_details(conn)
     # When each paper entered refs, for the dates below.
     entered = {wid: t for wid, w in all_works.items() if (t := _moment(w.get("created"))) is not None}
 
     names = set(members) | set(registry)
-    # A sub-collection's parent is listed even when it has no paper of its own.
+    # A sub-collection's parent is listed even when it has no paper of its own,
+    # and accumulates all descendant memberships in O(C * depth) instead of O(C^2).
+    subtree: dict[str, set[str]] = {n: set(ids) for n, ids in members.items()}
     for name in list(names):
-        while (name := parent(name)) is not None:
-            names.add(name)
+        ids = members.get(name)
+        cur = name
+        while (cur := parent(cur)) is not None:
+            names.add(cur)
+            if ids:
+                subtree.setdefault(cur, set()).update(ids)
     out = []
     for name in sorted(names):
         entry = registry.get(name) or {}
         derived = folder_born.get(name, {})
-        inside = set().union(*(ids for n, ids in members.items() if matches(n, name)))
+        inside = subtree.get(name, set())
         times = [entered[w] for w in inside if w in entered]
         out.append({
             "name": name,
@@ -444,8 +457,7 @@ def listing(cfg: Config, conn: sqlite3.Connection, all_works: dict | None = None
             "order": entry.get("order"),
             "label": entry.get("label"),
             "registered": name in registry,
-            "implicit": name not in registry and bool(derived)
-                        and not any(name in explicit(w) for w in all_works.values()),
+            "implicit": name not in registry and bool(derived) and name not in explicit_names,
             # Some papers are in it because of their folder (a rename leaves those).
             "from_folders": bool(derived),
             "hidden": bool(entry.get("hidden")),

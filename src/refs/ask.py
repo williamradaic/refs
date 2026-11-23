@@ -114,10 +114,12 @@ def unsure(report: dict) -> bool:
 
 
 def spent_this_month(conn: sqlite3.Connection) -> float:
-    conn.executescript(SCHEMA)
     month_start = datetime.now(timezone.utc).strftime("%Y-%m-01")
-    row = conn.execute("SELECT COALESCE(SUM(cost), 0) AS total FROM asks WHERE created >= ?",
-                       (month_start,)).fetchone()
+    try:
+        row = conn.execute("SELECT COALESCE(SUM(cost), 0) AS total FROM asks WHERE created >= ?",
+                           (month_start,)).fetchone()
+    except sqlite3.OperationalError:
+        return 0.0
     return float(row["total"])
 
 
@@ -194,8 +196,11 @@ def search(cfg: Config, conn: sqlite3.Connection, terms: list[str], filters: dic
     key = _key(text, filters, wide)
     by_id = {i["work_id"] or i["hash"]: i for i in wide}
 
-    conn.executescript(SCHEMA)
-    saved = conn.execute("SELECT answer FROM asks WHERE key=?", (key,)).fetchone()
+    try:
+        saved = conn.execute("SELECT answer FROM asks WHERE key=?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        conn.execute(SCHEMA.strip())
+        saved = None
     if saved is not None:
         picks = json.loads(saved["answer"])
         outcome.cached = True
@@ -256,6 +261,7 @@ def _record(conn: sqlite3.Connection, key: str, text: str, picks: list, cost: fl
     A failed call is stored under a key no search will look up again."""
     created = datetime.now(timezone.utc).isoformat(timespec="seconds")
     stored_key = key if save else f"failed:{key}:{created}"
+    conn.execute(SCHEMA.strip())
     conn.execute("INSERT OR REPLACE INTO asks VALUES (?,?,?,?,?)",
                  (stored_key, created, text, json.dumps(picks, ensure_ascii=False), cost))
     conn.commit()

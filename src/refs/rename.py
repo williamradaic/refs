@@ -44,22 +44,29 @@ def proposed_name(work: dict, current_name: str, *, allow_unverified: bool = Fal
     return naming.canonical_name(surnames, meta.get("year"), meta["title"], ocr=is_ocr)
 
 
-def disambiguate(name: str, taken: set[str], is_working_paper: bool) -> str:
+def disambiguate(name: str, taken: set[str] | dict[str, str], is_working_paper: bool,
+                 *, free: str | None = None) -> str:
     """Pick a free name when two different PDFs of one paper sit in the same folder.
 
     The first file to claim a name keeps it (callers offer published versions
     first). A working-paper version then becomes "...-wp.pdf"; anything else,
     or a second working paper, gets "-2", "-3", ...
+    `free`, if given, is a name treated as available even if present in `taken`
+    (the file's own current name, which renaming frees).
     """
-    if name not in taken:
+    if name not in taken or name == free:
         return name
     stem = name.removesuffix(".pdf")
-    if is_working_paper and f"{stem}-wp.pdf" not in taken:
-        return f"{stem}-wp.pdf"
+    if is_working_paper:
+        wp = f"{stem}-wp.pdf"
+        if wp not in taken or wp == free:
+            return wp
     number = 2
-    while f"{stem}-{number}.pdf" in taken:
+    while True:
+        cand = f"{stem}-{number}.pdf"
+        if cand not in taken or cand == free:
+            return cand
         number += 1
-    return f"{stem}-{number}.pdf"
 
 
 def free_name(cfg: Config, rel: str, new_name: str, is_working_paper: bool) -> str | None:
@@ -77,19 +84,25 @@ def free_name(cfg: Config, rel: str, new_name: str, is_working_paper: bool) -> s
     return None if final == current else final
 
 
-def blocked_reason(cfg: Config, rel: str) -> str | None:
-    """Why this file must be left alone, or None if renaming is allowed."""
-    parts = PurePosixPath(rel).parts[:-1]
+def _folder_blocked(cfg: Config, folder_rel: str, no_rename_lower: frozenset[str] | None = None) -> str | None:
+    """Why files in `folder_rel` must be left alone, or None if renaming is allowed."""
+    blocked_names = no_rename_lower if no_rename_lower is not None else frozenset(n.lower() for n in cfg.no_rename)
+    parts = PurePosixPath(folder_rel).parts if folder_rel and folder_rel != "." else ()
     for folder in parts:
-        if folder.lower() in {name.lower() for name in cfg.no_rename}:
+        if folder.lower() in blocked_names:
             return f"inside a managed folder ({folder})"
-    # Walk up from the file's folder: a .git anywhere above means a repository.
-    folder = cfg.absolute(rel).parent
+    # Walk up from the folder: a .git anywhere above means a repository.
+    folder = cfg.absolute(folder_rel) if parts else cfg.dropbox_root
     while folder != cfg.dropbox_root and folder != folder.parent:
         if (folder / ".git").exists():
             return "inside a Git repository"
         folder = folder.parent
     return None
+
+
+def blocked_reason(cfg: Config, rel: str) -> str | None:
+    """Why this file must be left alone, or None if renaming is allowed."""
+    return _folder_blocked(cfg, str(PurePosixPath(rel).parent))
 
 
 def apply(cfg: Config, rel: str, new_name: str, file_hash: str | None = None) -> str | None:
@@ -175,35 +188,60 @@ def plan(cfg: Config, conn: sqlite3.Connection, items: list[dict],
     the same paper gets a "-wp" or "-2" suffix.
     """
     candidates, protected = [], []
+    no_rename_lower = frozenset(n.lower() for n in cfg.no_rename)
+    blocked_cache: dict[str, str | None] = {}
+    path_hashes: dict[str, str] | None = None
+
     for item in items:
         work = all_works.get(item["work_id"] or "")
+        if not work:
+            continue
         for loc in item["locations"]:
-            name = PurePosixPath(loc["path"]).name
-            new_name = work and proposed_name(work, name)
+            rel = loc["path"]
+            folder, sep, name = rel.rpartition("/")
+            if not sep:
+                folder = "."
+            new_name = proposed_name(work, name)
             if not new_name or new_name == name:
                 continue
-            if reason := blocked_reason(cfg, loc["path"]):
-                protected.append((loc["path"], reason))
+            if folder not in blocked_cache:
+                blocked_cache[folder] = _folder_blocked(cfg, folder, no_rename_lower)
+            if reason := blocked_cache[folder]:
+                protected.append((rel, reason))
                 continue
-            file_hash = conn.execute("SELECT hash FROM paths WHERE path=?", (loc["path"],)).fetchone()[0]
+            if path_hashes is None:
+                path_hashes = dict(conn.execute("SELECT path, hash FROM paths").fetchall())
+            file_hash = path_hashes.get(rel)
+            if file_hash is None:
+                continue
             reading = (records.load_read(cfg, file_hash) or {}).get("reading") or {}
-            candidates.append((loc["path"], new_name, file_hash, bool(reading.get("is_working_paper")),
+            candidates.append((rel, new_name, file_hash, bool(reading.get("is_working_paper")),
                                work["id"]))
 
     proposals, copies = [], []
     taken: dict[str, dict[str, str]] = {}          # folder -> {name: hash that owns it}
     for rel, new_name, file_hash, is_wp, work_id in sorted(candidates, key=lambda c: (c[3], c[0])):
-        folder = str(PurePosixPath(rel).parent)
-        names = taken.setdefault(folder, {
-            p.name: "" for p in cfg.absolute(folder).glob("*.pdf")})   # names already on disk
+        folder, sep, current = rel.rpartition("/")
+        if not sep:
+            folder = "."
+        names = taken.get(folder)
+        if names is None:
+            names = {}
+            try:
+                with os.scandir(cfg.absolute(folder)) as entries:
+                    for entry in entries:
+                        if entry.name.lower().endswith(".pdf"):
+                            names[entry.name] = ""
+            except OSError:
+                pass
+            taken[folder] = names
         if names.get(new_name) == file_hash:
             copies.append(rel)                     # same content as a file already planned
             continue
         # The file's own current name is not "taken": renaming frees it. (Counting
         # it turned "x-wp.pdf", next to the published "x.pdf", into "x-2.pdf".)
-        current = PurePosixPath(rel).name
-        others = {n for n, owner in names.items() if not (n == current and owner in ("", file_hash))}
-        final = disambiguate(new_name, others, is_wp)
+        own_free = current if names.get(current) in ("", file_hash) else None
+        final = disambiguate(new_name, names, is_wp, free=own_free)
         if final == current:
             continue                               # already has the right name
         names[final] = file_hash

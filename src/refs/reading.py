@@ -21,9 +21,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pymupdf
+_pymupdf = None
 
-pymupdf.TOOLS.mupdf_display_errors(False)
+
+def _mupdf():
+    """Load PyMuPDF lazily so quick CLI commands never pay its import cost."""
+    global _pymupdf
+    if _pymupdf is None:
+        import pymupdf
+        pymupdf.TOOLS.mupdf_display_errors(False)
+        _pymupdf = pymupdf
+    return _pymupdf
+
 
 RANK = {"unread": 0, "reading": 1, "read": 2}
 
@@ -77,7 +86,7 @@ def survey(path: Path, authors: set[str]) -> dict:
     newest mark's date, ISO, None when the marks carry no date)."""
     found = {"pages": 0, "marked_pages": 0, "marks": 0, "by_author": {}, "latest": None}
     try:
-        doc = pymupdf.open(path)
+        doc = _mupdf().open(path)
     except Exception:                                   # noqa: BLE001 (damaged, encrypted, not a PDF)
         return found
     try:
@@ -108,7 +117,7 @@ def marks_by_author(path: Path) -> dict[str, int]:
     which lets you pick the names that are you."""
     found: dict[str, int] = {}
     try:
-        doc = pymupdf.open(path)
+        doc = _mupdf().open(path)
     except Exception:                                   # noqa: BLE001 (damaged, encrypted, not a PDF)
         return found
     try:

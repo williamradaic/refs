@@ -14,8 +14,10 @@ rebuilt with `refs scan`. Tables:
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import threading
 from pathlib import PurePosixPath
 
 from . import collection, contexts, embed, naming, notes, query, reading, records, works
@@ -72,6 +74,9 @@ CREATE TABLE IF NOT EXISTS paths (
     topic_order INTEGER
 );
 CREATE INDEX IF NOT EXISTS paths_hash ON paths(hash);
+CREATE INDEX IF NOT EXISTS paths_context ON paths(context);
+CREATE INDEX IF NOT EXISTS files_work_id ON files(work_id);
+CREATE INDEX IF NOT EXISTS files_status ON files(status);
 
 CREATE TABLE IF NOT EXISTS events (
     id       INTEGER PRIMARY KEY,
@@ -89,17 +94,45 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
 """
 
 
+# Verified schema cache: (resolved_path, st_dev, st_ino) -> PRAGMA schema_version.
+# Any DDL change (CREATE/ALTER/DROP) bumps SQLite's schema_version cookie, and
+# deleting/recreating the DB changes st_ino, so the cache is never stale.
+_verified_dbs: dict[tuple[str, int, int], int] = {}
+_verified_lock = threading.Lock()
+
+
 def connect(cfg: Config) -> sqlite3.Connection:
     """Open (and if needed create) the index."""
     cfg.index_db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(cfg.index_db, timeout=30)
     conn.row_factory = sqlite3.Row            # rows behave like dictionaries
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    conn.execute("PRAGMA cache_size = -16000")
+
+    # Fast path: this DB file was already verified and its SQLite schema_version
+    # cookie has not changed, so skip WAL setup and metadata queries.
+    db_key: tuple[str, int, int] | None = None
+    try:
+        st = cfg.index_db.stat()
+        db_key = (str(cfg.index_db.resolve()), st.st_dev, st.st_ino)
+    except OSError:
+        pass
+    cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
+    if db_key is not None:
+        with _verified_lock:
+            if _verified_dbs.get(db_key) == cookie:
+                return conn
+
     conn.execute("PRAGMA journal_mode = WAL")  # lets a reader and a writer coexist
 
     # The usual case: the index is already as this version wants it. Then
     # nothing is written, so opening it never waits for a scan that holds the
     # write lock (the web page opens the index on every request).
     if _schema_current(conn):
+        if db_key is not None:
+            with _verified_lock:
+                _verified_dbs[db_key] = conn.execute("PRAGMA schema_version").fetchone()[0]
         return conn
 
     # An index from an older version of the program is thrown away, not migrated:
@@ -135,6 +168,14 @@ def connect(cfg: Config) -> sqlite3.Connection:
     if rebuild_search:
         refresh_derived(cfg, conn)
     conn.commit()
+    try:
+        st = cfg.index_db.stat()
+        with _verified_lock:
+            _verified_dbs[(str(cfg.index_db.resolve()), st.st_dev, st.st_ino)] = (
+                conn.execute("PRAGMA schema_version").fetchone()[0]
+            )
+    except OSError:
+        pass
     return conn
 
 
@@ -145,12 +186,13 @@ ADDED_COLUMNS = [("pages", "INTEGER"), ("marked_pages", "INTEGER"), ("marks", "I
 
 # What connect() creates, so it can tell, by reading only, that there is nothing to do.
 _TABLES = {"meta", "files", "paths", "events", "search", "vectors"}
+_INDEXES = {"paths_hash", "paths_context", "files_work_id", "files_status"}
 
 
 def _schema_current(conn: sqlite3.Connection) -> bool:
     """Is this the current schema, with every table, index and added column?"""
     names = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
-    if not (_TABLES | {"paths_hash"}) <= names:
+    if not (_TABLES | _INDEXES) <= names:
         return False
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     if row is None or row["value"] != str(SCHEMA_VERSION):
@@ -198,40 +240,64 @@ def _ancestors(file_hash: str, supersedes: dict[str, str | None]) -> list[str]:
     return chain
 
 
+def _reading_rank(e: tuple[int, int, int]) -> tuple[int, int]:
+    return (reading.RANK.get(reading.detect(e[0], e[1]), -1), e[1])
+
+
 def _detect_reading(cfg: Config, conn: sqlite3.Connection, all_works: dict) -> list[dict]:
     """Update each work's detected read status from its files' markup, and copy
     read status and queue time into `files` for the filters. Returns the works
     that just became read by detection and so left the queue."""
     best: dict[str, tuple[int, int, int]] = {}
+    best_rank: dict[str, tuple[int, int]] = {}
     for row in conn.execute(
             "SELECT work_id, pages, marked_pages, marks FROM files WHERE work_id IS NOT NULL "
             "AND marked_pages IS NOT NULL AND hash IN (SELECT hash FROM paths)"):
+        wid = row["work_id"]
         evidence = (row["pages"], row["marked_pages"], row["marks"])
-        current = best.get(row["work_id"])
-        rank = lambda e: (reading.RANK.get(reading.detect(e[0], e[1]), -1), e[1])  # noqa: E731
-        if current is None or rank(evidence) > rank(current):
-            best[row["work_id"]] = evidence
+        r = _reading_rank(evidence)
+        if wid not in best_rank or r > best_rank[wid]:
+            best[wid] = evidence
+            best_rank[wid] = r
 
     finished = []
+    wdir = works.works_dir(cfg)
     for work_id, work in all_works.items():
-        if work_id not in best:
+        evidence = best.get(work_id)
+        if evidence is None:
             continue
-        before = json.dumps(work, sort_keys=True)
-        if reading.apply_detection(work, best[work_id]):
+        prev_auto = work.get("read_auto")
+        prev_auto_copy = dict(prev_auto) if prev_auto is not None else None
+        prev_queued = work["user"].get("queued")
+        if reading.apply_detection(work, evidence):
             finished.append(work)
-        if json.dumps(work, sort_keys=True) != before:     # write only what changed
-            records.write_json(works.works_dir(cfg) / f"{work_id}.json", work)
+        if work.get("read_auto") != prev_auto_copy or work["user"].get("queued") != prev_queued:
+            records.write_json(wdir / f"{work_id}.json", work)
 
-    for work_id, work in all_works.items():
-        conn.execute("UPDATE files SET read_status=?, queued=? WHERE work_id=?",
-                     (reading.effective(work)[0], work["user"].get("queued"), work_id))
+    if all_works:
+        conn.executemany(
+            "UPDATE files SET read_status=?, queued=? WHERE work_id=?",
+            [(reading.effective(work)[0], work["user"].get("queued"), work_id)
+             for work_id, work in all_works.items()],
+        )
     return finished
 
 
 # --- Provisional document kind ------------------------------------------------
 
+_SYLLABUS_RE = re.compile(r"syllab|reading[ _-]?list")
+_PSET_RE = re.compile(
+    r"problem[ _-]?set|pset|(?<![a-z])ps[ _-]?\d|homework|(?<![a-z])hw[ _-]?\d"
+    r"|solutions?(?![a-z])|exams?(?![a-z])|midterm|(?<![a-z])final(?![a-z ]| paper)"
+)
+_SLIDES_RE = re.compile(
+    r"slides?(?![a-z])|lecture|handout|(?<![a-z])week[ _-]?\d|class[ _-]?\d"
+    r"|(?<![a-z])sections?(?![a-z])"
+)
+
+
 def guess_kind(rel: str, ctx: contexts.Context, guess: naming.NameGuess,
-               material_dirs: list[str] = ()) -> str:
+               material_dirs: list[str] | set[str] | frozenset[str] = ()) -> str:
     """First, cheap guess at what a PDF is, from its name and folder alone.
 
     Phase 2 replaces this with a classification that actually reads the PDF.
@@ -251,22 +317,22 @@ def guess_kind(rel: str, ctx: contexts.Context, guess: naming.NameGuess,
     # Otherwise look for tell-tale words, first in the file name, then in the
     # folders above it ("Problem Sets/coding/plot.pdf").
     for text in (name, folders):
-        if re.search(r"syllab|reading[ _-]?list", text):
+        if _SYLLABUS_RE.search(text):
             return "syllabus"
         if text is folders and "reading" in text:
             break       # inside a readings folder: leave it to the rules below
-        if re.search(r"problem[ _-]?set|pset|(?<![a-z])ps[ _-]?\d|homework|(?<![a-z])hw[ _-]?\d"
-                     r"|solutions?(?![a-z])|exams?(?![a-z])|midterm|(?<![a-z])final(?![a-z ]| paper)", text):
+        if _PSET_RE.search(text):
             return "problem-set"
         if "notes" in text:
             return "notes"
-        if re.search(r"slides?(?![a-z])|lecture|handout|(?<![a-z])week[ _-]?\d|class[ _-]?\d"
-                     r"|(?<![a-z])sections?(?![a-z])", text):
+        if _SLIDES_RE.search(text):
             return "slides"
 
     # A course-site sync folder (config.toml `material_dirs`, e.g. canvas-sync).
-    if ctx.section and ctx.section.lower() in {d.lower() for d in material_dirs}:
-        return "course-material"
+    if ctx.section:
+        mats = material_dirs if isinstance(material_dirs, frozenset) else {d.lower() for d in material_dirs}
+        if ctx.section.lower() in mats:
+            return "course-material"
     # Anything inside a readings/<topic>/ folder, or named like "Author 2017".
     if ctx.topic or guess.looks_like_paper:
         return "paper"
@@ -290,45 +356,65 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
 
     # 1. Context columns for every path.
     layout = contexts.layout_for(cfg)
+    path_updates = []
     for row in conn.execute("SELECT path, hash FROM paths").fetchall():
-        ctx = layout.derive(row["path"])
-        conn.execute(
+        rel_path = row["path"]
+        ctx = layout.derive(rel_path)
+        path_updates.append((
+            ctx.key, ctx.area, ctx.term, ctx.slug, ctx.section, ctx.topic,
+            ctx.topic_order, rel_path,
+        ))
+        by_hash.setdefault(row["hash"], []).append((rel_path, ctx))
+    if path_updates:
+        conn.executemany(
             "UPDATE paths SET context=?, area=?, term=?, slug=?, section=?, topic=?, "
             "topic_order=? WHERE path=?",
-            (ctx.key, ctx.area, ctx.term, ctx.slug, ctx.section, ctx.topic,
-             ctx.topic_order, row["path"]),
+            path_updates,
         )
-        by_hash.setdefault(row["hash"], []).append((row["path"], ctx))
 
     # 2. Per file: metadata from its read record if the pipeline has processed it,
     #    otherwise the most informative file name among its paths.
     supersedes = dict(conn.execute("SELECT hash, supersedes FROM files").fetchall())
     file_to_work = works.sync(cfg)          # also writes new or changed work files
     all_works = works.load_all(cfg)
+    all_reads = records.load_all_reads(cfg)
     note_text = notes.bodies(cfg)           # your reading notes, by citekey
+    material_dirs = frozenset(d.lower() for d in cfg.material_dirs)
 
     # Collections (collection.py). A work is in the collections its PDFs'
     # folders stand for, wherever each PDF is, and in those you put it in.
     # Worked out per work first, so every file of a work carries the same
     # list and a filter finds the work through any of its files.
-    def owner(file_hash: str) -> str:
-        versions = _ancestors(file_hash, supersedes)
-        return next((file_to_work[h] for h in versions if h in file_to_work), None) or file_hash
+    versions_by_hash = {h: _ancestors(h, supersedes) for h in by_hash}
+    work_of_hash = {
+        h: next((file_to_work[v] for v in versions if v in file_to_work), None)
+        for h, versions in versions_by_hash.items()
+    }
     from_folders: dict[str, dict[str, None]] = {}       # work id (or hash) -> names, in order
     for file_hash, located in by_hash.items():
-        names = from_folders.setdefault(owner(file_hash), {})
+        names = from_folders.setdefault(work_of_hash[file_hash] or file_hash, {})
         for _, ctx in located:
             if (found := collection.implicit(ctx)) is not None:
                 names[found[0]] = None
 
+    explicit_by_work = {wid: collection.explicit(w) for wid, w in all_works.items()}
+
     def collections_of(work_id: str | None, file_hash: str) -> list[str]:
-        mine = collection.explicit(all_works.get(work_id) or {}) if work_id else []
-        return list(dict.fromkeys([*mine, *from_folders.get(work_id or file_hash, {})]))
+        mine = explicit_by_work.get(work_id, []) if work_id else []
+        extra = from_folders.get(work_id or file_hash)
+        if not extra:
+            return mine
+        if not mine:
+            return list(extra)
+        return list(dict.fromkeys([*mine, *extra]))
 
     conn.execute("DELETE FROM search")
+    file_updates = []
+    search_rows = []
     for file_hash, located in by_hash.items():
         guesses = [(naming.parse_filename(PurePosixPath(p).name), p, ctx) for p, ctx in located]
-        guesses.sort(key=lambda item: _STYLE_RANK[item[0].style])
+        if len(guesses) > 1:
+            guesses.sort(key=lambda item: _STYLE_RANK[item[0].style])
         best, best_path, best_ctx = guesses[0]
 
         # Merge identifiers from all names (one copy may be "w32515.pdf").
@@ -339,14 +425,14 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
         # Defaults: guessed from names and folders.
         kind_ctx = next((ctx for _, _, ctx in guesses if ctx.topic), best_ctx)
         title, authors, year = best.title, best.authors, best.year
-        kind, kind_source = guess_kind(best_path, kind_ctx, best, cfg.material_dirs), "path"
+        kind, kind_source = guess_kind(best_path, kind_ctx, best, material_dirs), "path"
         status = venue = doi = description = None
         tags: list[str] = []
 
         # An edited file (annotated, say) has a new hash but is the same document:
         # fall back to the read record of the versions it replaced.
-        versions = _ancestors(file_hash, supersedes)
-        read = next((r for h in versions if (r := records.load_read(cfg, h)) is not None), None)
+        versions = versions_by_hash[file_hash]
+        read = next((r for h in versions if (r := all_reads.get(h)) is not None), None)
         if read is not None:
             status = read["status"]
             if registry := read.get("registry"):       # confidential files: ids only
@@ -363,7 +449,7 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
 
         # A file that belongs to a work shows the work's metadata: a working
         # paper filed under its published version is listed as that publication.
-        work_id = next((file_to_work[h] for h in versions if h in file_to_work), None)
+        work_id = work_of_hash[file_hash]
         citekey = None
         former_names: list[str] = []
         if work_id and "meta" in all_works.get(work_id, {}):
@@ -374,41 +460,51 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
             venue, doi, status = meta.get("venue"), meta.get("doi"), meta.get("status")
             # Your own tags join the model's (no repeats, order kept); collections
             # are kept apart, in their own column (collection.py).
-            tags = list(dict.fromkeys([*tags, *work["user"].get("tags", [])]))
+            user_tags = work["user"].get("tags")
+            if user_tags:
+                tags = list(dict.fromkeys([*tags, *user_tags]))
             ids.update({f"alias{n}": a for n, a in enumerate(
                 [*work.get("aliases", []), *work.get("bib_keys", {})])})
             former_names = work["user"].get("former_names", [])
 
-        conn.execute(
-            "UPDATE files SET g_title=?, g_authors=?, g_year=?, g_ids=?, kind=?, kind_source=?, "
-            "status=?, venue=?, doi=?, description=?, tags=?, work_id=?, citekey=?, collections=? "
-            "WHERE hash=?",
-            (title, json.dumps(authors, ensure_ascii=False), year, json.dumps(ids), kind,
-             kind_source, status, venue, doi, description,
-             json.dumps(tags, ensure_ascii=False), work_id, citekey,
-             json.dumps(collections_of(work_id, file_hash), ensure_ascii=False), file_hash),
-        )
+        cols = collections_of(work_id, file_hash)
+        file_updates.append((
+            title, json.dumps(authors, ensure_ascii=False), year, json.dumps(ids), kind,
+            kind_source, status, venue, doi, description,
+            json.dumps(tags, ensure_ascii=False), work_id, citekey,
+            json.dumps(cols, ensure_ascii=False), file_hash,
+        ))
 
         # 3. One search row per file. `aliases` holds author initials, so that
         #    "blp" finds Berry-Levinsohn-Pakes.
         initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
-        conn.execute(
+        search_rows.append((
+            file_hash,
+            title or "",
+            " ".join(authors),
+            " ".join(filter(None, [initials, citekey, *ids.values()])),
+            " ".join([*(PurePosixPath(p).stem for p, _ in located),
+                      *(PurePosixPath(n).stem for n in former_names)]),
+            " ".join([*(f"{ctx.key} {ctx.topic or ''} {ctx.section or ''}" for _, ctx in located),
+                      *cols]),
+            venue or "",
+            " ".join(tags),
+            description or "",
+            note_text.get(citekey or "", ""),
+        ))
+
+    if file_updates:
+        conn.executemany(
+            "UPDATE files SET g_title=?, g_authors=?, g_year=?, g_ids=?, kind=?, kind_source=?, "
+            "status=?, venue=?, doi=?, description=?, tags=?, work_id=?, citekey=?, collections=? "
+            "WHERE hash=?",
+            file_updates,
+        )
+    if search_rows:
+        conn.executemany(
             "INSERT INTO search (hash, title, authors, aliases, filename, context, venue, tags, "
             "description, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                file_hash,
-                title or "",
-                " ".join(authors),
-                " ".join(filter(None, [initials, citekey, *ids.values()])),
-                " ".join([*(PurePosixPath(p).stem for p, _ in located),
-                          *(PurePosixPath(n).stem for n in former_names)]),
-                " ".join([*(f"{ctx.key} {ctx.topic or ''} {ctx.section or ''}" for _, ctx in located),
-                          *collections_of(work_id, file_hash)]),
-                venue or "",
-                " ".join(tags),
-                description or "",
-                note_text.get(citekey or "", ""),
-            ),
+            search_rows,
         )
 
     # 4. Read status: detected from your markup, laid under what you set.
@@ -418,32 +514,42 @@ def refresh_derived(cfg: Config, conn: sqlite3.Connection) -> list[dict]:
     #    Zotero) get a stand-in row, so they can be found like any other.
     conn.execute("DELETE FROM files WHERE hash LIKE 'work:%'")
     with_files = {file_to_work[h] for h in by_hash if h in file_to_work}
+    stub_files = []
+    stub_search = []
     for work_id, work in all_works.items():
         if work_id in with_files or "meta" not in work:
             continue
         meta, user = work["meta"], work["user"]
         authors = [a["family"] for a in meta.get("authors") or [] if a.get("family")]
         tags = list(dict.fromkeys([*work.get("tags", []), *user.get("tags", [])]))
-        conn.execute(
+        cols = explicit_by_work.get(work_id, [])
+        stub_files.append((
+            f"work:{work_id}", 0, work["created"], work_id, work["citekey"], meta.get("kind"),
+            "work", meta.get("title"), json.dumps(authors, ensure_ascii=False), meta.get("year"),
+            "{}", "no-file", meta.get("venue"), meta.get("doi"), work.get("description"),
+            json.dumps(tags, ensure_ascii=False), reading.effective(work)[0], user.get("queued"),
+            json.dumps(cols, ensure_ascii=False),
+        ))
+        initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
+        stub_search.append((
+            f"work:{work_id}", meta.get("title") or "", " ".join(authors),
+            " ".join(filter(None, [initials, work["citekey"], *work.get("aliases", []),
+                                   *work.get("bib_keys", {})])),
+            "", " ".join(cols), meta.get("venue") or "", " ".join(tags),
+            work.get("description") or "",
+            note_text.get(work["citekey"], ""),
+        ))
+    if stub_files:
+        conn.executemany(
             "INSERT INTO files (hash, size, first_seen, work_id, citekey, kind, kind_source, "
             "g_title, g_authors, g_year, g_ids, status, venue, doi, description, tags, "
             "read_status, queued, collections) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (f"work:{work_id}", 0, work["created"], work_id, work["citekey"], meta.get("kind"),
-             "work", meta.get("title"), json.dumps(authors, ensure_ascii=False), meta.get("year"),
-             "{}", "no-file", meta.get("venue"), meta.get("doi"), work.get("description"),
-             json.dumps(tags, ensure_ascii=False), reading.effective(work)[0], user.get("queued"),
-             json.dumps(collection.explicit(work), ensure_ascii=False)),
+            stub_files,
         )
-        initials = "".join(a[0] for a in authors if a) if len(authors) >= 2 else ""
-        conn.execute(
+        conn.executemany(
             "INSERT INTO search (hash, title, authors, aliases, filename, context, venue, tags, "
             "description, notes) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (f"work:{work_id}", meta.get("title") or "", " ".join(authors),
-             " ".join(filter(None, [initials, work["citekey"], *work.get("aliases", []),
-                                    *work.get("bib_keys", {})])),
-             "", " ".join(collection.explicit(work)), meta.get("venue") or "", " ".join(tags),
-             work.get("description") or "",
-             note_text.get(work["citekey"], "")),
+            stub_search,
         )
     return finished
 
@@ -589,66 +695,105 @@ def search(
         # The model gets the words as typed. Spelling out "IO" here would make
         # the field outweigh the topic ("IO paper on ice cream" then finds IO
         # syllabi); the keyword side already matches the expansion.
-        lookup_only = all(query.is_lookup(t, surnames(conn)) for t in terms)
-        if semantic and not lookup_only and (wide or len(terms) >= 2 or not rows):
-            ranked = embed.rank(conn, " ".join(terms))
-            if ranked:
-                top = ranked[0][1]
-                if report is not None:
-                    report.update(semantic_used=True, top_similarity=round(top, 4),
-                                  margin=round(top - ranked[min(4, len(ranked) - 1)][1], 4))
-                if not wide:
-                    ranked = [(u, s) for u, s in ranked
-                              if s >= max(SEMANTIC_FLOOR, top - SEMANTIC_BAND)]
-                ranked = ranked[:SEMANTIC_DEPTH]
-                # Reciprocal rank fusion: each list contributes 1 / (K + rank).
-                # A keyword hit gets a hair more, so a tie goes to the exact match.
-                score: dict[str, float] = {}
-                for position, row in enumerate(rows):
-                    score.setdefault(embed.unit_of(row), 1 / (RRF_K + position) + 1e-6)
-                for position, (unit, _) in enumerate(ranked):
-                    score[unit] = score.get(unit, 0.0) + 1 / (RRF_K + position)
-                rows = [r for r in conn.execute("SELECT * FROM files") if embed.unit_of(r) in score]
-                rows.sort(key=lambda r: -score[embed.unit_of(r)])
+        if semantic and (wide or len(terms) >= 2 or not rows):
+            known_surnames = surnames(conn)
+            lookup_only = all(query.is_lookup(t, known_surnames) for t in terms)
+            if not lookup_only:
+                ranked = embed.rank(conn, " ".join(terms))
+                if ranked:
+                    top = ranked[0][1]
+                    if report is not None:
+                        report.update(semantic_used=True, top_similarity=round(top, 4),
+                                      margin=round(top - ranked[min(4, len(ranked) - 1)][1], 4))
+                    if not wide:
+                        ranked = [(u, s) for u, s in ranked
+                                  if s >= max(SEMANTIC_FLOOR, top - SEMANTIC_BAND)]
+                    ranked = ranked[:SEMANTIC_DEPTH]
+                    # Reciprocal rank fusion: each list contributes 1 / (K + rank).
+                    # A keyword hit gets a hair more, so a tie goes to the exact match.
+                    score: dict[str, float] = {}
+                    for position, row in enumerate(rows):
+                        score.setdefault(embed.unit_of(row), 1 / (RRF_K + position) + 1e-6)
+                    for position, (unit, _) in enumerate(ranked):
+                        score[unit] = score.get(unit, 0.0) + 1 / (RRF_K + position)
+                    wanted_units = list(score)
+                    if not wanted_units:
+                        rows = []
+                    elif len(wanted_units) <= 400:
+                        placeholders = ",".join("?" * len(wanted_units))
+                        rows = conn.execute(
+                            f"SELECT * FROM files WHERE work_id IN ({placeholders}) "
+                            f"OR hash IN ({placeholders})",
+                            [*wanted_units, *wanted_units],
+                        ).fetchall()
+                        rows = [r for r in rows if embed.unit_of(r) in score]
+                        rows.sort(key=lambda r: -score[embed.unit_of(r)])
+                    else:
+                        rows = [r for r in conn.execute("SELECT * FROM files")
+                                if embed.unit_of(r) in score]
+                        rows.sort(key=lambda r: -score[embed.unit_of(r)])
     else:
         rows = conn.execute("SELECT * FROM files").fetchall()
 
     locations: dict[str, list[sqlite3.Row]] = {}
-    for loc in conn.execute("SELECT * FROM paths ORDER BY path"):
-        locations.setdefault(loc["hash"], []).append(loc)
+    if terms and len(rows) <= 250:
+        hashes = [r["hash"] for r in rows if not r["hash"].startswith("work:")]
+        if hashes:
+            placeholders = ",".join("?" * len(hashes))
+            for loc in conn.execute(
+                f"SELECT * FROM paths WHERE hash IN ({placeholders}) ORDER BY path", hashes
+            ):
+                locations.setdefault(loc["hash"], []).append(loc)
+    elif rows:
+        for loc in conn.execute("SELECT * FROM paths ORDER BY path"):
+            locations.setdefault(loc["hash"], []).append(loc)
+
+    # Pre-parse filter arguments once instead of inside the per-row loop.
+    filter_items = list(filters.items())
+    collection_filters = [(key, wanted.split(",")) for key, wanted in filter_items
+                          if key in {"collection", "course", "project"}]
+    path_filters = [(key, wanted, key in {"context", "topic"}) for key, wanted in filter_items
+                    if key in PATH_FILTERS]
+    tag_wanted = filters["tag"].replace("-", " ") if "tag" in filters else None
+    queued_wanted = filters["queued"] in {"yes", "true", "1"} if "queued" in filters else None
+    kind_wanted = filters.get("kind")
+    year_wanted = filters.get("year")
+    author_wanted = filters.get("author")
+    status_wanted = filters.get("status")
+    read_wanted = filters.get("read")
 
     def passes(row: sqlite3.Row, locs: list[sqlite3.Row]) -> bool:
-        for key, wanted in filters.items():
-            if key == "kind" and (row["kind"] or "") != wanted:
-                return False
-            if key == "year" and str(row["g_year"] or "") != wanted:
-                return False
-            if key == "author" and wanted not in (row["g_authors"] or "").lower():
-                return False
-            if key == "status" and (row["status"] or "unprocessed") != wanted:
-                return False
-            if key == "tag" and wanted.replace("-", " ") not in (row["tags"] or "").lower():
-                return False
-            if key == "read" and (row["read_status"] or "") != wanted:
-                return False
-            if key == "queued" and bool(row["queued"]) != (wanted in {"yes", "true", "1"}):
-                return False
-            if key in {"collection", "course", "project"}:
-                have = collection.cleaned(json.loads(row["collections"] or "[]"))
+        if kind_wanted is not None and (row["kind"] or "") != kind_wanted:
+            return False
+        if year_wanted is not None and str(row["g_year"] or "") != year_wanted:
+            return False
+        if author_wanted is not None and author_wanted not in (row["g_authors"] or "").lower():
+            return False
+        if status_wanted is not None and (row["status"] or "unprocessed") != status_wanted:
+            return False
+        if tag_wanted is not None and tag_wanted not in (row["tags"] or "").lower():
+            return False
+        if read_wanted is not None and (row["read_status"] or "") != read_wanted:
+            return False
+        if queued_wanted is not None and bool(row["queued"]) != queued_wanted:
+            return False
+        if collection_filters:
+            have = collection.cleaned(json.loads(row["collections"] or "[]"))
+            for key, names in collection_filters:
                 # Several #names (joined with commas) must all hold; a parent
                 # takes in its sub-collections.
-                for name in wanted.split(","):
+                for name in names:
                     in_it = any(collection.matches(n, name) for n in have)
                     by_folder = key != "collection" and any((loc["slug"] or "").lower() == name
                                                             for loc in locs)
                     if not (in_it or by_folder):
                         return False
-            if key in PATH_FILTERS:
-                def hit(loc: sqlite3.Row) -> bool:
-                    value = (loc[key] or "").lower()
-                    # context and topic match loosely; the rest must be exact.
-                    return wanted in value if key in {"context", "topic"} else value == wanted
-                if not any(hit(loc) for loc in locs):
+        for key, wanted, loose in path_filters:
+            if loose:
+                if not any(wanted in (loc[key] or "").lower() for loc in locs):
+                    return False
+            else:
+                if not any((loc[key] or "").lower() == wanted for loc in locs):
                     return False
         return True
 

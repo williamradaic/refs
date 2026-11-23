@@ -154,7 +154,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     }
     # Citation keys learned from project .bib files (bibkeys.py).
     from . import bibkeys, works
-    all_works = works.load_all(cfg)
+    all_works = works.load_all_readonly(cfg)
     data["bib_files"] = [bibkeys.label(cfg, p) for p in bibkeys.bib_paths(cfg)]
     data["works_with_project_keys"] = sum(1 for w in all_works.values() if w.get("bib_keys"))
     if args.json:
@@ -188,12 +188,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_find(args: argparse.Namespace) -> int:
-    from . import ask
+def _strip_force(words: list[str]) -> tuple[list[str], bool]:
+    """A leading "?" means ask Haiku (mirrors ask.strip_force without importing ask)."""
+    if words and words[0].startswith("?"):
+        first = words[0][1:]
+        return ([first] if first else []) + words[1:], True
+    return words, False
 
+
+def cmd_find(args: argparse.Namespace) -> int:
     cfg = config.load()
     conn = index.connect(cfg)
-    words, forced = ask.strip_force(args.query)
+    words, forced = _strip_force(args.query)
     terms, filters = _split_query(words)
     # Haiku is asked automatically only for a person at the terminal: --json
     # (scripts, coding agents) and --local never ask unless the query starts
@@ -201,12 +207,19 @@ def cmd_find(args: argparse.Namespace) -> int:
     mode = ("force" if forced or getattr(args, "force", False)
             else "off" if args.json or args.local else "auto")
     try:
-        outcome = ask.search(cfg, conn, terms, filters, mode=mode)
+        if mode == "off" or not terms:
+            # Avoid importing anthropic/pydantic/pymupdf for local & --json queries.
+            found = index.search(conn, terms, filters, limit=None, semantic=True)
+            message = ""
+        else:
+            from . import ask
+            outcome = ask.search(cfg, conn, terms, filters, mode=mode)
+            found, message = outcome.results, outcome.message
     except ValueError as error:
         print(f"refs: {error}. Filters: #collection, course, project, term, area, in, topic, "
               "section, kind, year, author, status, tag, read, queued.", file=sys.stderr)
         return 2
-    results = outcome.results if args.all else outcome.results[:args.limit]
+    results = found if args.all else found[:args.limit]
 
     if args.json:
         # Absolute paths included so a script can open the file directly.
@@ -214,12 +227,12 @@ def cmd_find(args: argparse.Namespace) -> int:
             for loc in item["locations"]:
                 loc["absolute_path"] = str(cfg.absolute(loc["path"]))
         print(json.dumps(results, indent=2, ensure_ascii=False))
-        if outcome.message:
-            print(f"refs: {outcome.message}", file=sys.stderr)
+        if message:
+            print(f"refs: {message}", file=sys.stderr)
         return 0
 
     if not results:
-        print(f"No matches{f' ({outcome.message})' if outcome.message else ''}.")
+        print(f"No matches{f' ({message})' if message else ''}.")
         return 1
     for item in results:
         label = item["kind"] + (f", {item['status']}" if item["status"] else ", not processed")
@@ -236,8 +249,8 @@ def cmd_find(args: argparse.Namespace) -> int:
             print(f"    {_where(loc)}")
             print(f"      {loc['path']}")
     print(f"\n{_plural(len(results), 'match')}" + ("" if args.all else f" (showing up to {args.limit})"))
-    if outcome.message:
-        print(f"✦ {outcome.message}")
+    if message:
+        print(f"✦ {message}")
     return 0
 
 
@@ -819,7 +832,9 @@ def _collect_on_add(cfg, conn, work: dict, names: list[str] | None) -> None:
         _after_collect(cfg, conn, [work["id"]], name, True, changed)
         print(f"  in #{name}")
     if names:
-        index.update_collections(conn, works.load_all(cfg)[work["id"]])
+        updated = works.load_one(cfg, work["id"])
+        if updated:
+            index.update_collections(conn, updated)
 
 
 def _queue(cfg, work: dict, on: bool = True) -> None:
