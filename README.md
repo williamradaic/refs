@@ -1,353 +1,287 @@
 # refs
 
-A reference manager for the PDFs you already keep in folders: Dropbox, iCloud
-Drive, or any folder on your Mac. Your files stay where they are. refs indexes
-them, works out what each paper is (checked against Crossref and OpenAlex),
-recognises which course or project it belongs to from its folders, and follows
-your folders as you add, move, rename and annotate files.
+A local-first, research-first reference manager for macOS that sits on top of the folders you already sync — Dropbox, iCloud Drive, Google Drive, OneDrive, or any local directory.
 
-- Search by words or by meaning ("IO paper on ice cream"), with a
-  keyboard-driven page at `http://refs.localhost:8377`.
-- BibTeX for any paper or project, and the citation keys your own `.bib`
-  files use.
-- Add a paper from a link, DOI, arXiv id or NBER number; a bookmarklet adds the
-  page you are on.
-- A reading queue, read status detected from your own highlights, and reading
-  notes kept in Obsidian.
-- Coding agents (Claude Code, Codex) can look papers up with it.
+`refs` gives you one clean library folder for your PDFs, flexible project and course collections (including shared coauthor folders), registry-verified metadata, hybrid keyword + local semantic + LLM search, searchable PDF highlights synced to Obsidian, LaTeX/BibTeX workflows, and native support for coding agents (Claude Code, Codex).
 
-refs runs on macOS. It was built by an economist for economists: the fields it
-tags papers with (`llm.py`) are those of economics, though any academic PDFs
-work.
+- **Your files stay yours**: plain PDFs on disk, human-readable JSON records synced alongside them, a rebuildable local index, and a live `library.bib` export. Zero lock-in.
+- **Research-first workspaces**: every project and course gets its own workspace with reading progress, status filters, BibTeX append, batch import, and shared coauthor folder sync.
+- **Keyboard-driven local web UI** at `http://refs.localhost:8377`, paired with a fast CLI (`--json` ready).
 
-## Install
+`refs` runs on macOS. It was built by an economist for economists — its field/method vocabulary (`src/refs/llm.py`) and working-paper workflows reflect economics — though any academic PDF library works.
 
-You need [uv](https://docs.astral.sh/uv/) (`brew install uv`) and an
-[Anthropic API key](https://console.anthropic.com/settings/keys): refs uses
-Claude Haiku to read each new PDF, about $0.001 a paper, billed to your key.
-Obsidian is optional.
+---
+
+## Why `refs`?
+
+Academic reference management usually forces an uncomfortable trade-off:
+
+- **Traditional reference managers** (Zotero, Mendeley, Paperpile) trap PDFs inside opaque internal databases or fight with the tools you actually use: Dropbox/iCloud sync, Preview or iPad PDF annotation, Obsidian vaults, shared coauthor folders, and hand-maintained Overleaf `.bib` files.
+- **Plain folders** give you full ownership and easy access across devices, but break down as soon as a paper belongs to two projects, filenames stay cryptic (`1-s2.0-S0014292123001234-main.pdf`), you lose track of what you read or highlighted, or you remember an idea (*"that IO paper on ice cream"*) rather than an author's name.
+
+On top of that, everyday academic workflows have quirks that most managers ignore:
+- Papers enter your library as NBER working papers, arXiv preprints, SSRN postings, or job market papers and get published in a journal years later.
+- Publishers block automated PDF downloaders while your browser is already signed in through your university library proxy.
+- Coauthors drop and annotate PDFs in shared Dropbox folders.
+- Course folders and `~/Downloads` mix real papers with slides, problem sets, and receipts.
+- Coding agents (Claude Code, Codex) increasingly help with literature reviews and LaTeX writing, and need trustworthy, structured access to *your* library and project citation keys.
+
+`refs` is built around those realities.
+
+---
+
+## Design & Architecture Philosophy
+
+### 1. One canonical library, many collections (research-first)
+Every paper you care about lives **once** in a flat central library folder (your quick-add folder, e.g. `refs-library` or `papers-dump`) under a tidy canonical filename (`surname-year-short-title.pdf`). Research projects and courses are lightweight **collections** (with nested parts such as `219a/public-economics`), not competing folders. A paper can belong to any number of projects and courses without duplicating files.
+
+Folders still play two explicit roles where they actually help:
+- **Shared coauthor folders**: Marking a project collection as *shared* automatically keeps recorded copies in that Dropbox folder for your coauthors, watches for papers they add, and tracks annotations across copies.
+- **Inboxes**: Course folders, Canvas/bCourses sync folders, and `~/Downloads` stay *outside* the main index so slides, problem sets, and receipts never clutter your library. Instead, `refs` scans them locally for paper-like PDFs and lets you pull readings into the library with course and topic pre-filled.
+
+*(If your papers already live across nested course or project folders, `refs` also supports folder-based context rules — see [Folder rules](#folder-rules).)*
+
+### 2. Zero lock-in: plain files, portable state, rebuildable cache
+`refs` separates durable user state from disposable indexes:
+
+| Layer | Location | Role |
+|---|---|---|
+| **Your PDFs** | Your library folder (Dropbox, iCloud, etc.) | Plain files you can open in Preview, annotate on an iPad, or browse in Finder. |
+| **Synced records** | `<library>/.refs/` | Small, versioned JSON files per work (`works/`), read records, `collections.json`, undo journal, annotation backups, and a continuously updated `library.bib`. Syncs across Macs; older versions never overwrite newer schemas. |
+| **Reading notes** | Your Obsidian vault (`<citekey>.md`) | Standard Markdown with YAML front matter. |
+| **Local index** | `~/Library/Application Support/refs/index.db` | Fast SQLite FTS5 index, semantic vectors, cached highlights, and reading ledger — purely a rebuildable cache. |
+
+If you stop using `refs` tomorrow, every PDF has a clean filename, every note is plain Markdown in Obsidian, and `library.bib` carries your full library with JabRef/Zotero-compatible `file` and `keywords` (collections) fields.
+
+### 3. Content-addressed files vs. intellectual works
+`refs` distinguishes a **file** (identified by its SHA-256 content hash and disk inode) from a **work** (one intellectual paper with a permanent, immutable citekey).
+- Move, rename, or highlight a PDF — even offline or on an iPad — and `refs` reconciles it by inode or hash without losing its metadata, collections, notes, or reading history.
+- Multiple copies (e.g., your library copy and a shared coauthor copy, or a working paper alongside its published article) attach cleanly to the same work.
+
+### 4. The reliability rule: *the model never authors a bibliographic fact*
+LLMs are great at reading messy PDF title pages and summarizing papers, and terrible at hallucinating DOIs or page numbers. `refs` enforces a strict division of labor:
+1. **Local extraction** reads the text of the first three pages (or an image of page 1 for scans) and any printed identifiers (DOI, arXiv, NBER, SSRN, JSTOR).
+2. **Claude Haiku** transcribes what is printed, classifies the document kind, and writes a short summary and field/method tags. It is deliberately blind to the filename so the filename remains an independent check.
+3. **Crossref & OpenAlex** supply the authoritative bibliographic record, accepted only if the title is at least 90% similar and at least half the printed authors match, selecting the right version by year.
+4. **Explicit provenance**: Every paper carries a visible status mark (`■ verified`, `▣ confirmed`, `◧ extracted`, `! needs review`) so you always know how much to trust a citation before putting it in a draft.
+
+### 5. Local-first, fast, and scriptable
+The web interface is served strictly on `127.0.0.1` (`http://refs.localhost:8377`) using plain HTML, CSS, and modular ES modules with no frontend build step, full keyboard navigation, and URL hash routing (Back/Forward, reload persistence, and deep links to any work or collection). Everything is equally accessible from the `refs` CLI with `--json` output for scripts and coding agents.
+
+---
+
+## Key Features
+
+### Project & course workspaces
+Open any `#project` or `#course` from the sidebar to enter its dedicated workspace:
+- **Progress & quick filters**: See reading progress at a glance (`read / skimmed / queued`) and slice the collection with one-click pills (`all`, `queued`, `unread`, `reading`, `skimmed`, `read`, `no pdf`).
+- **Workspace actions**: `+ add to #name`, `import list/.bib`, `append to .bib`, `copy BibTeX`, `open folder`, and `open next 5 via proxy` (to quickly grab paywalled stubs through your university library proxy).
+- **Flexible hierarchy & sidebar**: Nest sub-collections with slashes (`219a/public-economics`, automatically included in `219a`). Pin favorites to *Pinned*, drag to reorder projects, sort sections (custom order, A–Z, newest, recently used, size, or term), fold or hide sections and old terms, and act on anything via right-click menus (or `.` on the highlighted paper). Pinning, ordering, and hidden state sync via `collections.json`.
+
+### Capture: 1-click PDF bookmarklet, quick add & resilient batch import
+- **1-click PDF bookmarklet** (`/bookmarklet` → drag **+ refs** to your bookmarks bar): Works on both open PDFs (native browser PDFs, publisher viewers like Wiley/Econometrica, Chicago/JPE, T&F, AEA, OUP, ScienceDirect, SSRN, arXiv, NBER, signed CDNs, and library-proxy sessions) and article pages. It reads the PDF straight from your browser's own authenticated session/cache and uploads it directly into your library folder — no downloading to `~/Downloads`, no hitting Enter, resilient to COOP/CSP/popup blockers. On a paywalled article page with a **library proxy** configured in settings (e.g., `https://libproxy.berkeley.edu/login?qurl=`), it reopens the page through your proxy. A sticky *into* field remembers your target collection during a literature review.
+- **Quick add & drag-and-drop**: Press `a` (or run `refs add`) and paste a URL, DOI, arXiv ID, or NBER number; add `#collection` (Tab-completed, current term's courses first) to file immediately, or press `Shift+Enter` to also queue it. Drag PDFs onto the page (or drop them into your library folder from Finder/iPad/Dropbox) and the watcher picks them up automatically. Paywalled papers are saved as clean `no pdf` stubs that attach automatically once the PDF arrives.
+- **Resilient 3-stage batch importer** (*batch import* in the sidebar): Paste or drop a `.bib` file, a list of DOIs/URLs/arXiv/NBER IDs, or a plain-text syllabus reading list (with optional Claude parsing for messy syllabi):
+  1. **Parse** entries and section/week headings (into sub-collections).
+  2. **Preview & reconcile** against your existing library and Crossref/OpenAlex first — papers you already own are matched and simply tagged into the target collection (zero duplicates).
+  3. **Commit** immediately with verified metadata: reliable open-access PDFs (arXiv, NBER, OpenAlex OA, direct PDFs) download in the background, while paywalled papers enter as clean `no pdf` stubs ready for batch proxy capture.
+- **Downloads & Course Inboxes** (*Review → downloads / inbox*): Scans `~/Downloads`, unindexed course folders, and course-site sync folders locally (for free) to separate real papers from receipts, tickets, and slides. Pull selected papers straight into the library with course/topic pre-filled (moving from `~/Downloads` or copying out of managed sync folders), and safely **trash** `~/Downloads` copies whose exact bytes are already in `refs`.
+
+### 3-tier hybrid search
+Search starts instant and free, escalating to Claude only when needed:
+
+| Tier | What it searches | Cost |
+|---|---|---|
+| **Words (FTS5)** | Prefix-matches every word across title, authors, initials (`blp`), citekeys, project `.bib` keys, filenames, personal & auto tags, summaries, Obsidian notes, and **extracted PDF highlights**. Economics abbreviations (`IO`, `PF`, `RDD`, …) expand to their spelled-out fields. | Free |
+| **Meaning (local)** | On-device embedding model (`fastembed`) matches descriptions against titles, tags, summaries, notes, and highlights — so *"frozen desserts"* finds an ice-cream demand paper. | Free |
+| **Claude Haiku rerank** | Ranks ~40 local candidates and explains *why* each fits. Triggered only when you press Enter on a natural-language description and local results look unsure, or explicitly via `?` / `refs ask`. | ~$0.0005 (capped at \$1/mo) |
+
+Combine free text with structured filters: `#collection` (or `collection:`), `course:`, `project:`, `term:`, `area:`, `in:`, `topic:`, `kind:`, `year:`, `author:`, `tag:`, `status:`, `read:` (`unread`, `reading`, `skimmed`, `read`), `queued:` (`yes`, `no`).
+
+### Reading status, reading log, queue & searchable PDF highlights
+- **4-state reading cycle** (`r`): `unread` (`○`) → `reading` (`◐`) → `skimmed` (`◔`) → `read` (`●`). Manual choices always win; otherwise `refs` detects reading progress automatically from your own PDF highlights, underlines, notes, and ink (marks on ≥30% of pages and ≥5 pages → *read*; ≥2 pages → *reading*; books >150 pages cap at *reading*). Configure your annotation author names under Settings (*"find names in my PDFs"*) so an instructor's or coauthor's markup never counts as yours.
+- **Reading log**: Record multiple reads or re-reads on any paper with date, depth (`read`, `skimmed`, `reading`), project/course context, and a 1-line takeaway.
+- **Reading queue with intent**: Press `q` to toggle the queue, or `Q` to queue with a 1-line reason (*"why did I queue this?"*). Tie queued papers to a collection (`--for`), pin top priorities to **★ up next**, and let papers leave the queue automatically once read.
+- **Standalone searchable PDF highlights**: `refs` extracts the actual text you highlighted and the margin comments you wrote (cached per PDF content hash), indexes them into both keyword and semantic search, and displays them with page numbers and highlight colors in the detail pane (`refs highlights <query>`).
+
+### Deep Obsidian integration
+- **Stable citekey notes (`n`)**: One Markdown file per work (`<vault>/<folder>/<citekey>.md`), so `[[citekey]]` links cleanly from anywhere in your vault. Notes include an `Author (Year)` alias for Obsidian autocomplete.
+- **Safe concurrent editing**: Edit notes directly in `refs`; saves check a byte hash of the file first and write atomically via a temporary file so concurrent edits in Obsidian are never overwritten.
+- **Idempotent highlight pull**: Click **pull into note** (or run `refs highlights <query> --to-note`) to insert or refresh a delimited `<!-- refs:highlights:start --> … <!-- refs:highlights:end -->` Markdown block without touching your own writing.
+- **Managed front-matter sync**: Keeps `refs`-managed YAML properties (`title`, `authors`, `year`, `venue`, `doi`, `citekey`, `collections`, `read_status`, `aliases`) up to date while preserving every custom property and comment you add in Obsidian.
+- **Vault backlinks**: The detail pane lists every other note in your Obsidian vault that links to `[[citekey]]`, with one-click `obsidian://` links.
+
+### Shared coauthor folders & annotation sync
+- **Shared project collections** (`--shared`, shown with `⇄`): Adding a paper copies its PDF into the shared Dropbox folder for coauthors; PDFs a coauthor adds surface in **Inbox** ready to copy into your library; removing a paper from the collection asks before trashing the shared copy. Recorded library + shared copies stay out of the Copies review.
+- **Per-copy annotation tracking & pull-merge**: When a work has multiple copies, `refs` shows whose marks each copy holds and when it was last annotated, flagging `⚑` any copy that has annotations your library copy lacks. Click **Bring them into the library copy** (or run `refs marks <query> --pull '#project'`) to redraw those highlights and comments into your library copy (preserving author, text, and color, after saving a backup of the previous library PDF in `.refs/`).
+
+### Working-paper upgrades & library maintenance (`Review`)
+- **Working paper → published checker** (*Review → published* / `refs updates --check`): Re-queries Crossref and OpenAlex for your NBER, arXiv, SSRN, and draft papers (bypassing old cached misses) and surfaces verified journal publications. Accepting upgrades venue, year, volume, issue, pages, and DOI while keeping your citekey, collections, reading log, notes, PDF, and original working-paper provenance intact.
+- **Needs review, PDF re-read, merge & tags**: Fix metadata or fetch by DOI, re-read a single paper or a multi-selected batch with Claude and fresh registry lookups while preserving all user state, merge duplicate works (combining files, collections, and notes under the target citekey), add personal tags, and hide noisy auto-tags (restorable anytime).
+- **Copies & renames**: *Copies* spots identical files, marked-up vs. clean copies, and working papers next to published versions, recommending which copy to keep (weighing your marks first, then version, location, and name) with one-click cleanup for safe sets. *Renames* proposes tidy canonical filenames (`surname-year-short-title.pdf`) with an undo journal (`u` / `refs rename --undo`).
+
+### BibTeX, LaTeX & project `.bib` interoperability
+- **Clean biblatex/biber output**: UTF-8 entries with automatic acronym and mixed-case bracing (`{US}`, `{GDP}`, `{OLS}`, `{COVID-19}`, `{R\&D}`) so sentence-casing styles never mangle titles.
+- **Project `.bib` awareness**: Point `refs` at your project `.bib` files (read-only, per collection or in settings) and it learns the citation keys those projects already use — so `refs find o2006optimal` finds `odonoghue2006optimal`, and pressing `y` inside a project copies that project's key.
+- **Duplicate-free append**: `refs bib '#bets' --append` (or *append to .bib* in the workspace) appends entries to a `.bib` file while skipping any paper already present under *any* key (matched by key, DOI, or title).
+- **Live `library.bib`**: Continuously maintained in `.refs/library.bib` with relative `file` paths and `keywords` for JabRef and Zotero portability.
+
+### Coding agents (Claude Code & Codex)
+Run `refs skill install` to install the bundled agent skill (`src/refs/skill/SKILL.md`). Coding agents learn to search your library first (`refs find --json`), inspect collections and reading status, resolve `\cite{key}` references from `.tex` files, fetch verified BibTeX, queue or save papers, and leave confidential (`never_sent_to_ai`) folders and destructive file actions untouched.
+
+---
+
+## Record Status Reference
+
+Every paper in the list shows a status mark indicating how far to trust its bibliographic metadata:
+
+| Mark | Status | Meaning |
+|---|---|---|
+| `■` | verified | A Crossref or OpenAlex record agrees with what is printed in the PDF |
+| `▣` | confirmed | You accepted, edited, or upgraded the record |
+| `◧` | extracted | No registry record; Claude's transcription of the opening pages (drafts, JMPs) |
+| `!` | needs review | Something did not match cleanly; inspect under *Review → needs review* |
+| `·` | classified | Non-library item (slides, problem set, syllabus, etc.) |
+| `·` | confidential | In a `never sent to Claude` folder; read from printed identifiers only |
+| `◆` | imported | Imported from Zotero and not yet read |
+| `□` | no file | Metadata stub saved without a PDF yet |
+
+---
+
+## Install & First Run
+
+You need [uv](https://docs.astral.sh/uv/) (`brew install uv`) and an [Anthropic API key](https://console.anthropic.com/settings/keys). Obsidian is optional.
 
 ```sh
 uv tool install git+https://github.com/williamradaic/refs
 refs service install
 ```
 
-`refs service install` keeps refs running in the background (and starts it at
-login), then opens the page. To update later: `uv tool upgrade refs`, then
-`refs service restart`.
-
-## First run
-
-While refs is not set up, the page asks:
-
-1. **Library folder**: where your papers are (Dropbox, iCloud Drive, Google
-   Drive, OneDrive, Documents, or a folder you choose).
-2. **Folders with papers**: a tree of your folders with PDF counts; tick the
-   ones refs should watch. Folders of term folders (`Fall 2026`,
-   `2025-spring`) are recognised, and the courses inside them are grouped by
-   term.
-3. **Quick-add folder**: where added papers are saved (created if new).
-4. **Private folders**: paperwork to leave out entirely, and confidential work
-   (a manuscript you referee) to index but never send to Claude. refs
-   suggests some from their names (`visa`, `referee`, ...).
-5. **Notes**: an Obsidian vault for reading notes, or none.
-6. **Reading**: your API key, and how much to read: everything now (with the
-   cost), only papers you add from now on, or nothing.
-
-`refs init` asks the same questions in the terminal. Everything can be changed
-later under **settings**. If something seems off, `refs doctor` checks every
-part and says how to fix it.
-
-## Daily use
-
-The page is keyboard-driven: `j`/`k` move, `/` searches, `⏎` opens the PDF,
-`a` adds a paper, `,` opens settings, `?` lists every key.
-
-**Adding papers.** Paste a link, DOI, arXiv id or NBER number into the add bar
-(`a`), or drop PDFs on the page. A PDF you save into the quick-add folder
-yourself (from the browser, Finder, or Dropbox on the phone) is picked up on
-its own. refs downloads the PDF when it is openly available; a paywalled paper
-is saved without one and attaches itself when you save the PDF into the
-quick-add folder later. Shift+Enter in the add bar also puts the paper on your
-reading queue.
-
-**From Downloads, in a batch.** After a literature search that left a pile of
-PDFs in `~/Downloads`, open **downloads** (sidebar, under Review). It lists the
-PDFs saved there, newest first, sorted into *paper*, *maybe* and the rest
-(receipts, tickets, statements, behind "show other PDFs"). The sorting reads the
-PDFs' first and last pages on your Mac, for free: an identifier, an abstract,
-a reference list, the length. Tick the ones you want (or "select all"), then
-**take into the quick-add folder**, or **take into folder…** to put them
-straight into a course or project folder (a new one if you type a path).
-They are moved out of Downloads, or copied if you choose copy, then read like
-any new paper. A PDF refs already has is left where it is and marked
-"already in refs"; **trash** (on the row, or for all of them in the bar) moves
-those Downloads copies to the Trash, which is how to clear Downloads after
-copying papers in. Only a file whose exact content is in refs can be trashed
-this way, and it can be dragged back from the Trash. The
-folder is a setting (Library → Downloads folder); empty turns the view off.
-
-**The bookmarklet** (`/bookmarklet`, drag "+ refs" to the bookmarks bar) adds
-the paper whose page you are on, in one click. It reads the page's citation
-details and fetches the PDF in your browser, signed in as you, so it works
-where refs alone is turned away (AEA and OUP pages, library access); a small
-window follows the add and closes itself. On a paywall, with a **library
-proxy** set under settings (UC Berkeley:
-`https://libproxy.berkeley.edu/login?qurl=`), it reopens the page through the
-proxy: sign in if asked and click "+ refs" again. Journals that serve the PDF
-from another site (OUP's) need the PDF open: click "+ refs" on the PDF itself.
-The bookmarklet carries a key belonging to this Mac's refs; after updating refs
-from an older version, drag it to the bookmarks bar again.
-
-**Search** combines two free rankings and, when unsure, asks Claude:
-
-| | What it does | Cost |
-|---|---|---|
-| words | every word must appear (as a prefix) in the title, authors, initials, citekeys, file names, tags, summary or your note; `IO`, `PF`, `RDD`, … also match the spelled-out field | free |
-| meaning | a small model on your Mac compares a description with each paper's title, tags, summary and note, so "frozen desserts" finds an ice-cream paper | free |
-| Claude Haiku | ranks a shortlist of about 40 local candidates and says why each fits; only when you press Enter on a description and the local result looks unsure (or the query starts with `?`) | about $0.0005, capped at $1 a month |
-
-Filters: `#220a` (a collection, parts included; on the command line quote it,
-`'#220a'`, or write `collection:220a`), `course:` / `project:` (a collection,
-or a folder name), `term:`, `area:`, `in:` (part of a folder path), `topic:`,
-`kind:`, `year:`, `author:`, `tag:`, `status:`, `read:` (read, reading,
-unread), `queued:` (yes, no).
-
-**The record status** in the list says how far to trust a paper's details:
-
-| Mark | Status | Meaning |
-|---|---|---|
-| ■ | verified | a Crossref or OpenAlex record agrees with what is printed in the PDF |
-| ▣ | confirmed | you accepted or corrected the record |
-| ◧ | extracted | no registry record; the details are Claude's transcription of the first page (drafts, job market papers) |
-| ! | needs review | something does not add up; check it under Review |
-| · | classified | not a library item (slides, problem sets, ...) |
-| · | confidential | in a private folder; read from printed identifiers only |
-| ◆ | imported | came from Zotero and has not been read yet |
-| □ | no file | saved without a PDF yet |
-
-**Reading.** Each paper is unread, reading (◐) or read (●). Set it with `r`;
-otherwise refs works it out from your own highlights, underlines, notes and
-ink: marks on at least 30% of the pages (and at least 5) mean read, marks on 2
-or more pages mean reading. Only your marks count, not an instructor's: the
-names that are you are set under settings ("find names in my PDFs"). `q` puts
-a paper on the reading queue (▸); it leaves the queue once read.
-
-**Notes** (`n`): a Markdown file per paper in your Obsidian vault, named by
-citekey, so `[[citekey]]` links to it from any note. The page edits the text;
-refs writes the properties once and never overwrites a change made in
-Obsidian.
-
-**Review**, in the sidebar: *needs review* (correct a record, fetch it by DOI,
-or accept it), *renames* (tidy file names, `surname-year-short-title.pdf`,
-only for files you tick; undo is offered), *copies* (the same PDF in several
-places, or a marked-up copy next to a clean one, or a working paper next to the
-published article: refs says which copy to keep and why, from your marks first,
-then the version, then place and name; *do it* trashes what it says and gives the
-kept copy its tidy name, *clear the safe sets* does every set where nothing is lost).
-
-**Filing into courses and projects.** **File to…** (`F`) moves a PDF into
-another folder, **Copy to…** (`C`) copies it (the original stays, say in a
-shared project folder). For many papers at once, select them first: `x` or
-⌘-click adds a row, ⇧-click a range, ⌘A everything listed; the selection
-survives searches, so you can gather papers from several. In the folder box,
-↑/↓ choose and Tab on a folder, then a name, makes a new folder inside it.
-`u` undoes the last filing. Besides *added* (the PDF's own date), the *in refs*
-column says when a paper entered refs.
-
-**Citing.** `b` copies the BibTeX of the selected paper; `refs bib` does the
-same at the terminal, for one paper or a whole project, and `--append` adds
-entries to a `.bib` unless it already has them under any key. refs reads your
-project `.bib` files (listed under settings; read only) and learns the keys
-they use, so `refs find o2006optimal` finds the paper refs calls
-`odonoghue2006optimal`.
-
-**Agents.** `refs skill install` teaches Claude Code and Codex to look papers
-up with refs (`refs find --json`, `refs bib`, `refs add`) and what to leave to
-you.
-
-**Elsewhere.** `/?q=<search>` opens the page with a search, `/?add=<link>` with
-the add bar filled in. In Chrome, ⋮ → Cast, Save and Share → Install page as
-app gives refs its own window. Raycast users can import
-`extras/raycast-quicklinks.json`.
-
-## Courses and projects
-
-**Collections.** A course or project is a collection: a set of papers, wherever
-their PDFs are. A paper can be in any number of them, and a slash makes a part
-(`219a/public-economics`, included in `219a`). On a paper, *Collections* lists
-its own (× takes it out) and, dotted, the ones its folder stands for; *add to…*
-(`#`) puts it in one, or in a new one if you type a new name. The same key
-collects a whole selection. The sidebar lists projects, then courses by
-term; *+ new project* and *+ new course* at the end of each make one, with a
-folder, whether that folder is shared with coauthors, a `.bib` and, for a
-course, its term. Drag a project to put the projects in your own order.
-
-**Right-click.** Anything with actions of its own has a menu: a paper (or the
-selection: file, collect, queue, copy citekeys, `\cite{…}` or BibTeX), a
-course or project (show its folder or `.bib`, copy its BibTeX, new part, move
-up or down, hide, edit, rename, delete), a term heading (hide all its
-courses), a column header, a file or collection on a paper. Each item shows
-its key where it has one; `.` opens the highlighted paper's menu.
-
-**The sidebar.** Pin any course, project or part to *Pinned* at the top.
-Each section has its options under a right-click on its heading: sort
-(projects: your order, A–Z, newest first, recently added to, most papers;
-courses also by term), hide empty collections, fold, hide the section;
-clicking a heading folds it. A hidden course or project keeps its papers and
-is still found by `#name`; *N hidden* at the end of its section shows it
-again. *sidebar* (under refs) lists every collection to pin or hide many at
-once (empty ones, past terms' courses) and every section's options. Pins,
-places and hidden collections are saved in `collections.json`, so they follow
-you to your other Macs; how each section looks is kept in the browser. In the
-terminal:
+`refs service install` installs a macOS login agent that runs `refs` in the background (starting at login) and opens `http://refs.localhost:8377`. To update later:
 
 ```sh
-refs project new bets --folder phd/research/bets/readings/lit --shared --bib ~/phd/research/bets/refs.bib
-refs project new 220a --course --term 2026-fall
-refs collection add bets o'donoghue procrastination   # the best match (--all: every match)
-refs collection remove bets o'donoghue
-refs collection                                      # every collection, with counts
-refs collection rename 219a/pf 219a/public-economics
-refs bib '#bets' --append                            # into the collection's own .bib
+uv tool upgrade refs
+refs service restart
 ```
 
-Collections live in refs' folder in the library: `collections.json` describes
-them, and each paper's file lists the ones you put it in.
+### Onboarding wizard
+On first run, the page walks you through six steps (or run `refs init` in the terminal):
+1. **Library root**: Where your synced folders live (Dropbox, iCloud Drive, Google Drive, OneDrive, Box, Documents, or any custom folder).
+2. **Folders with papers**: A folder tree with PDF counts; tick the folders `refs` should watch. Term folders (`Fall 2026`, `2025-spring`) are detected automatically.
+3. **Quick-add / library folder**: Where newly added papers are stored and tidily named (created if new).
+4. **Private folders**: Exclude personal paperwork completely (`visa`, `taxes`, …) or mark confidential folders (`referee`, …) to index locally without ever sending text to Claude.
+5. **Notes**: Select an Obsidian vault for reading notes, or leave notes off.
+6. **Reading**: Store your Anthropic API key (in the macOS Keychain) and choose whether to identify all existing PDFs now (with a cost estimate), only new papers added from now on, or none.
 
-**One library folder.** Every reading lives once in the library folder (the
-quick-add folder, `refs-library`), named
-`surname-year-short-title.pdf`; courses and projects are collections, not
-folders. Course folders keep their slides and problem sets and can be listed
-as *inboxes* (settings): the **Inbox** view (under Review) shows the papers in
-them that the library lacks, with the course, and the topic as a part
-(`220a/demand-estimation-ii`), filled in. Taking one in moves it into the
-library, or copies it out of a folder another tool manages (a course site's
-sync folder). `u` undoes.
+Everything can be changed later under **settings** (`,`). Run `refs doctor` anytime to verify every component.
 
-**Shared projects.** A project whose folder is a Dropbox folder shared with
-coauthors is marked *shared* (`--shared`, or the box on *+ new project*).
-Its folder is watched; putting a paper in the project copies it there for
-them; a PDF a coauthor adds turns up in the Inbox, to copy into the library;
-taking a paper out asks before trashing the shared copy. Library copy plus
-shared copies are expected, so they stay out of the Copies review.
+### Everyday keyboard shortcuts
 
-**Marks across copies.** A paper with several copies shows each one's marks
-(yours, and others' by name, with the newest mark's date) and flags ⚑ a copy
-with marks the library copy lacks. *Bring them into the library copy* redraws
-those marks there (author, text, colour), after keeping the library copy as
-it was in refs' folder; `refs marks <search> --pull '#bets'` does the same.
-Marks deleted in one copy are not deleted in the other, and the two must be
-the same version.
+| Key | Action | Key | Action |
+|---|---|---|---|
+| `j` / `k` | Move down / up (`g` / `G` top / bottom) | `r` | Cycle reading status (`unread → reading → skimmed → read`) |
+| `/` | Focus search (`Esc` clears) | `q` / `Q` | Toggle queue / queue with a 1-line reason |
+| `⏎` / `o` | Open PDF in browser tab (`p` Preview, `f` Finder) | `n` | Edit reading note (Obsidian) |
+| `a` | Add a paper (`Shift+Enter` also queues) | `y` / `b` | Copy citekey (project key first) / copy BibTeX |
+| `#` | Add paper or selection to a collection | `x` / `⌘A` | Multi-select rows (selection persists across searches) |
+| `F` / `C` / `u` | File to folder / Copy to folder / Undo | `.` | Context menu for paper or selection |
+| `,` / `w` / `R` | Settings / watcher status / rescan | `?` | Full shortcut reference (`t` toggles light/dark) |
 
-**Adding into a collection.** In the add bar, `#220a` after the link files
-the paper (Tab completes, this term's courses first); the bookmarklet window
-has an *into* field it remembers between papers (for a literature review);
-the Downloads view has one too; a PDF dropped on the page while a
-collection is shown goes into it; `refs add <link> --to bets`.
+**Tips**: `/?q=<search>` opens directly to a search; `/?add=<link>` pre-fills the add bar; URL hashes (`#c=bets&w=...`) support browser Back/Forward and deep links. In Chrome, *⋮ → Cast, Save and Share → Install page as app* gives `refs` its own standalone window. Raycast users can import [extras/raycast-quicklinks.json](extras/raycast-quicklinks.json).
 
-**library.bib.** refs keeps `library.bib` in the same folder: every paper,
-with `file` (its PDF, relative to the .bib) and `keywords` (its collections).
-JabRef and Zotero import both fields, so your courses and projects survive
-without refs. The background service rewrites it a few seconds after anything
-changes; `refs bib --library` writes it now.
+---
 
-**From folders.** refs also reads a PDF's course or project off its folders,
-and treats each as a collection of that name. By default each folder
-directly inside a watched folder is one (`Papers/IO/x.pdf` → `Papers/IO`).
-Rules under settings say more, tried in order:
+## Settings, Folder Rules, Costs & Privacy
+
+### Settings
+Settings live in `~/.config/refs/config.toml` and can be edited on the **settings** page (`,`) or by hand (comments are preserved). Every change is validated before saving and applies immediately.
+
+#### Folder rules
+If you keep papers in existing course or project folders, `refs` also derives implicit collections from folder paths, tried in order:
 
 | Setting | What it does |
 |---|---|
-| `contexts` | your own rules, e.g. `Classes/{term}/{course}`, `Research/{name}` |
-| `layout = "phd"` | a ready-made layout: `phd/coursework/<term>/<course>`, `phd/research/<project>`, `phd/referee/<journal>/<manuscript>`, … |
-| `material_dirs` | folder names whose PDFs are course material, not papers (a course-site sync folder) |
+| `contexts` | Custom rules, e.g. `Classes/{term}/{course}`, `Research/{name}` (`{term}` matches `2026-fall`, `Fall 2026`; `{course}` normalizes `1-Econ 240A` → `240a`; `{name}` / `{area}` match any folder). Subfolders like `readings/03-demand` become topics. |
+| `layout = "phd"` | Built-in preset for `phd/coursework/<term>/<course>`, `phd/research/<project>`, `phd/referee/<journal>/<manuscript>`, etc. |
+| `material_dirs` | Folder names treated as course material (slides, handouts) rather than papers. |
 
-`{term}` matches `2026-fall`, `Fall 2026` and similar; `{course}` matches
-`240a` or `1-Econ 240A` (read as `240a`); `{name}` matches any folder; `{area}`
-matches any folder and names the area. Folders called `readings/03-demand`
-give topics ("3. Demand").
+### Costs & guardrails
+- **Reading new PDFs**: Sends only the text of the first three pages (an image of page 1 for scans) to Claude Haiku — roughly **$0.001 per paper**, billed to your own API key.
+- **AI search reranking**: Sends titles, authors, tags, and summaries of ~40 local candidates — roughly **$0.0005 per query**, cached locally.
+- **Spend caps & batch approval**: Automatic reading pauses at a monthly cap (**\$10/month** by default); AI search caps at **\$1/month**. Batches of more than 25 new PDFs wait for your confirmation (with an upfront cost estimate) before spending anything.
 
-## Settings
+### Privacy & safety
+- **Never sent to AI**: Filenames, your Obsidian notes, anything in excluded folders, and anything inside folders marked `no_llm` (*never sent to Claude*).
+- **Registry lookups**: Send only titles and identifiers to Crossref and OpenAlex.
+- **Credentials & network**: Your API key is stored in the **macOS Keychain** (never in a config file). The web server binds exclusively to `127.0.0.1` and uses a per-Mac token for the bookmarklet.
+- **Non-destructive file handling**: `refs` only renames files automatically in your quick-add/library folder or when you explicitly approve renames under Review; it never renames files inside Git repositories or managed sync folders (like Overleaf), records every move/copy/rename in an undo journal, and never modifies Zotero.
 
-Settings live in `~/.config/refs/config.toml`, edited on the settings page
-(sidebar, or `,`) or by hand; comments you write there are kept. Every change
-is checked before it is saved and applies at once. Besides the folders above:
-the Obsidian vault, your annotation names, project `.bib` files, what to read
-on its own, the monthly limits, the search model, and the API key (kept in
-the macOS Keychain, never in a file).
+---
 
-## Costs and privacy
-
-- To identify a PDF, refs sends the **text of its first three pages** (an image
-  of page one for scans) to Claude Haiku, about $0.001 a paper, on your own API
-  key. Searches that ask Claude send titles, authors, tags and summaries of
-  about 40 candidates. Never file names, your notes, or anything in a folder
-  marked never-sent-to-Claude.
-- Registry lookups go to Crossref and OpenAlex (titles and identifiers).
-- Reading on its own stops at a monthly limit ($10 by default); asking stops
-  at $1. More than 25 new PDFs at once wait for your OK, with their cost, in
-  the page's footer. `refs process` asks before a large run.
-- The page is served on `127.0.0.1` only, and takes changes only from itself.
-- refs renames files only in the quick-add folder or when you tick them under
-  Review, never inside folders another tool keeps in sync or Git repositories,
-  and keeps an undo journal. It never modifies Zotero.
-
-## Command line
+## Command Line
 
 ```sh
-refs init                      # set refs up (the first-run questions)
-refs doctor                    # check that everything is in order
-refs scan                      # bring the index in line with your folders
-refs status                    # what the library holds
-refs find blp                  # search titles, authors, initials, file names, notes
-refs find course:240a kind:paper topic:demand
-refs find IO paper on ice cream   # a description works too (matched by meaning)
-refs ask demand for frozen desserts   # let Claude pick from ~40 candidates (~$0.0005)
-refs contexts                  # courses and projects recognised from folders
-refs collection                # collections (courses, projects); add, remove, rename, new, delete
-refs project new bets          # a new project (--course --term 2026-fall for a course)
-refs dupes                     # files stored in more than one place
-refs open blp                  # open the best match
-refs path blp                  # print its full path
+# Setup & health
+refs init                                  # interactive first-run setup
+refs setup-key                             # store Anthropic API key in Keychain
+refs doctor                                # check setup, folders, index, key, service
+refs service status                        # background service (install, restart, uninstall)
+refs serve --open                          # run in the foreground instead of background
+refs skill install                         # teach Claude Code & Codex to use refs
 
-refs add w32515                # add: NBER number, arXiv id, DOI, URL or a PDF file
-refs add w32515 --queue        # ... and put it on the reading queue
-refs queue                     # the reading queue, oldest first
-refs wanted                    # papers saved without a PDF yet
-refs bib blp                   # BibTeX for the best match (or `refs bib project:thesis`)
-refs bib blp --append references.bib   # add it unless the file already has it
-refs add <link> --to 220a      # add straight into a collection
-refs marks blp                 # the copies of a paper and whose marks each holds
-refs marks blp --pull '#bets'  # bring the bets copy's marks into the library copy
-refs bib --library             # write library.bib (every paper, PDF and collections) now
-refs rename in:dump            # propose tidy names; add --apply to rename
-refs rename --undo 3           # reverse the last 3 renames and moves
+# Searching & browsing
+refs scan                                  # reconcile index with watched folders
+refs status                                # library summary and totals
+refs find blp                              # keyword + local semantic search
+refs find '#220a' kind:paper read:unread   # filter by collection, kind, reading state, ...
+refs ask IO paper on ice cream             # Claude Haiku rerank (~$0.0005)
+refs open blp                              # open best match in default PDF viewer
+refs path blp                              # print absolute path of best match
 
-refs process --all             # read everything not yet read (asks first if many)
-refs setup-key                 # store the Anthropic API key in the Keychain
-refs skill install             # teach coding agents to use refs
-refs zotero-import --dry-run   # what importing ~/Zotero would do
-refs serve --open              # run the page in this terminal instead of the background
-refs service status            # the background service (install, restart, uninstall)
+# Capturing, reading & highlights
+refs add w32515 --to bets --queue          # add NBER/arXiv/DOI/URL/PDF into collection & queue
+refs queue                                 # list reading queue (use `refs queue blp --next --note "..."`)
+refs wanted                                # papers saved as stubs without a PDF yet
+refs highlights blp --to-note              # extract PDF highlights (and pull into Obsidian note)
+refs updates --check                       # check working papers for published journal versions
+
+# Projects, courses & shared folders
+refs project new bets --folder phd/research/bets/readings --shared --bib ~/phd/research/bets/refs.bib
+refs project new 220a --course --term 2026-fall
+refs collection                            # list collections (add, remove, rename, new, delete)
+refs collection add bets o'donoghue        # add best match (--all for every match)
+refs marks blp --pull '#bets'              # pull annotations from a shared copy into library copy
+
+# BibTeX & maintenance
+refs bib blp                               # print BibTeX (or `refs bib '#bets'`)
+refs bib '#bets' --append                  # append to the collection's .bib (deduplicated)
+refs bib --library                         # regenerate .refs/library.bib now
+refs rename in:dump                        # propose tidy names (--apply to rename; --undo N to revert)
+refs dupes                                 # list duplicate file locations
+refs process --all                         # identify unread PDFs (--redo / --relookup)
+refs zotero-import --dry-run               # preview importing a ~/Zotero library
 ```
 
-`--json` on `find`, `status`, `contexts`, `collection`, `dupes` and `scan` gives
-machine-readable output.
+Add `--json` to `find`, `ask`, `status`, `contexts`, `collection`, `dupes`, `scan`, `queue`, `highlights`, and `updates` for machine-readable output.
 
-## Troubleshooting and removal
+---
 
-`refs doctor` checks the settings, folders, index, API key, spending, notes,
-search model and background service, and says how to fix what is wrong; its
-report names no paper and never shows the key, so it is safe to send when
-asking for help. The log is `~/Library/Logs/refs.log`.
+## Troubleshooting & Removal
 
-`refs uninstall` lists, then removes, what refs made on your Mac: the
-background service, the index, caches, log, settings and Keychain key
-(`--keep-settings` and `--keep-key` keep those). Your PDFs, your notes and
-refs' records in the library folder (`.refs/`, which a reinstall picks up
-again) stay. Then `uv tool uninstall refs` removes the program.
+- Run `refs doctor` to diagnose settings, folders, index, Keychain key, budget, Obsidian vault, local search model, and background service. Its output never names a paper or prints your API key, so it is safe to share when reporting an issue.
+- Background service logs live at `~/Library/Logs/refs.log`.
+- To remove `refs` from your Mac:
+  ```sh
+  refs uninstall               # removes service, index, caches, log, settings, Keychain key
+  uv tool uninstall refs       # removes the CLI binary
+  ```
+  Pass `--keep-settings` or `--keep-key` to preserve those. Your PDFs, Obsidian notes, and `.refs/` records inside your library folder are always left untouched so a reinstall picks up where you left off.
 
-## License
+---
 
-MIT. Working on refs itself: [docs/development.md](docs/development.md).
+## Development & License
+
+MIT License — see [LICENSE](LICENSE).
+
+- Contributing, code map, and local sandbox servers: [docs/development.md](docs/development.md)
+- Research-first architecture notes: [docs/research-first-plan.md](docs/research-first-plan.md)
