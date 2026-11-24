@@ -58,6 +58,23 @@
         "8380"
       ],
       "port": 8380
+    },
+    {
+      "name": "refs-demo",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "REFS_CONFIG=local/demo/config.toml",
+        "REFS_DROPBOX_ROOT=local/demo/Dropbox",
+        "REFS_INDEX_DB=local/demo/index.db",
+        "uv",
+        "run",
+        "refs",
+        "serve",
+        "--port",
+        "8381",
+        "--no-watch"
+      ],
+      "port": 8381
     }
   ]
 }

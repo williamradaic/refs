@@ -25,19 +25,24 @@ ln -s "$PWD/src/refs/skill" ~/.codex/skills/refs
 
 ## Trying changes without touching your library
 
-`.claude/launch.json` defines three local servers:
+`.claude/launch.json` defines four local servers:
 
 | Entry | Port | What it serves |
 |---|---|---|
 | `refs-dev` | 8378 | your real library and settings, without the folder watcher |
 | `refs-sandbox` | 8379 | a fake, set-up library in `local/sandbox/` (its own settings and index), no watcher |
 | `refs-first-run` | 8380 | an unconfigured library in `local/first-run/`, with the watcher: the first-run screens |
+| `refs-demo` | 8381 | a demo library in `local/demo/` (about 20 well-known economics papers, a few notes, an Obsidian vault): the README screenshots |
 
 The sandboxes are made by hand (`local/` is ignored by Git): a `Dropbox/`
 folder with a few PDFs, and for `refs-sandbox` a `config.toml`. The servers
 use `REFS_CONFIG`, `REFS_DROPBOX_ROOT` and `REFS_INDEX_DB`, which the tests
 use too; the API key still comes from the Keychain, so avoid reading PDFs
 there unless you mean to pay for it.
+
+The README screenshots in `docs/screenshots/` are 1440×860 captures at 2× of
+`refs-demo`, taken with headless Chrome (deep links such as `#c=bets&w=<id>`
+select the view). Never capture your real library for them.
 
 ## Map of the code
 

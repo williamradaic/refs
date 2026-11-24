@@ -8,6 +8,8 @@ A local-first, research-first reference manager for macOS that sits on top of th
 - **Research-first workspaces**: every project and course gets its own workspace with reading progress, status filters, BibTeX append, batch import, and shared coauthor folder sync.
 - **Keyboard-driven local web UI** at `http://refs.localhost:8377`, paired with a fast CLI (`--json` ready).
 
+![The refs library: sidebar with collections and review queues, the paper list with reading-status and record marks, and the detail pane with reading log and Obsidian note](docs/screenshots/library.png)
+
 `refs` runs on macOS. It was built by an economist for economists — its field/method vocabulary (`src/refs/llm.py`) and working-paper workflows reflect economics — though any academic PDF library works.
 
 ---
@@ -74,6 +76,9 @@ The web interface is served strictly on `127.0.0.1` (`http://refs.localhost:8377
 
 ### Project & course workspaces
 Open any `#project` or `#course` from the sidebar to enter its dedicated workspace:
+
+![A project workspace: reading progress, status filter pills, workspace actions, and papers grouped by sub-collection](docs/screenshots/project.png)
+
 - **Progress & quick filters**: See reading progress at a glance (`read / skimmed / queued`) and slice the collection with one-click pills (`all`, `queued`, `unread`, `reading`, `skimmed`, `read`, `no pdf`).
 - **Workspace actions**: `+ add to #name`, `import list/.bib`, `append to .bib`, `copy BibTeX`, `open folder`, and `open next 5 via proxy` (to quickly grab paywalled stubs through your university library proxy).
 - **Flexible hierarchy & sidebar**: Nest sub-collections with slashes (`219a/public-economics`, automatically included in `219a`). Pin favorites to *Pinned*, drag to reorder projects, sort sections (custom order, A–Z, newest, recently used, size, or term), fold or hide sections and old terms, and act on anything via right-click menus (or `.` on the highlighted paper). Pinning, ordering, and hidden state sync via `collections.json`.
@@ -89,6 +94,8 @@ Open any `#project` or `#course` from the sidebar to enter its dedicated workspa
 
 ### 3-tier hybrid search
 Search starts instant and free, escalating to Claude only when needed:
+
+![Searching "inattention to taxes": local semantic search finds salience, optimal-taxation, and behavioral-welfare papers with no shared keywords](docs/screenshots/search.png)
 
 | Tier | What it searches | Cost |
 |---|---|---|
@@ -186,6 +193,8 @@ Everything can be changed later under **settings** (`,`). Run `refs doctor` anyt
 | `#` | Add paper or selection to a collection | `x` / `⌘A` | Multi-select rows (selection persists across searches) |
 | `F` / `C` / `u` | File to folder / Copy to folder / Undo | `.` | Context menu for paper or selection |
 | `,` / `w` / `R` | Settings / watcher status / rescan | `?` | Full shortcut reference (`t` toggles light/dark) |
+
+![Dark mode (`t`), showing a course workspace](docs/screenshots/dark.png)
 
 **Tips**: `/?q=<search>` opens directly to a search; `/?add=<link>` pre-fills the add bar; URL hashes (`#c=bets&w=...`) support browser Back/Forward and deep links. In Chrome, *⋮ → Cast, Save and Share → Install page as app* gives `refs` its own standalone window. Raycast users can import [extras/raycast-quicklinks.json](extras/raycast-quicklinks.json).
 
