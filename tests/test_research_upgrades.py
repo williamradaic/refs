@@ -548,3 +548,27 @@ def test_reread_single_batch_and_clear_overrides(env, monkeypatch):
     assert w1_cleared["citekey"] == orig_citekey
 
 
+
+
+def test_quick_add_stub_is_searchable_at_once(env, monkeypatch):
+    """`refs add <doi>` for a paywalled paper (no open PDF) saves a stub that
+    search and collection filters find immediately, without waiting for a scan.
+    The quick-add box and the bookmarklet run this same command."""
+    from refs import capture, cli
+
+    cfg, conn, root, vault = env
+    record = resolve.Record(title="The Market for Lemons", year=1970, venue="QJE",
+                            doi="10.2307/1879431", source="crossref",
+                            authors=[{"given": "George", "family": "Akerlof"}])
+    # Offline: no page fetch, no open copy, the registry answers from memory.
+    monkeypatch.setattr(capture, "discover", lambda target, fetch_page=True: target)
+    monkeypatch.setattr(capture, "download_first", lambda urls, folder: None)
+    monkeypatch.setattr(capture, "open_copies", lambda doi: [])
+    monkeypatch.setattr(resolve, "by_ids", lambda ids, refresh=False: (record, "doi"))
+
+    assert cli.main(["add", "10.2307/1879431", "--to", "220a"]) == 0
+    fresh = index.connect(cfg)
+    found = [r["citekey"] for r in index.search(fresh, ["lemons"])]
+    assert found == ["akerlof1970market"]
+    row = fresh.execute("SELECT collections FROM files WHERE citekey='akerlof1970market'").fetchone()
+    assert json.loads(row["collections"]) == ["220a"]

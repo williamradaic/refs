@@ -785,6 +785,11 @@ def cmd_add(args: argparse.Namespace) -> int:
         work = works.create_stub(cfg, record.to_dict(), source_url)
         if args.queue:
             _queue(cfg, work)
+        # Index the stub now: its search row and vectors are only (re)built by
+        # a scan, and the folder watcher ignores .refs/, so without this the
+        # paper stays out of the list and search until something else scans.
+        with ingest.exclusive(cfg):
+            scanner.scan(cfg, conn)
         _collect_on_add(cfg, conn, work, args.to)
         print(f"Saved without a PDF (no open copy found): {record.title} ({record.year})"
               + ("  [queued]" if args.queue else ""))
